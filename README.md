@@ -1,143 +1,234 @@
 # BitNet-TT
 
-Tenstorrent Blackhole p150a에서 BitNet LLM을 구현하기 위한 프로젝트입니다.
+Tenstorrent Blackhole p150a에서 Microsoft의 **BitNet b1.58 2B-4T** 모델을 실행하는 TT-NN 네이티브 구현입니다.
 
-## 프로젝트 개요
+## 주요 기능
 
-이 프로젝트는 Microsoft Research의 **BitNet b1.58** 아키텍처를 Tenstorrent의 **Blackhole p150a** AI 가속기에서 실행하는 것을 목표로 합니다. BitNet의 1.58-bit 삼진 가중치({-1, 0, 1})와 Tenstorrent의 Tensix 코어 아키텍처를 결합하여 초저전력 고효율 LLM 추론을 구현합니다.
+- **HuggingFace 호환**: `microsoft/bitnet-b1.58-2B-4T-bf16` 가중치 직접 로드
+- **TT-NN 네이티브**: Tenstorrent 하드웨어에 최적화된 구현
+- **KV-Cache 지원**: 효율적인 자기회귀 생성
+- **높은 정확도**: HuggingFace 구현과 correlation 0.99+ 달성
 
-## 하드웨어: Tenstorrent Blackhole p150a
+## 빠른 시작
 
-### 사양
+```bash
+# 설치
+git clone https://github.com/deveworld/bitnet-tt.git
+cd bitnet-tt
+uv sync
+
+# 테스트
+python main.py --test
+
+# Mini 모델 데모
+python main.py
+
+# Full 2B 모델 데모
+python main.py --full
+
+# 대화형 채팅
+python main.py --chat
+```
+
+## 검증 결과
+
+HuggingFace 공식 구현과의 비교:
+
+| 지표 | 결과 |
+|------|------|
+| Logits Correlation | 0.988 ~ 0.999 |
+| Top-1 Prediction Match | 100% |
+| Max Logit Difference | < 2.5 |
+
+```bash
+# 검증 스크립트 실행
+python examples/debug_compare.py      # 레이어별 비교
+python examples/debug_full_compare.py  # 전체 모델 비교
+```
+
+## 성능
+
+Tenstorrent Blackhole p150a에서 측정:
+
+| 모드 | 시간 | 속도 |
+|------|------|------|
+| Without KV-Cache | 6.53s / 30 tokens | ~217 ms/token |
+| With KV-Cache | 3.84s / 30 tokens | ~128 ms/token |
+
+**KV-Cache 속도 향상: 1.7x**
+
+## 아키텍처
+
+### 모델 구조
+
+```
+BitNetModel
+├── Embedding (128256 vocab, 2560 dim)
+├── TransformerBlock x 30
+│   ├── RMSNorm (input)
+│   ├── MultiHeadAttention
+│   │   ├── Q/K/V Projection (BitLinear)
+│   │   ├── RoPE (θ=500000)
+│   │   ├── Grouped Query Attention (20 Q heads, 5 KV heads)
+│   │   ├── Attention Sub-Norm
+│   │   └── O Projection (BitLinear)
+│   ├── RMSNorm (post-attention)
+│   └── FFN
+│       ├── Gate/Up Projection (BitLinear)
+│       ├── SiLU + Squared ReLU
+│       ├── FFN Sub-Norm
+│       └── Down Projection (BitLinear)
+├── RMSNorm (final)
+└── LM Head (tie_word_embeddings=True)
+```
+
+### BitLinear 가중치 양자화
+
+HuggingFace BitLinear와 동일한 양자화 적용:
+
+```python
+# 가중치 양자화 공식
+s = 1.0 / weight.abs().mean()
+weight_quant = (weight * s).round().clamp(-1, 1) / s
+# 결과: {-scale, 0, +scale} 삼진 값
+```
+
+### 주요 컴포넌트
+
+| 컴포넌트 | 파일 | 설명 |
+|----------|------|------|
+| Embedding | `layers/embedding.py` | 토큰 임베딩 |
+| RMSNorm | `layers/bitlinear.py` | Root Mean Square Normalization |
+| Linear | `layers/bitlinear.py` | 삼진 가중치 양자화 Linear |
+| Attention | `layers/attention.py` | GQA + RoPE + KV-Cache |
+| FFN | `layers/ffn.py` | SwiGLU + Squared ReLU |
+| Transformer | `model/transformer.py` | 트랜스포머 블록 |
+| BitNetModel | `model/bitnet.py` | 전체 모델 |
+
+## 프로젝트 구조
+
+```
+bitnet-tt/
+├── src/bitnet_tt/
+│   ├── config.py              # 모델 설정
+│   ├── layers/
+│   │   ├── attention.py       # Multi-Head Attention + KV-Cache
+│   │   ├── bitlinear.py       # BitLinear, RMSNorm, Linear
+│   │   ├── embedding.py       # Embedding layer
+│   │   └── ffn.py             # Feed-Forward Network
+│   ├── model/
+│   │   ├── bitnet.py          # BitNetModel
+│   │   └── transformer.py     # TransformerBlock
+│   ├── inference/
+│   │   └── generator.py       # Text generation
+│   └── utils/
+│       ├── device.py          # TT-NN device 관리
+│       ├── quantization.py    # 양자화 유틸리티
+│       └── weights.py         # HuggingFace 가중치 로딩
+├── examples/
+│   ├── demo.py                # 데모 스크립트
+│   ├── debug_compare.py       # 레이어별 비교
+│   └── debug_full_compare.py  # 전체 모델 비교
+└── main.py                    # CLI 엔트리포인트
+```
+
+## API 사용법
+
+### 기본 추론
+
+```python
+from bitnet_tt.model.bitnet import create_model
+from bitnet_tt.inference.generator import TextGenerator
+from bitnet_tt.utils.device import device_context
+from bitnet_tt.utils.weights import load_bitnet_weights, load_weights_to_model
+
+with device_context() as device:
+    # 모델 로드
+    state_dict, config = load_bitnet_weights("microsoft/bitnet-b1.58-2B-4T-bf16")
+    model = create_model(config, device)
+    load_weights_to_model(model, state_dict)
+
+    # 텍스트 생성
+    generator = TextGenerator(model)
+    output = generator.generate(
+        "Hello, I am",
+        max_new_tokens=50,
+        temperature=0.7,
+        use_cache=True,
+    )
+    print(output)
+```
+
+### KV-Cache 사용
+
+```python
+from bitnet_tt.layers.attention import KVCache
+
+# 첫 번째 forward (프롬프트 처리)
+logits, past_key_values = model(input_ids, use_cache=True)
+
+# 후속 forward (토큰 생성)
+for _ in range(max_tokens):
+    next_token = sample(logits)
+    logits, past_key_values = model(
+        next_token,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+```
+
+## 하드웨어 요구사항
+
+### Tenstorrent Blackhole p150a
 
 | 항목 | 사양 |
 |------|------|
 | Tensix 코어 | 140개 |
-| RISC-V 코어 | 16개 |
 | SRAM | 210MB (코어당 1.5MB) |
 | 메모리 | 32GB GDDR6 |
-| 메모리 대역폭 | 높은 대역폭 |
 | TDP | 최대 300W |
-| 네트워킹 | 4x QSFP-DD 800Gbps (멀티카드 연결 지원) |
-| 폼팩터 | 듀얼슬롯, 액티브 쿨러 |
-| 전원 | 12+4핀 12V-2x6 커넥터 |
 
-### 주요 특징
+### 소프트웨어 요구사항
 
-- **Tensix 코어**: 32-wide FPU 벡터 유닛과 32x32 행렬 가속기 탑재
-- **소프트웨어 관리 메모리**: 캐시 기반이 아닌 스크래치패드 SRAM + DMA 방식
-- **고속 토러스 인터커넥트**: 코어 간 빠른 데이터 전송
-- **멀티칩 스케일링**: QSFP-DD 포트를 통한 다중 카드 연결로 메모리 풀링 가능
-
-## 소프트웨어 스택
-
-Tenstorrent는 세 가지 레벨의 소프트웨어 스택을 제공합니다:
-
-### 1. TT-Forge (High-Level)
-
-MLIR 기반 컴파일러로, PyTorch, JAX, TensorFlow 모델을 Tenstorrent 하드웨어용으로 컴파일합니다.
-
-```python
-# PyTorch 모델을 TT-Forge로 컴파일하는 예시
-import tt_forge
-model = tt_forge.compile(pytorch_model)
-```
-
-### 2. TT-NN (Mid-Level)
-
-Python & C++ 뉴럴 네트워크 연산 라이브러리입니다. 친숙한 고수준 API로 모델을 실행할 수 있습니다.
-
-```python
-import ttnn
-
-# 디바이스 열기
-device = ttnn.open_device(device_id=0)
-
-# 텐서 생성 및 연산
-a = ttnn.from_torch(torch_tensor, device=device)
-b = ttnn.matmul(a, weights)
-
-# 디바이스 닫기
-ttnn.close_device(device)
-```
-
-**주요 연산**:
-- `ttnn.matmul`: 행렬 곱셈
-- `ttnn.add`, `ttnn.sub`, `ttnn.mul`: 요소별 연산
-- `ttnn.softmax`, `ttnn.relu`, `ttnn.gelu`: 활성화 함수
-- `ttnn.layer_norm`, `ttnn.rms_norm`: 정규화
-- `ttnn.embedding`: 임베딩 룩업
-
-### 3. TT-Metalium (Low-Level)
-
-저수준 SDK로 커스텀 커널을 직접 개발할 수 있습니다.
-
-**커널 타입**:
-- **Data Movement 커널**: 메모리 간 데이터 이동
-- **Compute 커널**: SFPU(Scalar Floating Point Unit)를 사용한 연산
-- **Ethernet 커널**: 멀티칩 통신
-
-## BitNet b1.58 아키텍처
-
-### 개요
-
-BitNet b1.58은 Microsoft Research에서 개발한 1-bit LLM 아키텍처입니다. 모든 가중치가 삼진 값 **{-1, 0, 1}**로 표현됩니다.
-
-### 핵심 컴포넌트: BitLinear
-
-```
-Input -> LayerNorm -> Absmax Quantization -> 1-bit Weights -> Dequantization -> Output
-                           |
-                     beta (scale factor)
-```
-
-**BitLinear 연산**:
-1. 활성화를 8-bit 정수로 양자화 (absmax 양자화)
-2. 가중치를 삼진 값 {-1, 0, 1}로 양자화 (absmean 양자화)
-3. 정수 행렬 곱셈 수행
-4. 결과를 역양자화
-
-### 장점
-
-| 항목 | BitNet b1.58 | FP16 모델 |
-|------|--------------|----------|
-| 가중치 크기 | ~1.58 bits/param | 16 bits/param |
-| 메모리 사용량 | ~10x 감소 | 기준 |
-| 에너지 소비 | 크게 감소 | 기준 |
-| 추론 속도 | 향상 | 기준 |
-| 정확도 | 동등 (3B+ 모델) | 기준 |
-
-### 참조 모델
-
-- **BitNet b1.58 2B4T**: 2B 파라미터, 4T 토큰으로 학습된 최초의 오픈소스 네이티브 1-bit LLM
-- HuggingFace: `microsoft/bitnet-b1.58-2B-4T`
-
-## 설치 및 환경 설정
-
-### 사전 요구사항
-
-- Tenstorrent Blackhole p150a 카드
 - Ubuntu 20.04/22.04 LTS
-- Python 3.12+
+- Python 3.10+
+- TT-NN SDK
+- PyTorch 2.0+
+- Transformers 4.40+
 
-### 프로젝트 설치
+## 구현 세부사항
 
-```bash
-git clone https://github.com/your-username/bitnet-tt.git
-cd bitnet-tt
-uv sync
-```
-
-## 사용법
+### TT-NN 텐서 레이아웃
 
 ```python
-from bitnet_tt import BitNetModel
+# TILE_LAYOUT: 연산에 최적화 (기본값)
+# ROW_MAJOR_LAYOUT: reshape/permute 전에 변환 필요
 
-# 모델 로드
-model = BitNetModel.from_pretrained("microsoft/bitnet-b1.58-2B-4T")
+# reshape/permute 전 레이아웃 변환
+x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+x = ttnn.reshape(x, new_shape)
+x = ttnn.permute(x, dims)
+x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+```
 
-# 추론
-output = model.generate("Hello, world!")
+### 가중치 매핑
+
+HuggingFace → TT-NN 가중치 매핑:
+
+```python
+layer_mapping = {
+    "input_layernorm.weight": "input_layernorm.weight",
+    "self_attn.q_proj.weight": "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight": "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight": "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight": "self_attn.o_proj.weight",
+    "self_attn.attn_sub_norm.weight": "self_attn.attn_sub_norm.weight",  # BitNet 전용
+    "mlp.gate_proj.weight": "mlp.gate_proj.weight",
+    "mlp.up_proj.weight": "mlp.up_proj.weight",
+    "mlp.down_proj.weight": "mlp.down_proj.weight",
+    "mlp.ffn_sub_norm.weight": "mlp.ffn_sub_norm.weight",  # BitNet 전용
+    "post_attention_layernorm.weight": "post_attention_layernorm.weight",
+}
 ```
 
 ## 참고 자료
@@ -151,7 +242,7 @@ output = model.generate("Hello, world!")
 - [BitNet 논문 (arXiv:2310.11453)](https://arxiv.org/abs/2310.11453)
 - [BitNet b1.58 논문 (arXiv:2402.17764)](https://arxiv.org/abs/2402.17764)
 - [BitNet b1.58 2B4T (HuggingFace)](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-- [bitnet.cpp (추론 라이브러리)](https://github.com/microsoft/BitNet)
+- [HuggingFace Transformers BitNet](https://github.com/huggingface/transformers/tree/main/src/transformers/models/bitnet)
 
 ## 라이선스
 
