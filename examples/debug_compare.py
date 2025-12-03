@@ -108,10 +108,12 @@ def main():
 
         compare_tensors("Layer 0 input_layernorm", hf_normed, ttnn_normed)
 
-        # Compare Q projection
-        print("[5] Comparing Q projection...")
+        # Compare Q projection using pure PyTorch matmul (not HF BitLinear)
+        print("[5] Comparing Q projection (pure matmul, no quantization)...")
+        q_weight = hf_model.model.layers[0].self_attn.q_proj.weight.detach()
         with torch.no_grad():
-            hf_q = hf_model.model.layers[0].self_attn.q_proj(hf_normed)
+            # Pure PyTorch linear: x @ W^T
+            hf_q = torch.nn.functional.linear(hf_normed, q_weight)
 
         from bitnet_tt.layers.bitlinear import Linear
         ttnn_q_proj = Linear(
@@ -119,12 +121,33 @@ def main():
             out_features=hf_model.config.hidden_size,
             device=device,
         )
-        ttnn_q_proj.load_weights(
-            hf_model.model.layers[0].self_attn.q_proj.weight.detach().numpy()
-        )
+        ttnn_q_proj.load_weights(q_weight.numpy())
         ttnn_q = ttnn_q_proj(ttnn_normed)
 
         compare_tensors("Layer 0 Q projection", hf_q, ttnn_q)
+
+        # Compare full attention output (without RoPE for now)
+        print("[6] Checking attention output shape and basic stats...")
+        print(f"Q shape: HF={hf_q.shape}, TT-NN={ttnn_q.shape}")
+
+        # Test reshape and permute
+        batch_size = 1
+        seq_len = 2
+        num_heads = 20
+        head_dim = 128
+
+        ttnn_q_reshaped = ttnn.reshape(ttnn_q, (batch_size, seq_len, num_heads, head_dim))
+        ttnn_q_permuted = ttnn.permute(ttnn_q_reshaped, (0, 2, 1, 3))
+        print(f"TT-NN Q after reshape: {ttnn_q_reshaped.shape}")
+        print(f"TT-NN Q after permute: {ttnn_q_permuted.shape}")
+
+        # Compare with PyTorch
+        hf_q_reshaped = hf_q.view(batch_size, seq_len, num_heads, head_dim)
+        hf_q_permuted = hf_q_reshaped.permute(0, 2, 1, 3)
+        print(f"HF Q after reshape: {hf_q_reshaped.shape}")
+        print(f"HF Q after permute: {hf_q_permuted.shape}")
+
+        compare_tensors("Q after permute", hf_q_permuted, ttnn_q_permuted)
 
         print("=" * 60)
         print("Debug comparison complete!")
