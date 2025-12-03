@@ -5,13 +5,16 @@ This module implements the Transformer decoder block with:
 - Pre-normalization (RMSNorm before attention and FFN)
 - Residual connections
 - BitNet-style attention and FFN with sub-norms
+- KV-Cache support for efficient generation
 """
+
+from typing import Optional
 
 import numpy as np
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.attention import MultiHeadAttention
+from bitnet_tt.layers.attention import KVCache, MultiHeadAttention
 from bitnet_tt.layers.bitlinear import RMSNorm
 from bitnet_tt.layers.ffn import FeedForward
 
@@ -36,6 +39,7 @@ class TransformerBlock:
         max_position_embeddings: int = 4096,
         rope_theta: float = 10000.0,
         rms_norm_eps: float = 1e-6,
+        layer_idx: int = 0,
     ) -> None:
         """
         Initialize transformer block.
@@ -49,9 +53,11 @@ class TransformerBlock:
             max_position_embeddings: Maximum sequence length
             rope_theta: RoPE base frequency
             rms_norm_eps: RMSNorm epsilon
+            layer_idx: Layer index for cache management
         """
         self.hidden_size = hidden_size
         self.device = device
+        self.layer_idx = layer_idx
 
         # Pre-attention normalization
         self.input_layernorm = RMSNorm(hidden_size, device, rms_norm_eps)
@@ -65,6 +71,7 @@ class TransformerBlock:
             max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             eps=rms_norm_eps,
+            layer_idx=layer_idx,
         )
 
         # Pre-FFN normalization
@@ -130,16 +137,22 @@ class TransformerBlock:
         self,
         hidden_states: ttnn.Tensor,
         attention_mask: ttnn.Tensor | None = None,
-    ) -> ttnn.Tensor:
+        position_ids: NDArray[np.integer] | None = None,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
-        Forward pass.
+        Forward pass with optional KV-Cache support.
 
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
             attention_mask: Optional attention mask
+            position_ids: Position indices for RoPE
+            past_key_value: Optional KV-Cache from previous forward passes
+            use_cache: Whether to return updated KV-Cache
 
         Returns:
-            Output tensor of shape (batch, seq_len, hidden_size)
+            Tuple of (output tensor, updated KV-Cache if use_cache else None)
         """
         residual = hidden_states
 
@@ -147,7 +160,13 @@ class TransformerBlock:
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self-attention (includes attn_sub_norm before o_proj)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states, updated_cache = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
 
         # Residual connection
         hidden_states = ttnn.add(residual, hidden_states)
@@ -162,4 +181,4 @@ class TransformerBlock:
         # Residual connection
         hidden_states = ttnn.add(residual, hidden_states)
 
-        return hidden_states
+        return hidden_states, updated_cache

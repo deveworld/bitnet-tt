@@ -2,7 +2,7 @@
 Text generation utilities for BitNet using TT-NN.
 
 This module provides a high-level interface for text generation
-using BitNet models on Tenstorrent hardware.
+using BitNet models on Tenstorrent hardware with KV-Cache support.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from bitnet_tt.layers.attention import KVCache
 from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn, ttnn_to_numpy
 
 if TYPE_CHECKING:
@@ -20,7 +21,8 @@ class TextGenerator:
     """
     TT-NN native text generator for BitNet.
 
-    Generates text on Tenstorrent hardware using autoregressive decoding.
+    Generates text on Tenstorrent hardware using autoregressive decoding
+    with KV-Cache for efficient generation.
     """
 
     def __init__(
@@ -62,6 +64,7 @@ class TextGenerator:
         temperature: float = 1.0,
         top_k: int | None = 50,
         do_sample: bool = True,
+        use_cache: bool = True,
     ) -> str:
         """
         Generate text from a prompt.
@@ -72,6 +75,7 @@ class TextGenerator:
             temperature: Sampling temperature (higher = more random)
             top_k: Top-k filtering (None to disable)
             do_sample: Whether to sample (False for greedy decoding)
+            use_cache: Whether to use KV-Cache for efficient generation
 
         Returns:
             Generated text including the prompt
@@ -90,6 +94,7 @@ class TextGenerator:
             temperature=temperature,
             top_k=top_k,
             do_sample=do_sample,
+            use_cache=use_cache,
         )
 
         # Decode to text
@@ -104,9 +109,81 @@ class TextGenerator:
         temperature: float,
         top_k: int | None,
         do_sample: bool,
+        use_cache: bool = True,
     ) -> NDArray[np.int64]:
         """
-        Generate tokens autoregressively.
+        Generate tokens autoregressively with optional KV-Cache.
+
+        Args:
+            input_ids: Input token IDs of shape (batch, seq_len)
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            do_sample: Whether to sample
+            use_cache: Whether to use KV-Cache
+
+        Returns:
+            Generated token IDs of shape (batch, seq_len + max_new_tokens)
+        """
+        batch_size, seq_len = input_ids.shape
+        generated = input_ids.copy()
+
+        # Initialize KV-Cache
+        past_key_values: list[KVCache] | None = None
+
+        for step in range(max_new_tokens):
+            if use_cache and past_key_values is not None:
+                # Only process the new token (KV-Cache optimization)
+                current_input = generated[:, -1:]
+            else:
+                # Process full sequence (first iteration or no cache)
+                current_input = generated
+
+            # Convert current input to TT-NN tensor
+            input_tensor = numpy_int_to_ttnn(current_input, self.device)
+
+            # Forward pass with KV-Cache
+            logits, past_key_values = self.model(
+                input_tensor,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
+            # Get logits for the last position
+            # logits shape: (batch, seq, vocab_size)
+            logits_np = ttnn_to_numpy(logits)
+            next_token_logits = logits_np[:, -1, :]  # (batch, vocab_size)
+
+            # Sample next token
+            next_token = self._sample_token(
+                next_token_logits,
+                temperature=temperature,
+                top_k=top_k,
+                do_sample=do_sample,
+            )
+
+            # Append to generated sequence
+            generated = np.concatenate(
+                [generated, next_token.reshape(batch_size, 1)], axis=1
+            )
+
+            # Check for EOS token
+            if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
+                if next_token[0] == self.tokenizer.eos_token_id:
+                    break
+
+        return generated
+
+    def _generate_tokens_no_cache(
+        self,
+        input_ids: NDArray[np.int64],
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int | None,
+        do_sample: bool,
+    ) -> NDArray[np.int64]:
+        """
+        Generate tokens autoregressively without KV-Cache (legacy method).
 
         Args:
             input_ids: Input token IDs of shape (batch, seq_len)
@@ -125,13 +202,12 @@ class TextGenerator:
             # Convert current sequence to TT-NN tensor
             input_tensor = numpy_int_to_ttnn(generated, self.device)
 
-            # Forward pass
-            logits = self.model(input_tensor)
+            # Forward pass without cache
+            logits, _ = self.model(input_tensor, use_cache=False)
 
             # Get logits for the last position
-            # logits shape: (batch, seq, vocab_size)
             logits_np = ttnn_to_numpy(logits)
-            next_token_logits = logits_np[:, -1, :]  # (batch, vocab_size)
+            next_token_logits = logits_np[:, -1, :]
 
             # Sample next token
             next_token = self._sample_token(
@@ -216,6 +292,7 @@ class TextGenerator:
         messages: list[dict[str, str]],
         max_new_tokens: int = 256,
         temperature: float = 0.7,
+        use_cache: bool = True,
     ) -> str:
         """
         Generate a response in chat format.
@@ -224,6 +301,7 @@ class TextGenerator:
             messages: List of message dicts with 'role' and 'content' keys
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            use_cache: Whether to use KV-Cache
 
         Returns:
             Assistant's response
@@ -244,6 +322,7 @@ class TextGenerator:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=True,
+            use_cache=use_cache,
         )
 
         return response

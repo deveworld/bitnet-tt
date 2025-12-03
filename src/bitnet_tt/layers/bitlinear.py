@@ -188,11 +188,13 @@ class Linear:
     """
     TT-NN native Linear layer with weight quantization.
 
-    For BF16 BitNet models: applies ternary weight quantization during forward pass.
-    HuggingFace BitLinear applies WeightQuant.apply() which computes:
-        scale = weight.abs().mean()
-        e = weight.mean()
-        weight_quant = sign(weight - e) * scale
+    For BF16 BitNet models: applies ternary weight quantization at load time.
+    HuggingFace BitLinear applies weight_quant() which computes:
+        s = 1.0 / weight.abs().mean()
+        result = (weight * s).round().clamp(-1, 1) / s
+
+    This quantizes weights to {-scale, 0, +scale} where scale = mean(|weight|).
+    Quantization is pre-computed during load_weights() for efficiency.
     """
 
     def __init__(
@@ -216,21 +218,29 @@ class Linear:
 
     def load_weights(self, weight: NDArray[np.floating]) -> None:
         """
-        Load weights to device.
+        Load and pre-quantize weights to device.
+
+        Applies ternary weight quantization matching HuggingFace BitLinear:
+            s = 1.0 / weight.abs().mean()
+            result = (weight * s).round().clamp(-1, 1) / s
 
         Args:
             weight: Weight array of shape (out_features, in_features)
         """
-        self.weight = numpy_to_ttnn(weight.astype(np.float32), self.device)
+        weight = weight.astype(np.float32)
+
+        # Pre-compute ternary quantization (matching HF BitLinear weight_quant)
+        # s = 1 / mean(|weight|), result = round(weight * s).clamp(-1, 1) / s
+        scale = np.abs(weight).mean()
+        s = 1.0 / max(scale, 1e-5)
+        weight_quant = np.clip(np.round(weight * s), -1, 1) / s
+
+        # Store pre-quantized weights
+        self.weight = numpy_to_ttnn(weight_quant, self.device)
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         """
-        Forward pass with weight quantization.
-
-        Applies ternary weight quantization matching HuggingFace BitLinear:
-            scale = weight.abs().mean()
-            e = weight.mean()
-            weight_quant = sign(weight - e) * scale
+        Forward pass with pre-quantized weights.
 
         Args:
             x: Input tensor of shape (batch, seq_len, in_features)
@@ -241,20 +251,7 @@ class Linear:
         if self.weight is None:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
-        # Apply ternary weight quantization (matching HF BitLinear WeightQuant)
-        # scale = weight.abs().mean()
-        weight_abs = ttnn.abs(self.weight)
-        scale = ttnn.mean(weight_abs)
-
-        # e = weight.mean()
-        e = ttnn.mean(self.weight)
-
-        # weight_quant = sign(weight - e) * scale
-        weight_centered = ttnn.subtract(self.weight, e)
-        weight_sign = ttnn.sign(weight_centered)
-        weight_quant = ttnn.multiply(weight_sign, scale)
-
-        weight_t = ttnn.transpose(weight_quant, -2, -1)
+        weight_t = ttnn.transpose(self.weight, -2, -1)
         return ttnn.matmul(x, weight_t)
 
 

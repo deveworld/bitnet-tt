@@ -11,6 +11,9 @@ Quick start:
     # Run full 2B model demo
     python main.py --full
 
+    # Run interactive chat
+    python main.py --chat
+
     # Run quick test
     python main.py --test
 """
@@ -29,14 +32,36 @@ def main() -> None:
         help="Run with full 2B model from HuggingFace",
     )
     parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Run interactive chat mode with full model",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Run quick self-test",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to generate (default: 256)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (default: 0.7)",
     )
     args = parser.parse_args()
 
     if args.test:
         run_quick_test()
+    elif args.chat:
+        run_interactive_chat(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+        )
     elif args.full:
         from examples.demo import run_full_demo
         run_full_demo()
@@ -45,15 +70,158 @@ def main() -> None:
         run_mini_demo()
 
 
+def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> None:
+    """Run interactive chat mode with the full BitNet model."""
+    print("=" * 60)
+    print("BitNet-TT Interactive Chat")
+    print("=" * 60)
+    print()
+
+    from bitnet_tt.utils.device import is_ttnn_available
+
+    if not is_ttnn_available():
+        print("Error: TT-NN is not available.")
+        print("Please install the Tenstorrent SDK and drivers.")
+        return
+
+    print("Loading model... (this may take a while on first run)")
+    print()
+
+    from bitnet_tt.inference.generator import TextGenerator
+    from bitnet_tt.model.bitnet import create_model
+    from bitnet_tt.utils.device import device_context
+    from bitnet_tt.utils.weights import load_bitnet_weights, load_weights_to_model
+
+    with device_context() as device:
+        # Load model
+        try:
+            state_dict, config = load_bitnet_weights("microsoft/bitnet-b1.58-2B-4T-bf16")
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+            print("Please ensure you have internet access and huggingface_hub installed.")
+            return
+
+        model = create_model(config, device)
+        load_weights_to_model(model, state_dict)
+
+        # Create generator
+        generator = TextGenerator(model)
+
+        if generator.tokenizer is None:
+            print("Error: Tokenizer not available.")
+            return
+
+        print("Model loaded successfully!")
+        print()
+        print("Commands:")
+        print("  /quit, /exit, /q - Exit the chat")
+        print("  /clear, /reset   - Clear conversation history")
+        print("  /temp <value>    - Set temperature (e.g., /temp 0.5)")
+        print("  /tokens <value>  - Set max tokens (e.g., /tokens 100)")
+        print()
+        print("-" * 60)
+
+        # Chat loop
+        conversation_history = []
+        current_temp = temperature
+        current_max_tokens = max_tokens
+
+        while True:
+            try:
+                user_input = input("\nYou: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nGoodbye!")
+                break
+
+            if not user_input:
+                continue
+
+            # Handle commands
+            if user_input.startswith("/"):
+                cmd = user_input.lower().split()
+                if cmd[0] in ["/quit", "/exit", "/q"]:
+                    print("\nGoodbye!")
+                    break
+                elif cmd[0] in ["/clear", "/reset"]:
+                    conversation_history = []
+                    print("Conversation cleared.")
+                    continue
+                elif cmd[0] == "/temp" and len(cmd) > 1:
+                    try:
+                        current_temp = float(cmd[1])
+                        print(f"Temperature set to {current_temp}")
+                    except ValueError:
+                        print("Invalid temperature value.")
+                    continue
+                elif cmd[0] == "/tokens" and len(cmd) > 1:
+                    try:
+                        current_max_tokens = int(cmd[1])
+                        print(f"Max tokens set to {current_max_tokens}")
+                    except ValueError:
+                        print("Invalid token count.")
+                    continue
+                else:
+                    print("Unknown command. Use /quit to exit.")
+                    continue
+
+            # Add user message to history
+            conversation_history.append({"role": "user", "content": user_input})
+
+            # Generate response
+            print("\nAssistant: ", end="", flush=True)
+
+            try:
+                response = generator.chat(
+                    conversation_history,
+                    max_new_tokens=current_max_tokens,
+                    temperature=current_temp,
+                    use_cache=True,
+                )
+
+                # Extract just the assistant's response from the full output
+                # The response includes the full conversation, so we need to extract the new part
+                if hasattr(generator.tokenizer, "apply_chat_template"):
+                    # Find where the assistant response starts
+                    prompt = generator.tokenizer.apply_chat_template(
+                        conversation_history,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    if response.startswith(prompt):
+                        assistant_response = response[len(prompt):].strip()
+                    else:
+                        # Fallback: try to extract the last assistant response
+                        assistant_response = response.split("Assistant:")[-1].strip()
+                else:
+                    assistant_response = response
+
+                # Clean up the response (remove any trailing special tokens)
+                if generator.tokenizer.eos_token:
+                    assistant_response = assistant_response.replace(
+                        generator.tokenizer.eos_token, ""
+                    ).strip()
+
+                print(assistant_response)
+
+                # Add assistant response to history
+                conversation_history.append({"role": "assistant", "content": assistant_response})
+
+            except Exception as e:
+                print(f"\nError generating response: {e}")
+                # Remove the failed user message from history
+                conversation_history.pop()
+
+
 def run_quick_test() -> None:
     """Run a quick self-test to verify the installation."""
     print("Running quick self-test...")
     print()
 
     # Test imports
-    print("[1/4] Testing imports...")
+    print("[1/5] Testing imports...")
     try:
         from bitnet_tt.config import BitNetMiniConfig  # noqa: F401
+        from bitnet_tt.layers.attention import KVCache  # noqa: F401
         from bitnet_tt.utils.device import is_ttnn_available
         from bitnet_tt.utils.quantization import weight_quant_ternary
 
@@ -63,7 +231,7 @@ def run_quick_test() -> None:
         sys.exit(1)
 
     # Check TT-NN availability
-    print("[2/4] Checking TT-NN availability...")
+    print("[2/5] Checking TT-NN availability...")
     if is_ttnn_available():
         print("      TT-NN is available")
     else:
@@ -72,7 +240,7 @@ def run_quick_test() -> None:
         sys.exit(0)
 
     # Test device
-    print("[3/4] Testing device access...")
+    print("[3/5] Testing device access...")
     try:
         from bitnet_tt.utils.device import close_device, get_device
 
@@ -85,7 +253,7 @@ def run_quick_test() -> None:
         sys.exit(1)
 
     # Test quantization
-    print("[4/4] Testing quantization...")
+    print("[4/5] Testing quantization...")
     try:
         import numpy as np
 
@@ -98,11 +266,26 @@ def run_quick_test() -> None:
         print(f"      FAILED: {e}")
         sys.exit(1)
 
+    # Test KV-Cache
+    print("[5/5] Testing KV-Cache...")
+    try:
+        from bitnet_tt.layers.attention import KVCache
+
+        cache = KVCache()
+        assert cache.key_cache is None
+        assert cache.seq_len_cached == 0
+        cache.reset()
+        print("      KV-Cache OK")
+    except Exception as e:
+        print(f"      FAILED: {e}")
+        sys.exit(1)
+
     print()
     print("All tests passed!")
     print()
     print("Run 'python main.py' to run the mini model demo")
     print("Run 'python main.py --full' to run the full 2B model demo")
+    print("Run 'python main.py --chat' for interactive chat mode")
 
 
 if __name__ == "__main__":

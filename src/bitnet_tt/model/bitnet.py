@@ -4,16 +4,19 @@ BitNet model implementation using TT-NN.
 This module provides the complete BitNet model for causal language modeling,
 including:
 - Token embedding
-- Stack of Transformer blocks
+- Stack of Transformer blocks with KV-Cache support
 - Final normalization
 - Language model head
 """
+
+from typing import Optional
 
 import numpy as np
 import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.config import BitNetConfig
+from bitnet_tt.layers.attention import KVCache
 from bitnet_tt.layers.bitlinear import RMSNorm, numpy_to_ttnn
 from bitnet_tt.layers.embedding import Embedding
 from bitnet_tt.model.transformer import TransformerBlock
@@ -51,7 +54,7 @@ class BitNetModel:
 
         # Transformer layers
         self.layers: list[TransformerBlock] = []
-        for _ in range(config.num_layers):
+        for layer_idx in range(config.num_layers):
             self.layers.append(
                 TransformerBlock(
                     hidden_size=config.hidden_size,
@@ -62,6 +65,7 @@ class BitNetModel:
                     max_position_embeddings=config.max_position_embeddings,
                     rope_theta=config.rope_theta,
                     rms_norm_eps=config.rms_norm_eps,
+                    layer_idx=layer_idx,
                 )
             )
 
@@ -129,23 +133,46 @@ class BitNetModel:
         self,
         input_ids: ttnn.Tensor,
         attention_mask: ttnn.Tensor | None = None,
-    ) -> ttnn.Tensor:
+        position_ids: NDArray[np.integer] | None = None,
+        past_key_values: list[KVCache] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[ttnn.Tensor, Optional[list[KVCache]]]:
         """
-        Forward pass.
+        Forward pass with optional KV-Cache support.
 
         Args:
             input_ids: Token indices tensor of shape (batch, seq_len)
             attention_mask: Optional attention mask
+            position_ids: Position indices for RoPE (seq_len,) or None
+            past_key_values: List of KV-Cache for each layer (from previous forward)
+            use_cache: Whether to return updated KV-Cache
 
         Returns:
-            Logits tensor of shape (batch, seq_len, vocab_size)
+            Tuple of (logits tensor, updated KV-Cache list if use_cache else None)
         """
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
 
+        # Initialize cache list if using cache
+        if use_cache and past_key_values is None:
+            past_key_values = [None] * len(self.layers)
+
+        updated_caches: list[KVCache] = [] if use_cache else None
+
         # Process through transformer layers
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+        for layer_idx, layer in enumerate(self.layers):
+            past_kv = past_key_values[layer_idx] if past_key_values else None
+
+            hidden_states, updated_cache = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_kv,
+                use_cache=use_cache,
+            )
+
+            if use_cache:
+                updated_caches.append(updated_cache)
 
         # Final normalization
         hidden_states = self.norm(hidden_states)
@@ -156,7 +183,18 @@ class BitNetModel:
 
         logits = ttnn.matmul(hidden_states, ttnn.transpose(self.lm_head_weight, -2, -1))
 
-        return logits
+        return logits, updated_caches if use_cache else None
+
+    def reset_cache(self, past_key_values: list[KVCache]) -> None:
+        """
+        Reset all KV-Caches.
+
+        Args:
+            past_key_values: List of KV-Cache to reset
+        """
+        for cache in past_key_values:
+            if cache is not None:
+                cache.reset()
 
 
 def create_model(

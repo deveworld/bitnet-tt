@@ -108,12 +108,20 @@ def main():
 
         compare_tensors("Layer 0 input_layernorm", hf_normed, ttnn_normed)
 
-        # Compare Q projection using pure PyTorch matmul (not HF BitLinear)
-        print("[5] Comparing Q projection (pure matmul, no quantization)...")
+        # Compare Q projection with weight quantization (matching HF BitLinear)
+        print("[5] Comparing Q projection (with BitLinear quantization)...")
         q_weight = hf_model.model.layers[0].self_attn.q_proj.weight.detach()
+
+        # Manually apply HuggingFace BitLinear weight_quant formula:
+        # s = 1.0 / weight.abs().mean()
+        # result = (weight * s).round().clamp(-1, 1) / s
+        def weight_quant_hf(weight: torch.Tensor) -> torch.Tensor:
+            s = 1.0 / weight.abs().mean().clamp_(min=1e-5)
+            return (weight * s).round().clamp_(-1, 1) / s
+
         with torch.no_grad():
-            # Pure PyTorch linear: x @ W^T
-            hf_q = torch.nn.functional.linear(hf_normed, q_weight)
+            q_weight_quant = weight_quant_hf(q_weight)
+            hf_q = torch.nn.functional.linear(hf_normed, q_weight_quant)
 
         from bitnet_tt.layers.bitlinear import Linear
         ttnn_q_proj = Linear(
@@ -121,6 +129,7 @@ def main():
             out_features=hf_model.config.hidden_size,
             device=device,
         )
+        # Load weights - our Linear applies the same quantization as HF BitLinear
         ttnn_q_proj.load_weights(q_weight.numpy())
         ttnn_q = ttnn_q_proj(ttnn_normed)
 
@@ -130,14 +139,19 @@ def main():
         print("[6] Checking attention output shape and basic stats...")
         print(f"Q shape: HF={hf_q.shape}, TT-NN={ttnn_q.shape}")
 
-        # Test reshape and permute
+        # Test reshape and permute with layout conversion
         batch_size = 1
-        seq_len = 2
+        seq_len = input_ids.shape[1]
         num_heads = 20
         head_dim = 128
 
-        ttnn_q_reshaped = ttnn.reshape(ttnn_q, (batch_size, seq_len, num_heads, head_dim))
+        # Convert to ROW_MAJOR for reshape/permute (matching the fixed attention.py)
+        ttnn_q_row = ttnn.to_layout(ttnn_q, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn_q_reshaped = ttnn.reshape(ttnn_q_row, (batch_size, seq_len, num_heads, head_dim))
         ttnn_q_permuted = ttnn.permute(ttnn_q_reshaped, (0, 2, 1, 3))
+        # Convert back to TILE_LAYOUT
+        ttnn_q_permuted = ttnn.to_layout(ttnn_q_permuted, ttnn.TILE_LAYOUT)
+
         print(f"TT-NN Q after reshape: {ttnn_q_reshaped.shape}")
         print(f"TT-NN Q after permute: {ttnn_q_permuted.shape}")
 
@@ -171,7 +185,7 @@ def main():
         cos_ttnn = numpy_to_ttnn(cos_np, device)
         print(f"cos_ttnn shape: {cos_ttnn.shape}")
 
-        # Slice to seq_len=2
+        # Slice to seq_len
         cos_sliced = cos_ttnn[:, :, :seq_len, :]
         print(f"cos_sliced shape: {cos_sliced.shape}")
 
@@ -215,6 +229,35 @@ def main():
         print(f"hf_rotated shape: {hf_rotated.shape}")
 
         compare_tensors("rotate_half result", hf_rotated, ttnn_rotated)
+
+        # Test full RoPE application
+        print("\n[10] Testing full RoPE application...")
+
+        # Get cos/sin for current positions
+        position_ids = np.arange(seq_len, dtype=np.int64)
+        cos_pos = cos_np[:, :, position_ids, :]
+        sin_pos = sin_np[:, :, position_ids, :]
+
+        cos_ttnn_pos = numpy_to_ttnn(cos_pos.astype(np.float32), device)
+        sin_ttnn_pos = numpy_to_ttnn(sin_pos.astype(np.float32), device)
+
+        # Expand cos/sin to match Q shape
+        cos_expanded = ttnn.repeat(cos_ttnn_pos, ttnn.Shape([1, num_heads, 1, 1]))
+        sin_expanded = ttnn.repeat(sin_ttnn_pos, ttnn.Shape([1, num_heads, 1, 1]))
+
+        # Apply RoPE in TT-NN
+        ttnn_q_cos = ttnn.multiply(ttnn_q_permuted, cos_expanded)
+        ttnn_q_rot_sin = ttnn.multiply(ttnn_rotated, sin_expanded)
+        ttnn_q_rope = ttnn.add(ttnn_q_cos, ttnn_q_rot_sin)
+
+        # Apply RoPE in PyTorch
+        cos_torch = torch.from_numpy(cos_pos).expand(1, num_heads, seq_len, head_dim)
+        sin_torch = torch.from_numpy(sin_pos).expand(1, num_heads, seq_len, head_dim)
+        hf_q_cos = hf_q_permuted * cos_torch
+        hf_q_rot_sin = hf_rotated * sin_torch
+        hf_q_rope = hf_q_cos + hf_q_rot_sin
+
+        compare_tensors("Q after RoPE", hf_q_rope, ttnn_q_rope)
 
         print("=" * 60)
         print("Debug comparison complete!")

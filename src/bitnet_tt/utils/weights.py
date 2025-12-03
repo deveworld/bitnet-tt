@@ -114,7 +114,10 @@ def convert_hf_state_dict(
         "mlp.gate_proj.weight": "mlp.gate_proj.weight",
         "mlp.up_proj.weight": "mlp.up_proj.weight",
         "mlp.down_proj.weight": "mlp.down_proj.weight",
-        # BitLinear norm weights
+        # BitNet sub-norm weights (critical for BitNet architecture)
+        "self_attn.attn_sub_norm.weight": "self_attn.attn_sub_norm.weight",
+        "mlp.ffn_sub_norm.weight": "mlp.ffn_sub_norm.weight",
+        # BitLinear norm weights (if present in model)
         "self_attn.q_proj.input_norm.weight": "self_attn.q_proj.input_norm.weight",
         "self_attn.k_proj.input_norm.weight": "self_attn.k_proj.input_norm.weight",
         "self_attn.v_proj.input_norm.weight": "self_attn.v_proj.input_norm.weight",

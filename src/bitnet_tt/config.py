@@ -35,7 +35,7 @@ class BitNetConfig:
     hidden_act: str = "relu2"  # Squared ReLU (ReLU^2)
 
     # Misc
-    tie_word_embeddings: bool = False
+    tie_word_embeddings: bool = True
     use_cache: bool = True
     attention_dropout: float = 0.0
     attention_bias: bool = False
