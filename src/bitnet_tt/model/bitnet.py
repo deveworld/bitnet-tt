@@ -196,6 +196,43 @@ class BitNetModel:
             if cache is not None:
                 cache.reset()
 
+    def preallocate_cache(
+        self,
+        batch_size: int = 1,
+        max_seq_len: int | None = None,
+    ) -> list[KVCache]:
+        """
+        Pre-allocate KV-Cache for all layers.
+
+        This avoids memory reallocation during generation and improves performance.
+
+        Args:
+            batch_size: Batch size for generation
+            max_seq_len: Maximum sequence length to cache (default: config.max_position_embeddings)
+
+        Returns:
+            List of pre-allocated KVCache objects for each layer
+        """
+        if max_seq_len is None:
+            max_seq_len = self.config.max_position_embeddings
+
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        caches: list[KVCache] = []
+        for _ in range(len(self.layers)):
+            cache = KVCache()
+            cache.preallocate(
+                batch_size=batch_size,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                head_dim=head_dim,
+                device=self.device,
+            )
+            caches.append(cache)
+
+        return caches
+
 
 def create_model(
     config: BitNetConfig,

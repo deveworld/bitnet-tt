@@ -267,11 +267,16 @@ class MultiHeadAttention:
         # Sub-norm applied after attention, before o_proj
         self.attn_sub_norm = RMSNorm(hidden_size, device, eps)
 
-        # Precompute RoPE frequencies (stored as numpy for flexible slicing)
-        self.cos_np, self.sin_np = precompute_freqs_cis(
+        # Precompute RoPE frequencies and upload to device once
+        cos_np, sin_np = precompute_freqs_cis(
             self.head_dim, max_position_embeddings, rope_theta
         )
         self.max_position_embeddings = max_position_embeddings
+
+        # Upload full RoPE tensors to device (only done once at init)
+        # Shape: (1, 1, max_seq_len, head_dim)
+        self.cos_device = numpy_to_ttnn(cos_np.astype(np.float32), device)
+        self.sin_device = numpy_to_ttnn(sin_np.astype(np.float32), device)
 
     def load_weights(
         self,
@@ -348,22 +353,22 @@ class MultiHeadAttention:
         key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
         value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
 
-        # Determine position IDs for RoPE
-        if position_ids is None:
-            if past_key_value is not None and past_key_value.seq_len_cached > 0:
-                # For cached generation, positions start after cached sequence
-                start_pos = past_key_value.seq_len_cached
-                position_ids = np.arange(start_pos, start_pos + seq_len, dtype=np.int64)
-            else:
-                position_ids = np.arange(seq_len, dtype=np.int64)
+        # Determine position range for RoPE
+        if past_key_value is not None and past_key_value.seq_len_cached > 0:
+            # For cached generation, positions start after cached sequence
+            start_pos = past_key_value.seq_len_cached
+        else:
+            start_pos = 0
+        end_pos = start_pos + seq_len
 
-        # Get RoPE embeddings for current positions
-        cos = self.cos_np[:, :, position_ids, :]
-        sin = self.sin_np[:, :, position_ids, :]
-
-        # Convert to TT-NN tensors
-        cos_ttnn = numpy_to_ttnn(cos.astype(np.float32), self.device)
-        sin_ttnn = numpy_to_ttnn(sin.astype(np.float32), self.device)
+        # Slice RoPE embeddings from pre-uploaded device tensors (no CPU->GPU transfer)
+        # cos_device/sin_device shape: (1, 1, max_seq_len, head_dim)
+        cos_rm = ttnn.to_layout(self.cos_device, ttnn.ROW_MAJOR_LAYOUT)
+        sin_rm = ttnn.to_layout(self.sin_device, ttnn.ROW_MAJOR_LAYOUT)
+        cos_slice = cos_rm[:, :, start_pos:end_pos, :]
+        sin_slice = sin_rm[:, :, start_pos:end_pos, :]
+        cos_ttnn = ttnn.to_layout(cos_slice, ttnn.TILE_LAYOUT)
+        sin_ttnn = ttnn.to_layout(sin_slice, ttnn.TILE_LAYOUT)
 
         # Apply RoPE to query and key
         query = self._apply_rope(query, cos_ttnn, sin_ttnn)
@@ -374,7 +379,11 @@ class MultiHeadAttention:
         if use_cache:
             if past_key_value is None:
                 past_key_value = KVCache()
-            key, value = past_key_value.update(key, value, self.device)
+            # Use pre-allocated update if available, otherwise fall back to concat
+            if past_key_value._preallocated:
+                key, value = past_key_value.update_preallocated(key, value)
+            else:
+                key, value = past_key_value.update(key, value, self.device)
             updated_cache = past_key_value
 
         # Get full sequence length (including cached)

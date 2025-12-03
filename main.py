@@ -135,6 +135,9 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
             except (KeyboardInterrupt, EOFError):
                 print("\n\nGoodbye!")
                 break
+            except UnicodeDecodeError:
+                print("\nError: Invalid input encoding. Please use UTF-8.")
+                continue
 
             if not user_input:
                 continue

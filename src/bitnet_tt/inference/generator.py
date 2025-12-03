@@ -231,11 +231,18 @@ class TextGenerator:
         batch_size, seq_len = input_ids.shape
         generated = input_ids.copy()
 
-        # Initialize KV-Cache
-        past_key_values: list[KVCache] | None = None
+        # Pre-allocate KV-Cache for all layers (avoids memory reallocation)
+        if use_cache:
+            max_total_len = seq_len + max_new_tokens
+            past_key_values = self.model.preallocate_cache(
+                batch_size=batch_size,
+                max_seq_len=max_total_len,
+            )
+        else:
+            past_key_values = None
 
         for step in range(max_new_tokens):
-            if use_cache and past_key_values is not None:
+            if use_cache and step > 0:
                 # Only process the new token (KV-Cache optimization)
                 current_input = generated[:, -1:]
             else:
@@ -493,13 +500,22 @@ class TextGenerator:
 
         # Initialize
         generated = input_ids.copy()
-        past_key_values: list[KVCache] | None = None
         prev_text_len = len(self.tokenizer.decode(generated[0], skip_special_tokens=True))
+
+        # Pre-allocate KV-Cache for all layers (avoids memory reallocation)
+        if use_cache:
+            max_total_len = seq_len + max_new_tokens
+            past_key_values = self.model.preallocate_cache(
+                batch_size=batch_size,
+                max_seq_len=max_total_len,
+            )
+        else:
+            past_key_values = None
 
         for step in range(max_new_tokens):
             token_start = time.perf_counter()
 
-            if use_cache and past_key_values is not None:
+            if use_cache and step > 0:
                 current_input = generated[:, -1:]
             else:
                 current_input = generated
