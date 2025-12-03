@@ -112,12 +112,14 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
             return
 
         print("Model loaded successfully!")
+        print(f"Model: BitNet b1.58 2B-4T ({config.hidden_size}d, {config.num_layers}L)")
         print()
         print("Commands:")
         print("  /quit, /exit, /q - Exit the chat")
         print("  /clear, /reset   - Clear conversation history")
         print("  /temp <value>    - Set temperature (e.g., /temp 0.5)")
         print("  /tokens <value>  - Set max tokens (e.g., /tokens 100)")
+        print("  /stats           - Toggle stats display (default: on)")
         print()
         print("-" * 60)
 
@@ -125,6 +127,7 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
         conversation_history = []
         current_temp = temperature
         current_max_tokens = max_tokens
+        show_stats = True
 
         while True:
             try:
@@ -160,6 +163,10 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
                     except ValueError:
                         print("Invalid token count.")
                     continue
+                elif cmd[0] == "/stats":
+                    show_stats = not show_stats
+                    print(f"Stats display: {'on' if show_stats else 'off'}")
+                    continue
                 else:
                     print("Unknown command. Use /quit to exit.")
                     continue
@@ -167,47 +174,42 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
             # Add user message to history
             conversation_history.append({"role": "user", "content": user_input})
 
-            # Generate response
+            # Generate response with streaming
             print("\nAssistant: ", end="", flush=True)
 
             try:
-                response = generator.chat(
+                assistant_response = ""
+                final_stats = None
+
+                # Stream tokens
+                for new_text, stats in generator.chat_streaming(
                     conversation_history,
                     max_new_tokens=current_max_tokens,
                     temperature=current_temp,
                     use_cache=True,
-                )
+                ):
+                    # Print new text immediately
+                    print(new_text, end="", flush=True)
+                    assistant_response += new_text
+                    final_stats = stats
 
-                # Extract just the assistant's response from the full output
-                # The response includes the full conversation, so we need to extract the new part
-                if hasattr(generator.tokenizer, "apply_chat_template"):
-                    # Find where the assistant response starts
-                    prompt = generator.tokenizer.apply_chat_template(
-                        conversation_history,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    if response.startswith(prompt):
-                        assistant_response = response[len(prompt):].strip()
-                    else:
-                        # Fallback: try to extract the last assistant response
-                        assistant_response = response.split("Assistant:")[-1].strip()
-                else:
-                    assistant_response = response
-
-                # Clean up the response (remove any trailing special tokens)
+                # Clean up the response
                 if generator.tokenizer.eos_token:
                     assistant_response = assistant_response.replace(
                         generator.tokenizer.eos_token, ""
                     ).strip()
 
-                print(assistant_response)
+                # Print stats
+                if show_stats and final_stats:
+                    print(final_stats)
 
                 # Add assistant response to history
                 conversation_history.append({"role": "assistant", "content": assistant_response})
 
             except Exception as e:
                 print(f"\nError generating response: {e}")
+                import traceback
+                traceback.print_exc()
                 # Remove the failed user message from history
                 conversation_history.pop()
 

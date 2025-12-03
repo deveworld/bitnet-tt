@@ -5,7 +5,9 @@ This module provides a high-level interface for text generation
 using BitNet models on Tenstorrent hardware with KV-Cache support.
 """
 
-from typing import TYPE_CHECKING, Any
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Generator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +17,46 @@ from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn, ttnn_to_numpy
 
 if TYPE_CHECKING:
     from bitnet_tt.model.bitnet import BitNetModel
+
+
+@dataclass
+class GenerationStats:
+    """Statistics for text generation."""
+
+    prompt_tokens: int = 0
+    generated_tokens: int = 0
+    prompt_time: float = 0.0
+    generation_time: float = 0.0
+    token_times: list[float] = field(default_factory=list)
+
+    @property
+    def total_time(self) -> float:
+        return self.prompt_time + self.generation_time
+
+    @property
+    def tokens_per_second(self) -> float:
+        if self.generation_time > 0:
+            return self.generated_tokens / self.generation_time
+        return 0.0
+
+    @property
+    def time_to_first_token(self) -> float:
+        return self.prompt_time
+
+    @property
+    def avg_token_time(self) -> float:
+        if self.token_times:
+            return sum(self.token_times) / len(self.token_times)
+        return 0.0
+
+    def __str__(self) -> str:
+        return (
+            f"\n[Stats] "
+            f"Prompt: {self.prompt_tokens} tokens ({self.prompt_time*1000:.1f}ms) | "
+            f"Generated: {self.generated_tokens} tokens ({self.generation_time:.2f}s) | "
+            f"Speed: {self.tokens_per_second:.2f} tokens/s | "
+            f"TTFT: {self.time_to_first_token*1000:.1f}ms"
+        )
 
 
 class TextGenerator:
@@ -287,6 +329,100 @@ class TextGenerator:
                 ]
             )
 
+    def generate_streaming(
+        self,
+        prompt: str,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: int | None = 50,
+        do_sample: bool = True,
+        use_cache: bool = True,
+    ) -> Generator[tuple[str, GenerationStats], None, None]:
+        """
+        Generate text with streaming output.
+
+        Yields tokens as they are generated along with statistics.
+
+        Args:
+            prompt: Input prompt text
+            max_new_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            do_sample: Whether to sample
+            use_cache: Whether to use KV-Cache
+
+        Yields:
+            Tuple of (new_text, stats) for each generated token
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded. Please provide a tokenizer.")
+
+        # Tokenize prompt
+        inputs = self.tokenizer(prompt, return_tensors="np")
+        input_ids: NDArray[np.int64] = inputs["input_ids"]
+        batch_size, seq_len = input_ids.shape
+
+        stats = GenerationStats(prompt_tokens=seq_len)
+
+        # Initialize
+        generated = input_ids.copy()
+        past_key_values: list[KVCache] | None = None
+        prev_text_len = len(self.tokenizer.decode(generated[0], skip_special_tokens=True))
+
+        for step in range(max_new_tokens):
+            token_start = time.perf_counter()
+
+            if use_cache and past_key_values is not None:
+                current_input = generated[:, -1:]
+            else:
+                current_input = generated
+
+            # Forward pass
+            input_tensor = numpy_int_to_ttnn(current_input, self.device)
+            logits, past_key_values = self.model(
+                input_tensor,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
+            token_end = time.perf_counter()
+            token_time = token_end - token_start
+
+            # Record timing
+            if step == 0:
+                stats.prompt_time = token_time
+            else:
+                stats.token_times.append(token_time)
+                stats.generation_time += token_time
+
+            # Sample next token
+            logits_np = ttnn_to_numpy(logits)
+            next_token_logits = logits_np[:, -1, :]
+            next_token = self._sample_token(
+                next_token_logits,
+                temperature=temperature,
+                top_k=top_k,
+                do_sample=do_sample,
+            )
+
+            # Append token
+            generated = np.concatenate(
+                [generated, next_token.reshape(batch_size, 1)], axis=1
+            )
+            stats.generated_tokens += 1
+
+            # Decode new text
+            current_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            new_text = current_text[prev_text_len:]
+            prev_text_len = len(current_text)
+
+            yield new_text, stats
+
+            # Check for EOS
+            if self.tokenizer.eos_token_id is not None:
+                if next_token[0] == self.tokenizer.eos_token_id:
+                    break
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -326,6 +462,48 @@ class TextGenerator:
         )
 
         return response
+
+    def chat_streaming(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        use_cache: bool = True,
+    ) -> Generator[tuple[str, GenerationStats], None, None]:
+        """
+        Generate a chat response with streaming output.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            use_cache: Whether to use KV-Cache
+
+        Yields:
+            Tuple of (new_text, stats) for each generated token
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded.")
+
+        # Format chat using tokenizer's chat template
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        # Track prompt length to extract only new content
+        prompt_text_len = len(prompt)
+
+        # Generate with streaming
+        for new_text, stats in self.generate_streaming(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True,
+            use_cache=use_cache,
+        ):
+            yield new_text, stats
 
 
 def _softmax(x: NDArray[np.floating]) -> NDArray[np.floating]:
