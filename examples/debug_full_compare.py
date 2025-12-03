@@ -9,6 +9,11 @@ This script compares:
 
 import numpy as np
 import torch
+
+# Disable torch dynamo/compile to avoid inductor issues
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.disable = True
+
 import ttnn
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
