@@ -230,8 +230,14 @@ def load_weights_to_model(
             model.load_layer_weights(layer_idx, layer_weights)
 
     # Load final weights
-    if "norm.weight" in state_dict and "lm_head.weight" in state_dict:
-        model.load_final_weights(
-            state_dict["norm.weight"],
-            state_dict["lm_head.weight"],
-        )
+    # Note: BitNet uses tied embeddings (lm_head.weight = embed_tokens.weight)
+    if "norm.weight" in state_dict:
+        lm_head_weight = state_dict.get("lm_head.weight")
+        if lm_head_weight is None:
+            # Use tied embeddings
+            lm_head_weight = state_dict.get("embed_tokens.weight")
+        if lm_head_weight is not None:
+            model.load_final_weights(
+                state_dict["norm.weight"],
+                lm_head_weight,
+            )
