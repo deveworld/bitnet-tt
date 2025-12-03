@@ -167,14 +167,11 @@ class MultiHeadAttention:
         key = ttnn.permute(key, (0, 2, 1, 3))
         value = ttnn.permute(value, (0, 2, 1, 3))
 
-        # Apply RoPE using built-in function
-        # Slice cos/sin to current sequence length
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
-
-        # Apply rotary embedding
-        query = ttnn.experimental.rotary_embedding(query, cos, sin)
-        key = ttnn.experimental.rotary_embedding(key, cos, sin)
+        # TODO: RoPE disabled temporarily for debugging
+        # The ttnn.experimental.rotary_embedding seems to change tensor shapes unexpectedly
+        # Need to investigate the correct input format
+        # For now, skip RoPE to verify rest of architecture works
+        pass
 
         # Expand KV heads for GQA if needed
         if self.num_kv_groups > 1:
