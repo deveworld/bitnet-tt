@@ -379,11 +379,8 @@ class MultiHeadAttention:
         if use_cache:
             if past_key_value is None:
                 past_key_value = KVCache()
-            # Use pre-allocated update if available, otherwise fall back to concat
-            if past_key_value._preallocated:
-                key, value = past_key_value.update_preallocated(key, value)
-            else:
-                key, value = past_key_value.update(key, value, self.device)
+            # Use concat-based update (scatter has dtype issues with TT-NN)
+            key, value = past_key_value.update(key, value, self.device)
             updated_cache = past_key_value
 
         # Get full sequence length (including cached)
