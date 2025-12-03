@@ -149,6 +149,73 @@ def main():
 
         compare_tensors("Q after permute", hf_q_permuted, ttnn_q_permuted)
 
+        # Test RoPE slicing
+        print("\n[7] Testing RoPE slicing operations...")
+
+        # Create test cos/sin tensors
+        head_dim = 128
+        max_seq = 10
+        rope_theta = 500000.0
+
+        # Compute frequencies like in attention.py
+        freqs = 1.0 / (rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+        t = np.arange(max_seq, dtype=np.float32)
+        freqs_outer = np.outer(t, freqs)
+        emb = np.concatenate([freqs_outer, freqs_outer], axis=-1)
+        cos_np = np.cos(emb).astype(np.float32).reshape(1, 1, max_seq, head_dim)
+        sin_np = np.sin(emb).astype(np.float32).reshape(1, 1, max_seq, head_dim)
+
+        print(f"cos_np shape: {cos_np.shape}")
+
+        # Test slicing in TT-NN
+        cos_ttnn = numpy_to_ttnn(cos_np, device)
+        print(f"cos_ttnn shape: {cos_ttnn.shape}")
+
+        # Slice to seq_len=2
+        cos_sliced = cos_ttnn[:, :, :seq_len, :]
+        print(f"cos_sliced shape: {cos_sliced.shape}")
+
+        # Compare with numpy slicing
+        cos_np_sliced = cos_np[:, :, :seq_len, :]
+        print(f"cos_np_sliced shape: {cos_np_sliced.shape}")
+
+        cos_sliced_np = ttnn.to_torch(cos_sliced).float().numpy()
+        slice_diff = np.abs(cos_np_sliced - cos_sliced_np)
+        print(f"Slicing max diff: {slice_diff.max():.6f}")
+        print(f"Slicing mean diff: {slice_diff.mean():.6f}")
+
+        # Test tensor splitting (for rotate_half)
+        print("\n[8] Testing tensor splitting for rotate_half...")
+        # Use Q tensor for testing
+        half_dim = head_dim // 2
+
+        # TT-NN slicing
+        ttnn_x1 = ttnn_q_permuted[:, :, :, :half_dim]
+        ttnn_x2 = ttnn_q_permuted[:, :, :, half_dim:]
+        print(f"ttnn_x1 shape: {ttnn_x1.shape}")
+        print(f"ttnn_x2 shape: {ttnn_x2.shape}")
+
+        # PyTorch slicing
+        hf_x1 = hf_q_permuted[:, :, :, :half_dim]
+        hf_x2 = hf_q_permuted[:, :, :, half_dim:]
+        print(f"hf_x1 shape: {hf_x1.shape}")
+        print(f"hf_x2 shape: {hf_x2.shape}")
+
+        # Compare
+        compare_tensors("x1 (first half)", hf_x1, ttnn_x1)
+        compare_tensors("x2 (second half)", hf_x2, ttnn_x2)
+
+        # Test concat
+        print("[9] Testing concat...")
+        ttnn_x2_neg = ttnn.neg(ttnn_x2)
+        ttnn_rotated = ttnn.concat([ttnn_x2_neg, ttnn_x1], dim=-1)
+        print(f"ttnn_rotated shape: {ttnn_rotated.shape}")
+
+        hf_rotated = torch.cat([-hf_x2, hf_x1], dim=-1)
+        print(f"hf_rotated shape: {hf_rotated.shape}")
+
+        compare_tensors("rotate_half result", hf_rotated, ttnn_rotated)
+
         print("=" * 60)
         print("Debug comparison complete!")
         print("=" * 60)
