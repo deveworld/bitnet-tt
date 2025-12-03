@@ -186,9 +186,13 @@ class BitLinear:
 
 class Linear:
     """
-    TT-NN native Linear layer (simple matmul, no normalization).
+    TT-NN native Linear layer with weight quantization.
 
-    For BF16 models where weights are not quantized.
+    For BF16 BitNet models: applies ternary weight quantization during forward pass.
+    HuggingFace BitLinear applies WeightQuant.apply() which computes:
+        scale = weight.abs().mean()
+        e = weight.mean()
+        weight_quant = sign(weight - e) * scale
     """
 
     def __init__(
@@ -221,7 +225,12 @@ class Linear:
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         """
-        Forward pass.
+        Forward pass with weight quantization.
+
+        Applies ternary weight quantization matching HuggingFace BitLinear:
+            scale = weight.abs().mean()
+            e = weight.mean()
+            weight_quant = sign(weight - e) * scale
 
         Args:
             x: Input tensor of shape (batch, seq_len, in_features)
@@ -232,7 +241,20 @@ class Linear:
         if self.weight is None:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
-        weight_t = ttnn.transpose(self.weight, -2, -1)
+        # Apply ternary weight quantization (matching HF BitLinear WeightQuant)
+        # scale = weight.abs().mean()
+        weight_abs = ttnn.abs(self.weight)
+        scale = ttnn.mean(weight_abs)
+
+        # e = weight.mean()
+        e = ttnn.mean(self.weight)
+
+        # weight_quant = sign(weight - e) * scale
+        weight_centered = ttnn.subtract(self.weight, e)
+        weight_sign = ttnn.sign(weight_centered)
+        weight_quant = ttnn.multiply(weight_sign, scale)
+
+        weight_t = ttnn.transpose(weight_quant, -2, -1)
         return ttnn.matmul(x, weight_t)
 
 
