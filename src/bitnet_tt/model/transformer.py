@@ -4,7 +4,7 @@ Transformer block implementation using TT-NN.
 This module implements the Transformer decoder block with:
 - Pre-normalization (RMSNorm before attention and FFN)
 - Residual connections
-- BitLinear-based attention and FFN
+- BitNet-style attention and FFN with sub-norms
 """
 
 import numpy as np
@@ -20,10 +20,10 @@ class TransformerBlock:
     """
     TT-NN native Transformer decoder block.
 
-    Architecture:
-        x -> RMSNorm -> Attention -> + -> RMSNorm -> FFN -> + -> output
-             |__________________|      |_______________|
-                  residual                  residual
+    Architecture (matching HuggingFace Transformers BitNet):
+        x -> input_layernorm -> Attention (with attn_sub_norm) -> + -> post_attention_layernorm -> FFN (with ffn_sub_norm) -> + -> output
+             |__________________________________________|           |___________________________________________________|
+                              residual                                                   residual
     """
 
     def __init__(
@@ -56,7 +56,7 @@ class TransformerBlock:
         # Pre-attention normalization
         self.input_layernorm = RMSNorm(hidden_size, device, rms_norm_eps)
 
-        # Self-attention
+        # Self-attention (includes attn_sub_norm internally)
         self.self_attn = MultiHeadAttention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -70,7 +70,7 @@ class TransformerBlock:
         # Pre-FFN normalization
         self.post_attention_layernorm = RMSNorm(hidden_size, device, rms_norm_eps)
 
-        # Feed-forward network
+        # Feed-forward network (includes ffn_sub_norm internally)
         self.mlp = FeedForward(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -83,19 +83,14 @@ class TransformerBlock:
         input_layernorm_weight: NDArray[np.floating],
         post_attention_layernorm_weight: NDArray[np.floating],
         q_weight: NDArray[np.floating],
-        q_norm_weight: NDArray[np.floating],
         k_weight: NDArray[np.floating],
-        k_norm_weight: NDArray[np.floating],
         v_weight: NDArray[np.floating],
-        v_norm_weight: NDArray[np.floating],
         o_weight: NDArray[np.floating],
-        o_norm_weight: NDArray[np.floating],
+        attn_sub_norm_weight: NDArray[np.floating] | None,
         gate_weight: NDArray[np.floating],
-        gate_norm_weight: NDArray[np.floating],
         up_weight: NDArray[np.floating],
-        up_norm_weight: NDArray[np.floating],
         down_weight: NDArray[np.floating],
-        down_norm_weight: NDArray[np.floating],
+        ffn_sub_norm_weight: NDArray[np.floating] | None,
     ) -> None:
         """
         Load all weights for the transformer block.
@@ -104,41 +99,31 @@ class TransformerBlock:
             input_layernorm_weight: Pre-attention norm weight
             post_attention_layernorm_weight: Pre-FFN norm weight
             q_weight: Query projection weight
-            q_norm_weight: Query norm weight
             k_weight: Key projection weight
-            k_norm_weight: Key norm weight
             v_weight: Value projection weight
-            v_norm_weight: Value norm weight
             o_weight: Output projection weight
-            o_norm_weight: Output norm weight
+            attn_sub_norm_weight: Attention sub-norm weight (after attn, before o_proj)
             gate_weight: Gate projection weight
-            gate_norm_weight: Gate norm weight
             up_weight: Up projection weight
-            up_norm_weight: Up norm weight
             down_weight: Down projection weight
-            down_norm_weight: Down norm weight
+            ffn_sub_norm_weight: FFN sub-norm weight (after gate*up, before down_proj)
         """
         self.input_layernorm.load_weights(input_layernorm_weight)
         self.post_attention_layernorm.load_weights(post_attention_layernorm_weight)
 
         self.self_attn.load_weights(
-            q_weight,
-            q_norm_weight,
-            k_weight,
-            k_norm_weight,
-            v_weight,
-            v_norm_weight,
-            o_weight,
-            o_norm_weight,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            v_weight=v_weight,
+            o_weight=o_weight,
+            attn_sub_norm_weight=attn_sub_norm_weight,
         )
 
         self.mlp.load_weights(
-            gate_weight,
-            gate_norm_weight,
-            up_weight,
-            up_norm_weight,
-            down_weight,
-            down_norm_weight,
+            gate_weight=gate_weight,
+            up_weight=up_weight,
+            down_weight=down_weight,
+            ffn_sub_norm_weight=ffn_sub_norm_weight,
         )
 
     def __call__(
@@ -161,7 +146,7 @@ class TransformerBlock:
         # Pre-attention norm
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self-attention
+        # Self-attention (includes attn_sub_norm before o_proj)
         hidden_states = self.self_attn(hidden_states, attention_mask)
 
         # Residual connection
@@ -171,7 +156,7 @@ class TransformerBlock:
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # FFN
+        # FFN (includes ffn_sub_norm before down_proj)
         hidden_states = self.mlp(hidden_states)
 
         # Residual connection

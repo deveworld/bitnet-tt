@@ -184,6 +184,58 @@ class BitLinear:
         return output
 
 
+class Linear:
+    """
+    TT-NN native Linear layer (simple matmul, no normalization).
+
+    For BF16 models where weights are not quantized.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        device: ttnn.Device,
+    ) -> None:
+        """
+        Initialize Linear layer.
+
+        Args:
+            in_features: Size of input features
+            out_features: Size of output features
+            device: TT-NN device
+        """
+        self.in_features = in_features
+        self.out_features = out_features
+        self.device = device
+        self.weight: ttnn.Tensor | None = None
+
+    def load_weights(self, weight: NDArray[np.floating]) -> None:
+        """
+        Load weights to device.
+
+        Args:
+            weight: Weight array of shape (out_features, in_features)
+        """
+        self.weight = numpy_to_ttnn(weight.astype(np.float32), self.device)
+
+    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, seq_len, in_features)
+
+        Returns:
+            Output tensor of shape (batch, seq_len, out_features)
+        """
+        if self.weight is None:
+            raise RuntimeError("Weights not loaded. Call load_weights() first.")
+
+        weight_t = ttnn.transpose(self.weight, -2, -1)
+        return ttnn.matmul(x, weight_t)
+
+
 class RMSNorm:
     """
     TT-NN native RMSNorm layer.

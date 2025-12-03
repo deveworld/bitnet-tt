@@ -177,62 +177,51 @@ def _init_random_weights(model, config, device) -> None:
     for layer_idx in range(config.num_layers):
         layer_weights = {}
 
+        head_dim = config.hidden_size // config.num_attention_heads
+
         # RMSNorm weights (initialized to 1)
         layer_weights["input_layernorm.weight"] = np.ones(config.hidden_size, dtype=np.float32)
         layer_weights["post_attention_layernorm.weight"] = np.ones(
             config.hidden_size, dtype=np.float32
         )
 
-        head_dim = config.hidden_size // config.num_attention_heads
-
-        # Attention weights
+        # Attention weights (plain linear, no per-projection norms)
         layer_weights["self_attn.q_proj.weight"] = np.random.randn(
             config.num_attention_heads * head_dim, config.hidden_size
         ).astype(np.float32) * 0.02
-        layer_weights["self_attn.q_proj.input_norm.weight"] = np.ones(
-            config.hidden_size, dtype=np.float32
-        )
 
         layer_weights["self_attn.k_proj.weight"] = np.random.randn(
             config.num_key_value_heads * head_dim, config.hidden_size
         ).astype(np.float32) * 0.02
-        layer_weights["self_attn.k_proj.input_norm.weight"] = np.ones(
-            config.hidden_size, dtype=np.float32
-        )
 
         layer_weights["self_attn.v_proj.weight"] = np.random.randn(
             config.num_key_value_heads * head_dim, config.hidden_size
         ).astype(np.float32) * 0.02
-        layer_weights["self_attn.v_proj.input_norm.weight"] = np.ones(
-            config.hidden_size, dtype=np.float32
-        )
 
         layer_weights["self_attn.o_proj.weight"] = np.random.randn(
             config.hidden_size, config.num_attention_heads * head_dim
         ).astype(np.float32) * 0.02
-        layer_weights["self_attn.o_proj.input_norm.weight"] = np.ones(
-            config.num_attention_heads * head_dim, dtype=np.float32
+
+        # Attention sub-norm (applied after attention output, before o_proj)
+        layer_weights["self_attn.attn_sub_norm.weight"] = np.ones(
+            config.hidden_size, dtype=np.float32
         )
 
-        # FFN weights
+        # FFN weights (plain linear, no per-projection norms)
         layer_weights["mlp.gate_proj.weight"] = np.random.randn(
             config.intermediate_size, config.hidden_size
         ).astype(np.float32) * 0.02
-        layer_weights["mlp.gate_proj.input_norm.weight"] = np.ones(
-            config.hidden_size, dtype=np.float32
-        )
 
         layer_weights["mlp.up_proj.weight"] = np.random.randn(
             config.intermediate_size, config.hidden_size
         ).astype(np.float32) * 0.02
-        layer_weights["mlp.up_proj.input_norm.weight"] = np.ones(
-            config.hidden_size, dtype=np.float32
-        )
 
         layer_weights["mlp.down_proj.weight"] = np.random.randn(
             config.hidden_size, config.intermediate_size
         ).astype(np.float32) * 0.02
-        layer_weights["mlp.down_proj.input_norm.weight"] = np.ones(
+
+        # FFN sub-norm (applied after gate*up, before down_proj)
+        layer_weights["mlp.ffn_sub_norm.weight"] = np.ones(
             config.intermediate_size, dtype=np.float32
         )
 

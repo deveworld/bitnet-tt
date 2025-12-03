@@ -4,7 +4,7 @@ Multi-Head Attention implementation using TT-NN.
 This module implements the attention mechanism with:
 - Grouped Query Attention (GQA)
 - Rotary Position Embeddings (RoPE)
-- BitLinear projections for Q, K, V, and output
+- attn_sub_norm applied after attention, before output projection
 """
 
 import math
@@ -13,7 +13,7 @@ import numpy as np
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.bitlinear import BitLinear, numpy_to_ttnn
+from bitnet_tt.layers.bitlinear import Linear, RMSNorm, numpy_to_ttnn
 
 
 def precompute_freqs_cis(
@@ -44,7 +44,12 @@ class MultiHeadAttention:
     """
     TT-NN native Multi-Head Attention with GQA and RoPE.
 
-    Uses BitLinear layers for Q, K, V, and output projections.
+    Architecture (matching HuggingFace Transformers):
+        Q, K, V = q_proj(x), k_proj(x), v_proj(x)  # Plain linear
+        Q, K = apply_rope(Q, K)
+        attn_output = scaled_dot_product_attention(Q, K, V)
+        attn_output = attn_sub_norm(attn_output)  # RMSNorm before o_proj
+        output = o_proj(attn_output)  # Plain linear
     """
 
     def __init__(
@@ -78,16 +83,19 @@ class MultiHeadAttention:
         self.eps = eps
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-        # Projections
-        self.q_proj = BitLinear(hidden_size, num_attention_heads * self.head_dim, device, eps)
-        self.k_proj = BitLinear(hidden_size, num_key_value_heads * self.head_dim, device, eps)
-        self.v_proj = BitLinear(hidden_size, num_key_value_heads * self.head_dim, device, eps)
-        self.o_proj = BitLinear(num_attention_heads * self.head_dim, hidden_size, device, eps)
+        # Projections (plain linear, no input norm)
+        self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device)
+        self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
+        self.v_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
+        self.o_proj = Linear(num_attention_heads * self.head_dim, hidden_size, device)
+
+        # Sub-norm applied after attention, before o_proj
+        self.attn_sub_norm = RMSNorm(hidden_size, device, eps)
 
         # Precompute RoPE frequencies
         cos, sin = precompute_freqs_cis(self.head_dim, max_position_embeddings, rope_theta)
 
-        # Transfer to device
+        # Transfer to device - shape for broadcasting with (batch, heads, seq, head_dim)
         cos_reshaped = cos.reshape(1, 1, max_position_embeddings, -1).astype(np.float32)
         sin_reshaped = sin.reshape(1, 1, max_position_embeddings, -1).astype(np.float32)
         self.cos_cached = numpy_to_ttnn(cos_reshaped, device)
@@ -96,31 +104,28 @@ class MultiHeadAttention:
     def load_weights(
         self,
         q_weight: NDArray[np.floating],
-        q_norm_weight: NDArray[np.floating],
         k_weight: NDArray[np.floating],
-        k_norm_weight: NDArray[np.floating],
         v_weight: NDArray[np.floating],
-        v_norm_weight: NDArray[np.floating],
         o_weight: NDArray[np.floating],
-        o_norm_weight: NDArray[np.floating],
+        attn_sub_norm_weight: NDArray[np.floating] | None = None,
     ) -> None:
         """
         Load all projection weights.
 
         Args:
             q_weight: Query projection weight
-            q_norm_weight: Query norm weight
             k_weight: Key projection weight
-            k_norm_weight: Key norm weight
             v_weight: Value projection weight
-            v_norm_weight: Value norm weight
             o_weight: Output projection weight
-            o_norm_weight: Output norm weight
+            attn_sub_norm_weight: Sub-norm weight (applied after attention, before o_proj)
         """
-        self.q_proj.load_weights(q_weight, q_norm_weight)
-        self.k_proj.load_weights(k_weight, k_norm_weight)
-        self.v_proj.load_weights(v_weight, v_norm_weight)
-        self.o_proj.load_weights(o_weight, o_norm_weight)
+        self.q_proj.load_weights(q_weight)
+        self.k_proj.load_weights(k_weight)
+        self.v_proj.load_weights(v_weight)
+        self.o_proj.load_weights(o_weight)
+
+        if attn_sub_norm_weight is not None:
+            self.attn_sub_norm.load_weights(attn_sub_norm_weight)
 
     def __call__(
         self,
@@ -156,15 +161,25 @@ class MultiHeadAttention:
         key = ttnn.permute(key, (0, 2, 1, 3))
         value = ttnn.permute(value, (0, 2, 1, 3))
 
+        # Apply RoPE (rotary position embeddings)
+        # Get cos/sin for current sequence length
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+
+        # Apply rotation: q_embed = q * cos + rotate_half(q) * sin
+        # rotate_half: split last dim in half, negate first half, swap
+        query_rot = self._apply_rope(query, cos, sin)
+        key_rot = self._apply_rope(key, cos, sin)
+
         # Expand KV heads for GQA if needed
         if self.num_kv_groups > 1:
-            key = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
+            key_rot = ttnn.repeat_interleave(key_rot, self.num_kv_groups, dim=1)
             value = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)
 
         # Scaled dot product attention
         attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query,
-            key,
+            query_rot,
+            key_rot,
             value,
             attn_mask=attention_mask,
             is_causal=True,
@@ -177,5 +192,38 @@ class MultiHeadAttention:
         # Reshape to 3D: (batch, seq, hidden)
         attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
 
+        # Apply sub-norm before output projection (key difference from standard attention!)
+        attn_output = self.attn_sub_norm(attn_output)
+
         # Output projection
         return self.o_proj(attn_output)
+
+    def _apply_rope(
+        self,
+        x: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """
+        Apply rotary position embeddings.
+
+        Args:
+            x: Input tensor of shape (batch, heads, seq, head_dim)
+            cos: Cosine frequencies
+            sin: Sine frequencies
+
+        Returns:
+            Tensor with RoPE applied
+        """
+        # Split head_dim in half for rotation
+        half_dim = self.head_dim // 2
+
+        # Get first and second half
+        x1 = x[:, :, :, :half_dim]
+        x2 = x[:, :, :, half_dim:]
+
+        # rotate_half: [-x2, x1]
+        x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+
+        # Apply rotation: x * cos + rotate_half(x) * sin
+        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(x_rotated, sin))

@@ -90,30 +90,24 @@ class BitNetModel:
         """
         layer = self.layers[layer_idx]
 
-        # BitNet b1.58 uses shared norms:
-        # - attn_sub_norm (2560): applied to attention output before o_proj
-        # - ffn_sub_norm (6912): applied to FFN intermediate before down_proj
-        attn_norm = weights.get("self_attn.attn_sub_norm.weight")
-        ffn_norm = weights.get("mlp.ffn_sub_norm.weight")
+        # BitNet b1.58 uses sub-norms:
+        # - attn_sub_norm (hidden_size=2560): applied after attention output, before o_proj
+        # - ffn_sub_norm (intermediate_size=6912): applied after gate*up, before down_proj
+        attn_sub_norm = weights.get("self_attn.attn_sub_norm.weight")
+        ffn_sub_norm = weights.get("mlp.ffn_sub_norm.weight")
 
-        # For BF16 version, weights are already unpacked
         layer.load_weights(
             input_layernorm_weight=weights["input_layernorm.weight"],
             post_attention_layernorm_weight=weights["post_attention_layernorm.weight"],
             q_weight=weights["self_attn.q_proj.weight"],
-            q_norm_weight=None,  # No per-projection norm for Q
             k_weight=weights["self_attn.k_proj.weight"],
-            k_norm_weight=None,  # No per-projection norm for K
             v_weight=weights["self_attn.v_proj.weight"],
-            v_norm_weight=None,  # No per-projection norm for V
             o_weight=weights["self_attn.o_proj.weight"],
-            o_norm_weight=attn_norm,  # attn_sub_norm before o_proj
+            attn_sub_norm_weight=attn_sub_norm,
             gate_weight=weights["mlp.gate_proj.weight"],
-            gate_norm_weight=None,  # No per-projection norm for gate
             up_weight=weights["mlp.up_proj.weight"],
-            up_norm_weight=None,  # No per-projection norm for up
             down_weight=weights["mlp.down_proj.weight"],
-            down_norm_weight=ffn_norm,  # ffn_sub_norm before down_proj
+            ffn_sub_norm_weight=ffn_sub_norm,
         )
 
     def load_final_weights(
