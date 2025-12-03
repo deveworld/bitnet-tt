@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bitnet-tt"
+version = "0.1.0"
+description = "BitNet b1.58 LLM implementation on Tenstorrent Blackhole p150a"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ttnn",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bitnet_tt"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.14.0",
+    "ty>=0.0.1a29",
+    "pyright>=1.1.407",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
