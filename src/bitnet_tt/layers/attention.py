@@ -167,11 +167,14 @@ class MultiHeadAttention:
         key = ttnn.permute(key, (0, 2, 1, 3))
         value = ttnn.permute(value, (0, 2, 1, 3))
 
-        # TODO: RoPE disabled temporarily for debugging
-        # The ttnn.experimental.rotary_embedding seems to change tensor shapes unexpectedly
-        # Need to investigate the correct input format
-        # For now, skip RoPE to verify rest of architecture works
-        pass
+        # Apply RoPE manually (ttnn.experimental.rotary_embedding has shape issues)
+        # Slice cos/sin to current sequence length
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+
+        # Apply rotation to query and key
+        query = self._apply_rope(query, cos, sin)
+        key = self._apply_rope(key, cos, sin)
 
         # Expand KV heads for GQA if needed
         if self.num_kv_groups > 1:
@@ -199,3 +202,44 @@ class MultiHeadAttention:
 
         # Output projection
         return self.o_proj(attn_output)
+
+    def _apply_rope(
+        self,
+        x: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """
+        Apply rotary position embeddings.
+
+        Args:
+            x: Input tensor of shape (batch, num_heads, seq, head_dim)
+            cos: Cosine frequencies of shape (1, 1, seq, head_dim)
+            sin: Sine frequencies of shape (1, 1, seq, head_dim)
+
+        Returns:
+            Tensor with RoPE applied
+        """
+        # Get the number of heads to expand cos/sin
+        num_heads = x.shape[1]
+
+        # Expand cos/sin to match x shape for element-wise ops
+        # (1, 1, seq, head_dim) -> (1, num_heads, seq, head_dim)
+        cos_expanded = ttnn.repeat(cos, ttnn.Shape([1, num_heads, 1, 1]))
+        sin_expanded = ttnn.repeat(sin, ttnn.Shape([1, num_heads, 1, 1]))
+
+        # rotate_half: split in half, negate second half, swap order
+        # x = [x1, x2] -> [-x2, x1]
+        half_dim = self.head_dim // 2
+
+        # Get first and second half of x
+        x1 = x[:, :, :, :half_dim]
+        x2 = x[:, :, :, half_dim:]
+
+        # rotate_half: [-x2, x1]
+        x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+
+        # Apply rotation: x * cos + rotate_half(x) * sin
+        x_cos = ttnn.multiply(x, cos_expanded)
+        x_rot_sin = ttnn.multiply(x_rotated, sin_expanded)
+        return ttnn.add(x_cos, x_rot_sin)
