@@ -10,10 +10,71 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator
 
 import numpy as np
+import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.layers.attention import KVCache
 from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn, ttnn_to_numpy
+
+
+def _on_device_argmax(logits: ttnn.Tensor) -> NDArray[np.int64]:
+    """
+    Perform argmax on device and return only the token index.
+
+    This avoids transferring the full logits tensor (128KB for vocab_size=128256)
+    to CPU. Instead, only the resulting token ID(s) are transferred.
+
+    Args:
+        logits: TT-NN tensor of shape (batch, seq, vocab_size)
+
+    Returns:
+        Token indices of shape (batch,)
+    """
+    # Get last position logits: (batch, seq, vocab) -> (batch, 1, vocab)
+    # Need ROW_MAJOR for slicing
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    last_logits = logits_rm[:, -1:, :]  # (batch, 1, vocab_size)
+
+    # Perform argmax on the last dimension (vocab_size)
+    # Returns indices of shape (batch, 1)
+    last_logits_tile = ttnn.to_layout(last_logits, ttnn.TILE_LAYOUT)
+    token_indices = ttnn.argmax(last_logits_tile, dim=-1)
+
+    # Transfer only the token indices back to CPU (4 bytes per batch element)
+    indices_np = ttnn.to_torch(token_indices).numpy().astype(np.int64)
+    return indices_np.flatten()
+
+
+def _on_device_topk(
+    logits: ttnn.Tensor, k: int
+) -> tuple[NDArray[np.floating], NDArray[np.int64]]:
+    """
+    Perform top-k selection on device and return only the top-k values and indices.
+
+    This avoids transferring the full logits tensor (128KB for vocab_size=128256)
+    to CPU. Instead, only the top-k values and indices are transferred.
+
+    Args:
+        logits: TT-NN tensor of shape (batch, seq, vocab_size)
+        k: Number of top elements to return
+
+    Returns:
+        Tuple of (top_k_values, top_k_indices) each of shape (batch, k)
+    """
+    # Get last position logits: (batch, seq, vocab) -> (batch, 1, vocab)
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    last_logits = logits_rm[:, -1:, :]  # (batch, 1, vocab_size)
+    last_logits_tile = ttnn.to_layout(last_logits, ttnn.TILE_LAYOUT)
+
+    # Perform top-k on device
+    # ttnn.topk returns (values, indices) tensors
+    top_k_values, top_k_indices = ttnn.topk(last_logits_tile, k, dim=-1)
+
+    # Transfer only top-k data to CPU (k * 8 bytes per batch element)
+    values_np = ttnn.to_torch(top_k_values).float().numpy().squeeze(1)  # (batch, k)
+    indices_np = ttnn.to_torch(top_k_indices).numpy().astype(np.int64).squeeze(1)
+
+    return values_np, indices_np
 
 if TYPE_CHECKING:
     from bitnet_tt.model.bitnet import BitNetModel
@@ -191,18 +252,32 @@ class TextGenerator:
                 use_cache=use_cache,
             )
 
-            # Get logits for the last position
-            # logits shape: (batch, seq, vocab_size)
-            logits_np = ttnn_to_numpy(logits)
-            next_token_logits = logits_np[:, -1, :]  # (batch, vocab_size)
+            # Deallocate input tensor to free device memory
+            ttnn.deallocate(input_tensor)
 
             # Sample next token
-            next_token = self._sample_token(
-                next_token_logits,
-                temperature=temperature,
-                top_k=top_k,
-                do_sample=do_sample,
-            )
+            if not do_sample:
+                # Greedy decoding: use on-device argmax (avoids 128KB transfer)
+                next_token = _on_device_argmax(logits)
+            elif top_k is not None and top_k > 0:
+                # Top-k sampling: use on-device top-k (transfers only k values)
+                top_k_values, top_k_indices = _on_device_topk(logits, top_k)
+                next_token = self._sample_from_topk(
+                    top_k_values, top_k_indices, temperature
+                )
+            else:
+                # Full distribution sampling: need full logits on CPU
+                logits_np = ttnn_to_numpy(logits)
+                next_token_logits = logits_np[:, -1, :]  # (batch, vocab_size)
+                next_token = self._sample_token(
+                    next_token_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    do_sample=do_sample,
+                )
+
+            # Deallocate logits to free device memory (large tensor: 128K vocab)
+            ttnn.deallocate(logits)
 
             # Append to generated sequence
             generated = np.concatenate(
@@ -247,17 +322,32 @@ class TextGenerator:
             # Forward pass without cache
             logits, _ = self.model(input_tensor, use_cache=False)
 
-            # Get logits for the last position
-            logits_np = ttnn_to_numpy(logits)
-            next_token_logits = logits_np[:, -1, :]
+            # Deallocate input tensor to free device memory
+            ttnn.deallocate(input_tensor)
 
             # Sample next token
-            next_token = self._sample_token(
-                next_token_logits,
-                temperature=temperature,
-                top_k=top_k,
-                do_sample=do_sample,
-            )
+            if not do_sample:
+                # Greedy decoding: use on-device argmax (avoids 128KB transfer)
+                next_token = _on_device_argmax(logits)
+            elif top_k is not None and top_k > 0:
+                # Top-k sampling: use on-device top-k (transfers only k values)
+                top_k_values, top_k_indices = _on_device_topk(logits, top_k)
+                next_token = self._sample_from_topk(
+                    top_k_values, top_k_indices, temperature
+                )
+            else:
+                # Full distribution sampling: need full logits on CPU
+                logits_np = ttnn_to_numpy(logits)
+                next_token_logits = logits_np[:, -1, :]
+                next_token = self._sample_token(
+                    next_token_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    do_sample=do_sample,
+                )
+
+            # Deallocate logits to free device memory (large tensor: 128K vocab)
+            ttnn.deallocate(logits)
 
             # Append to generated sequence
             generated = np.concatenate(
@@ -270,6 +360,43 @@ class TextGenerator:
                     break
 
         return generated
+
+    def _sample_from_topk(
+        self,
+        top_k_values: NDArray[np.floating],
+        top_k_indices: NDArray[np.int64],
+        temperature: float,
+    ) -> NDArray[np.int64]:
+        """
+        Sample a token from pre-computed top-k values and indices.
+
+        This is used with on-device top-k to avoid transferring full logits.
+
+        Args:
+            top_k_values: Top-k logit values of shape (batch, k)
+            top_k_indices: Top-k token indices of shape (batch, k)
+            temperature: Sampling temperature
+
+        Returns:
+            Sampled token IDs of shape (batch,)
+        """
+        batch_size = top_k_values.shape[0]
+        k = top_k_values.shape[1]
+
+        # Apply temperature
+        if temperature != 1.0:
+            top_k_values = top_k_values / temperature
+
+        # Convert to probabilities
+        probs = _softmax(top_k_values)
+
+        # Sample from top-k
+        sampled_local_indices = np.array(
+            [np.random.choice(k, p=probs[i]) for i in range(batch_size)]
+        )
+        return np.take_along_axis(
+            top_k_indices, sampled_local_indices.reshape(-1, 1), axis=-1
+        ).flatten()
 
     def _sample_token(
         self,
@@ -385,6 +512,9 @@ class TextGenerator:
                 use_cache=use_cache,
             )
 
+            # Deallocate input tensor to free device memory
+            ttnn.deallocate(input_tensor)
+
             token_end = time.perf_counter()
             token_time = token_end - token_start
 
@@ -396,14 +526,28 @@ class TextGenerator:
                 stats.generation_time += token_time
 
             # Sample next token
-            logits_np = ttnn_to_numpy(logits)
-            next_token_logits = logits_np[:, -1, :]
-            next_token = self._sample_token(
-                next_token_logits,
-                temperature=temperature,
-                top_k=top_k,
-                do_sample=do_sample,
-            )
+            if not do_sample:
+                # Greedy decoding: use on-device argmax (avoids 128KB transfer)
+                next_token = _on_device_argmax(logits)
+            elif top_k is not None and top_k > 0:
+                # Top-k sampling: use on-device top-k (transfers only k values)
+                top_k_values, top_k_indices = _on_device_topk(logits, top_k)
+                next_token = self._sample_from_topk(
+                    top_k_values, top_k_indices, temperature
+                )
+            else:
+                # Full distribution sampling: need full logits on CPU
+                logits_np = ttnn_to_numpy(logits)
+                next_token_logits = logits_np[:, -1, :]
+                next_token = self._sample_token(
+                    next_token_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    do_sample=do_sample,
+                )
+
+            # Deallocate logits to free device memory (large tensor: 128K vocab)
+            ttnn.deallocate(logits)
 
             # Append token
             generated = np.concatenate(

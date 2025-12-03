@@ -25,10 +25,43 @@ class KVCache:
     Key-Value cache for efficient autoregressive generation.
 
     Stores past key and value states to avoid recomputation.
+    Uses pre-allocated buffers with index tracking to minimize memory allocation.
     """
     key_cache: ttnn.Tensor | None = None
     value_cache: ttnn.Tensor | None = None
     seq_len_cached: int = 0
+    max_seq_len: int = 0
+    _preallocated: bool = False
+
+    def preallocate(
+        self,
+        batch_size: int,
+        num_kv_heads: int,
+        max_seq_len: int,
+        head_dim: int,
+        device: ttnn.Device,
+    ) -> None:
+        """
+        Pre-allocate cache buffers for maximum sequence length.
+
+        This avoids memory reallocation during generation.
+
+        Args:
+            batch_size: Batch size
+            num_kv_heads: Number of key/value heads
+            max_seq_len: Maximum sequence length to cache
+            head_dim: Head dimension
+            device: TT-NN device
+        """
+        # Create zero-filled buffers
+        cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
+        zeros = np.zeros(cache_shape, dtype=np.float32)
+
+        self.key_cache = numpy_to_ttnn(zeros, device)
+        self.value_cache = numpy_to_ttnn(zeros, device)
+        self.max_seq_len = max_seq_len
+        self.seq_len_cached = 0
+        self._preallocated = True
 
     def update(
         self,
@@ -47,11 +80,13 @@ class KVCache:
         Returns:
             Updated (key_states, value_states) including cached values
         """
+        new_seq_len = key_states.shape[2]
+
         if self.key_cache is None:
             # First token - just store
             self.key_cache = key_states
             self.value_cache = value_states
-            self.seq_len_cached = key_states.shape[2]
+            self.seq_len_cached = new_seq_len
             return key_states, value_states
 
         # Concatenate with cached values along sequence dimension
@@ -61,11 +96,85 @@ class KVCache:
 
         return self.key_cache, self.value_cache
 
+    def update_preallocated(
+        self,
+        key_states: ttnn.Tensor,
+        value_states: ttnn.Tensor,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Update pre-allocated cache with new key/value states using scatter.
+
+        This method uses in-place updates to avoid memory reallocation.
+        Must call preallocate() first.
+
+        Args:
+            key_states: New key states (batch, num_kv_heads, seq_len, head_dim)
+            value_states: New value states (batch, num_kv_heads, seq_len, head_dim)
+
+        Returns:
+            View of cached (key_states, value_states) up to current position
+        """
+        if not self._preallocated or self.key_cache is None:
+            raise RuntimeError("Cache not pre-allocated. Call preallocate() first.")
+
+        new_seq_len = key_states.shape[2]
+        start_pos = self.seq_len_cached
+        end_pos = start_pos + new_seq_len
+
+        if end_pos > self.max_seq_len:
+            raise RuntimeError(
+                f"Cache overflow: {end_pos} > {self.max_seq_len}. "
+                "Increase max_seq_len or reset cache."
+            )
+
+        # Use scatter to update specific positions in the pre-allocated buffer
+        # Create index tensor for the sequence positions to update
+        indices = np.arange(start_pos, end_pos, dtype=np.int32).reshape(1, 1, -1, 1)
+        indices = np.broadcast_to(
+            indices,
+            (key_states.shape[0], key_states.shape[1], new_seq_len, key_states.shape[3])
+        ).copy()
+        indices_ttnn = ttnn.from_torch(
+            ttnn.to_torch(key_states).new_tensor(indices, dtype=ttnn.to_torch(key_states).dtype),
+            device=key_states.device()
+        )
+
+        # Scatter update key cache
+        self.key_cache = ttnn.scatter(self.key_cache, 2, indices_ttnn, key_states)
+        self.value_cache = ttnn.scatter(self.value_cache, 2, indices_ttnn, value_states)
+
+        self.seq_len_cached = end_pos
+
+        # Return view up to current position
+        # Convert to ROW_MAJOR for slicing
+        key_rm = ttnn.to_layout(self.key_cache, ttnn.ROW_MAJOR_LAYOUT)
+        value_rm = ttnn.to_layout(self.value_cache, ttnn.ROW_MAJOR_LAYOUT)
+
+        key_view = key_rm[:, :, :end_pos, :]
+        value_view = value_rm[:, :, :end_pos, :]
+
+        key_view = ttnn.to_layout(key_view, ttnn.TILE_LAYOUT)
+        value_view = ttnn.to_layout(value_view, ttnn.TILE_LAYOUT)
+
+        return key_view, value_view
+
     def reset(self) -> None:
         """Reset the cache."""
+        if self._preallocated:
+            # Just reset position, keep buffers
+            self.seq_len_cached = 0
+        else:
+            self.key_cache = None
+            self.value_cache = None
+            self.seq_len_cached = 0
+
+    def clear(self) -> None:
+        """Fully clear the cache including pre-allocated buffers."""
         self.key_cache = None
         self.value_cache = None
         self.seq_len_cached = 0
+        self.max_seq_len = 0
+        self._preallocated = False
 
 
 def precompute_freqs_cis(
