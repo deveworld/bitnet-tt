@@ -30,13 +30,19 @@ def precompute_freqs_cis(
         theta: Base frequency
 
     Returns:
-        Tuple of (cos, sin) arrays of shape (max_seq_len, dim//2)
+        Tuple of (cos, sin) arrays of shape (max_seq_len, dim)
     """
+    # Compute inverse frequencies for half the dimension
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
     t = np.arange(max_seq_len, dtype=np.float32)
-    freqs = np.outer(t, freqs)
-    cos = np.cos(freqs).astype(np.float32)
-    sin = np.sin(freqs).astype(np.float32)
+    freqs = np.outer(t, freqs)  # (max_seq_len, dim//2)
+
+    # Concatenate to get full dimension (matching transformers implementation)
+    # emb = torch.cat((freqs, freqs), dim=-1)
+    emb = np.concatenate([freqs, freqs], axis=-1)  # (max_seq_len, dim)
+
+    cos = np.cos(emb).astype(np.float32)
+    sin = np.sin(emb).astype(np.float32)
     return cos, sin
 
 
@@ -95,9 +101,10 @@ class MultiHeadAttention:
         # Precompute RoPE frequencies
         cos, sin = precompute_freqs_cis(self.head_dim, max_position_embeddings, rope_theta)
 
-        # Transfer to device - shape for broadcasting with (batch, heads, seq, head_dim)
-        cos_reshaped = cos.reshape(1, 1, max_position_embeddings, -1).astype(np.float32)
-        sin_reshaped = sin.reshape(1, 1, max_position_embeddings, -1).astype(np.float32)
+        # Transfer to device - shape (1, 1, max_seq_len, head_dim) for broadcasting
+        # with query/key shape (batch, heads, seq, head_dim)
+        cos_reshaped = cos.reshape(1, 1, max_position_embeddings, self.head_dim).astype(np.float32)
+        sin_reshaped = sin.reshape(1, 1, max_position_embeddings, self.head_dim).astype(np.float32)
         self.cos_cached = numpy_to_ttnn(cos_reshaped, device)
         self.sin_cached = numpy_to_ttnn(sin_reshaped, device)
 
@@ -209,16 +216,17 @@ class MultiHeadAttention:
 
         Args:
             x: Input tensor of shape (batch, heads, seq, head_dim)
-            cos: Cosine frequencies
-            sin: Sine frequencies
+            cos: Cosine frequencies of shape (1, 1, seq, head_dim)
+            sin: Sine frequencies of shape (1, 1, seq, head_dim)
 
         Returns:
             Tensor with RoPE applied
         """
-        # Split head_dim in half for rotation
+        # rotate_half: split in half, negate second half, swap order
+        # x = [x1, x2] -> [-x2, x1]
         half_dim = self.head_dim // 2
 
-        # Get first and second half
+        # Get first and second half of x
         x1 = x[:, :, :, :half_dim]
         x2 = x[:, :, :, half_dim:]
 
@@ -226,4 +234,6 @@ class MultiHeadAttention:
         x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
         # Apply rotation: x * cos + rotate_half(x) * sin
-        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(x_rotated, sin))
+        x_cos = ttnn.multiply(x, cos)
+        x_rot_sin = ttnn.multiply(x_rotated, sin)
+        return ttnn.add(x_cos, x_rot_sin)
