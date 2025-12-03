@@ -3,7 +3,7 @@ Multi-Head Attention implementation using TT-NN.
 
 This module implements the attention mechanism with:
 - Grouped Query Attention (GQA)
-- Rotary Position Embeddings (RoPE)
+- Rotary Position Embeddings (RoPE) using ttnn.experimental.rotary_embedding
 - attn_sub_norm applied after attention, before output projection
 """
 
@@ -30,7 +30,7 @@ def precompute_freqs_cis(
         theta: Base frequency
 
     Returns:
-        Tuple of (cos, sin) arrays of shape (max_seq_len, dim)
+        Tuple of (cos, sin) arrays of shape (1, 1, max_seq_len, dim)
     """
     # Compute inverse frequencies for half the dimension
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
@@ -38,11 +38,15 @@ def precompute_freqs_cis(
     freqs = np.outer(t, freqs)  # (max_seq_len, dim//2)
 
     # Concatenate to get full dimension (matching transformers implementation)
-    # emb = torch.cat((freqs, freqs), dim=-1)
     emb = np.concatenate([freqs, freqs], axis=-1)  # (max_seq_len, dim)
 
     cos = np.cos(emb).astype(np.float32)
     sin = np.sin(emb).astype(np.float32)
+
+    # Reshape for ttnn.experimental.rotary_embedding: (1, 1, max_seq_len, dim)
+    cos = cos.reshape(1, 1, max_seq_len, dim)
+    sin = sin.reshape(1, 1, max_seq_len, dim)
+
     return cos, sin
 
 
@@ -100,13 +104,8 @@ class MultiHeadAttention:
 
         # Precompute RoPE frequencies
         cos, sin = precompute_freqs_cis(self.head_dim, max_position_embeddings, rope_theta)
-
-        # Transfer to device - shape (1, 1, max_seq_len, head_dim) for broadcasting
-        # with query/key shape (batch, heads, seq, head_dim)
-        cos_reshaped = cos.reshape(1, 1, max_position_embeddings, self.head_dim).astype(np.float32)
-        sin_reshaped = sin.reshape(1, 1, max_position_embeddings, self.head_dim).astype(np.float32)
-        self.cos_cached = numpy_to_ttnn(cos_reshaped, device)
-        self.sin_cached = numpy_to_ttnn(sin_reshaped, device)
+        self.cos_cached = numpy_to_ttnn(cos, device)
+        self.sin_cached = numpy_to_ttnn(sin, device)
 
     def load_weights(
         self,
@@ -168,25 +167,24 @@ class MultiHeadAttention:
         key = ttnn.permute(key, (0, 2, 1, 3))
         value = ttnn.permute(value, (0, 2, 1, 3))
 
-        # Apply RoPE (rotary position embeddings)
-        # Get cos/sin for current sequence length
+        # Apply RoPE using built-in function
+        # Slice cos/sin to current sequence length
         cos = self.cos_cached[:, :, :seq_len, :]
         sin = self.sin_cached[:, :, :seq_len, :]
 
-        # Apply rotation: q_embed = q * cos + rotate_half(q) * sin
-        # rotate_half: split last dim in half, negate first half, swap
-        query_rot = self._apply_rope(query, cos, sin)
-        key_rot = self._apply_rope(key, cos, sin)
+        # Apply rotary embedding
+        query = ttnn.experimental.rotary_embedding(query, cos, sin)
+        key = ttnn.experimental.rotary_embedding(key, cos, sin)
 
         # Expand KV heads for GQA if needed
         if self.num_kv_groups > 1:
-            key_rot = ttnn.repeat_interleave(key_rot, self.num_kv_groups, dim=1)
+            key = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
             value = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)
 
         # Scaled dot product attention
         attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query_rot,
-            key_rot,
+            query,
+            key,
             value,
             attn_mask=attention_mask,
             is_causal=True,
@@ -204,36 +202,3 @@ class MultiHeadAttention:
 
         # Output projection
         return self.o_proj(attn_output)
-
-    def _apply_rope(
-        self,
-        x: ttnn.Tensor,
-        cos: ttnn.Tensor,
-        sin: ttnn.Tensor,
-    ) -> ttnn.Tensor:
-        """
-        Apply rotary position embeddings.
-
-        Args:
-            x: Input tensor of shape (batch, heads, seq, head_dim)
-            cos: Cosine frequencies of shape (1, 1, seq, head_dim)
-            sin: Sine frequencies of shape (1, 1, seq, head_dim)
-
-        Returns:
-            Tensor with RoPE applied
-        """
-        # rotate_half: split in half, negate second half, swap order
-        # x = [x1, x2] -> [-x2, x1]
-        half_dim = self.head_dim // 2
-
-        # Get first and second half of x
-        x1 = x[:, :, :, :half_dim]
-        x2 = x[:, :, :, half_dim:]
-
-        # rotate_half: [-x2, x1]
-        x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
-
-        # Apply rotation: x * cos + rotate_half(x) * sin
-        x_cos = ttnn.multiply(x, cos)
-        x_rot_sin = ttnn.multiply(x_rotated, sin)
-        return ttnn.add(x_cos, x_rot_sin)
