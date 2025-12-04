@@ -184,7 +184,7 @@ class BitLinear:
         # 3. Matrix multiplication with pre-transposed weight
         # Weight is already transposed at load time: (in, out)
         weight_scaled = ttnn.multiply(self.weight, self.weight_scale)
-        output = ttnn.matmul(x_dequant, weight_scaled)
+        output = ttnn.matmul(x_dequant, weight_scaled, memory_config=ttnn.L1_MEMORY_CONFIG)
 
         return output
 
@@ -248,12 +248,13 @@ class Linear:
         # Store pre-quantized and pre-transposed weights
         self.weight = numpy_to_ttnn(weight_t, self.device)
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, memory_config: ttnn.MemoryConfig | None = None) -> ttnn.Tensor:
         """
         Forward pass with pre-quantized and pre-transposed weights.
 
         Args:
             x: Input tensor of shape (batch, seq_len, in_features)
+            memory_config: Optional memory config for output (default: L1 for decode perf)
 
         Returns:
             Output tensor of shape (batch, seq_len, out_features)
@@ -262,7 +263,11 @@ class Linear:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
         # Weight is already transposed at load time: (in, out)
-        return ttnn.matmul(x, self.weight)
+        # Use L1 by default for faster decode performance
+        if memory_config is None:
+            memory_config = ttnn.L1_MEMORY_CONFIG
+
+        return ttnn.matmul(x, self.weight, memory_config=memory_config)
 
 
 class RMSNorm:
