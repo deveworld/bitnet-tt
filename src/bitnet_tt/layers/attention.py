@@ -380,25 +380,10 @@ class MultiHeadAttention:
         key: ttnn.Tensor,
         token_idx: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Apply RoPE for decode mode using native op with token_index."""
-        try:
-            # Try native RoPE with token_index
-            query_rotated = ttnn.experimental.rotary_embedding(
-                query,
-                self.cos_cache,
-                self.sin_cache,
-                token_idx=token_idx,
-            )
-            key_rotated = ttnn.experimental.rotary_embedding(
-                key,
-                self.cos_cache,
-                self.sin_cache,
-                token_idx=token_idx,
-            )
-            return query_rotated, key_rotated
-        except (AttributeError, RuntimeError, TypeError) as e:
-            # Fallback to manual RoPE
-            return self._apply_rope_manual(query, key, token_idx, 1)
+        """Apply RoPE for decode mode."""
+        # Native RoPE op has shape requirements that don't match our tensors
+        # Use manual implementation for now
+        return self._apply_rope_manual(query, key, token_idx, 1)
 
     def _apply_rope_prefill(
         self,
@@ -408,22 +393,9 @@ class MultiHeadAttention:
         seq_len: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """Apply RoPE for prefill mode."""
-        try:
-            # Try native RoPE without token_index (prefill mode)
-            query_rotated = ttnn.experimental.rotary_embedding(
-                query,
-                self.cos_cache,
-                self.sin_cache,
-            )
-            key_rotated = ttnn.experimental.rotary_embedding(
-                key,
-                self.cos_cache,
-                self.sin_cache,
-            )
-            return query_rotated, key_rotated
-        except (AttributeError, RuntimeError, TypeError) as e:
-            # Fallback to manual RoPE
-            return self._apply_rope_manual(query, key, start_pos, seq_len)
+        # Native RoPE op has shape requirements that don't match our tensors
+        # Use manual implementation for now
+        return self._apply_rope_manual(query, key, start_pos, seq_len)
 
     def _apply_rope_manual(
         self,
