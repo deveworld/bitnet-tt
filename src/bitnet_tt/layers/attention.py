@@ -95,45 +95,30 @@ class KVCache:
         """
         Update cache for prefill mode.
 
-        For prefill, we need to update multiple positions at once.
-        Uses paged_update_cache with position indices.
+        Prefill runs once, so use simple approach.
+        Returns the key/value states directly for attention.
+        Cache is updated for subsequent decode steps.
         """
         seq_len = key_states.shape[2]
 
         if not self._preallocated:
-            # First call - just store and return
+            # Non-preallocated mode: just store directly
             self.key_cache = key_states
             self.value_cache = value_states
             self.seq_len_cached = seq_len
             return key_states, value_states
 
-        # Create position indices for all tokens in prefill
-        # Shape: [batch] with position for each token
-        update_indices = torch.arange(
-            start_pos, start_pos + seq_len, dtype=torch.int32
-        ).unsqueeze(0)  # [1, seq_len]
-
-        update_idx_tensor = ttnn.from_torch(
-            update_indices,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-        )
-
-        # Update cache in-place
-        ttnn.experimental.paged_update_cache(
-            self.key_cache, key_states,
-            update_idxs_tensor=update_idx_tensor
-        )
-        ttnn.experimental.paged_update_cache(
-            self.value_cache, value_states,
-            update_idxs_tensor=update_idx_tensor
-        )
-
-        ttnn.deallocate(update_idx_tensor)
+        # Preallocated mode: Store for decode, return original for prefill attention
+        # For prefill, we return the input KV directly (no need to read from cache)
+        # The decode phase will use the cached version
         self.seq_len_cached = start_pos + seq_len
 
-        return self.key_cache, self.value_cache
+        # Store reference for decode to build upon
+        # Note: We keep track of seq_len_cached, decode will update from there
+        self._prefill_key = key_states
+        self._prefill_value = value_states
+
+        return key_states, value_states
 
     def update_decode(
         self,
@@ -144,33 +129,25 @@ class KVCache:
         """
         Update cache for decode mode (single token).
 
-        Uses paged_update_cache with single position index.
-        This is in-place and doesn't change tensor shapes!
+        Uses concat to append new KV to cache.
+        Note: paged_update_cache requires specific tensor format (1BKD)
+        that differs from our format (B,KV,S,D).
         """
-        if not self._preallocated:
-            raise RuntimeError("KV cache not preallocated. Call preallocate() first.")
+        # Build cache from prefill KV if this is first decode
+        if hasattr(self, '_prefill_key') and self._prefill_key is not None:
+            self.key_cache = self._prefill_key
+            self.value_cache = self._prefill_value
+            self._prefill_key = None
+            self._prefill_value = None
 
-        # Create position tensor for single position
-        # Shape: [batch] or [1, 1]
-        update_idx_tensor = ttnn.from_torch(
-            torch.tensor([[seq_position]], dtype=torch.int32),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-        )
+        if self.key_cache is None:
+            self.key_cache = key_states
+            self.value_cache = value_states
+        else:
+            self.key_cache = ttnn.concat([self.key_cache, key_states], dim=2)
+            self.value_cache = ttnn.concat([self.value_cache, value_states], dim=2)
 
-        # Update cache in-place at seq_position
-        ttnn.experimental.paged_update_cache(
-            self.key_cache, key_states,
-            update_idxs_tensor=update_idx_tensor
-        )
-        ttnn.experimental.paged_update_cache(
-            self.value_cache, value_states,
-            update_idxs_tensor=update_idx_tensor
-        )
-
-        ttnn.deallocate(update_idx_tensor)
-        self.seq_len_cached = seq_position + 1
+        self.seq_len_cached = self.key_cache.shape[2]
 
         return self.key_cache, self.value_cache
 
@@ -382,32 +359,16 @@ class MultiHeadAttention:
             value_expanded = value_full
 
         # Scaled dot product attention
-        if mode == "decode" and past_key_value is not None and past_key_value._preallocated:
-            # Decode mode: Use decode-specific SDPA with cur_pos_tensor
-            # This tells SDPA how much of the pre-allocated cache is valid
-            cur_pos_tensor = ttnn.from_torch(
-                torch.tensor([current_pos], dtype=torch.int32),
-                dtype=ttnn.int32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                device=self.device,
-            )
-
-            attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
-                query, key_expanded, value_expanded,
-                cur_pos_tensor=cur_pos_tensor,
-                scale=self.scale,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            ttnn.deallocate(cur_pos_tensor)
-        else:
-            # Prefill mode: Use general SDPA with causal mask
-            is_causal = past_key_value is None or past_key_value.seq_len_cached == seq_len
-            attn_output = ttnn.transformer.scaled_dot_product_attention(
-                query, key_expanded, value_expanded,
-                attn_mask=attention_mask,
-                is_causal=is_causal,
-                scale=self.scale,
-            )
+        # Use general SDPA for both prefill and decode
+        # Note: scaled_dot_product_attention_decode requires fixed-shape cache with 1BKD format
+        # Our concat-based cache has variable shapes, so we use general SDPA
+        is_causal = past_key_value is None or past_key_value.seq_len_cached == seq_len
+        attn_output = ttnn.transformer.scaled_dot_product_attention(
+            query, key_expanded, value_expanded,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
+            scale=self.scale,
+        )
 
         # Concatenate heads: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
         # Use optimized ttnn.transformer.concatenate_heads to avoid layout conversions

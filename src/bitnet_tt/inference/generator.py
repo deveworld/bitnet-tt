@@ -544,16 +544,12 @@ class TextGenerator:
         generated = input_ids.copy()
         prev_text_len = len(self.tokenizer.decode(generated[0], skip_special_tokens=True))
 
-        # Reset trace and KV cache
+        # Reset trace
         self.reset_trace()
-        self.reset_kv_cache()
 
-        # Get pre-allocated KV cache (creates if needed)
-        kv_cache = self.get_preallocated_cache()
-
-        # Phase 1: Prefill
+        # Phase 1: Prefill (KV cache will be created during forward)
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, kv_cache)
+        logits, kv_cache = self.prefill_forward(input_ids)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
