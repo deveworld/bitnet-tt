@@ -108,36 +108,12 @@ class KVCache:
         seq_position: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
-        Update cache using in-place op (for decode).
+        Update cache for decode mode.
 
-        Falls back to concat if native op fails.
+        Note: Native kv_cache.update_cache_for_token_() has shape constraints.
+        Using concat for now.
         """
-        if not self._preallocated:
-            # Fallback to concat if not preallocated
-            return self.update_prefill(key_states, value_states)
-
-        try:
-            # Try native in-place update
-            ttnn.kv_cache.update_cache_for_token_(
-                cache=self.key_cache,
-                token=key_states,
-                update_index=seq_position,
-                batch_offset=0,
-            )
-            ttnn.kv_cache.update_cache_for_token_(
-                cache=self.value_cache,
-                token=value_states,
-                update_index=seq_position,
-                batch_offset=0,
-            )
-            self.seq_len_cached = seq_position + 1
-
-            # Return view up to current position
-            return self.key_cache, self.value_cache
-
-        except (AttributeError, RuntimeError) as e:
-            # Fallback to concat
-            return self.update_prefill(key_states, value_states)
+        return self.update_prefill(key_states, value_states)
 
     def update(
         self,
@@ -351,16 +327,15 @@ class MultiHeadAttention:
             value_expanded = value_full
 
         # Scaled dot product attention
-        if mode == "decode" and seq_len == 1:
-            attn_output = self._sdpa_decode(query, key_expanded, value_expanded, current_pos)
-        else:
-            is_causal = past_key_value is None or past_key_value.seq_len_cached == seq_len
-            attn_output = ttnn.transformer.scaled_dot_product_attention(
-                query, key_expanded, value_expanded,
-                attn_mask=attention_mask,
-                is_causal=is_causal,
-                scale=self.scale,
-            )
+        # Note: scaled_dot_product_attention_decode requires seq_len % 32 == 0
+        # Using general SDPA for all cases for now
+        is_causal = past_key_value is None or past_key_value.seq_len_cached == seq_len
+        attn_output = ttnn.transformer.scaled_dot_product_attention(
+            query, key_expanded, value_expanded,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
+            scale=self.scale,
+        )
 
         # Reshape back: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
