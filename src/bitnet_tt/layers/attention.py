@@ -31,115 +31,19 @@ class KVCache:
     """
     Key-Value cache for efficient autoregressive generation.
 
-    Uses pre-allocated fixed-size cache with in-place updates.
-    This enables trace capture by keeping tensor shapes constant.
-
-    Based on tt_transformers pattern:
-    - Pre-allocate: [batch, n_kv_heads, max_seq_len, head_dim]
-    - Update: ttnn.experimental.paged_update_cache (in-place)
-    - SDPA: cur_pos_tensor tells how much of cache is valid
+    Uses concat-based cache for simplicity.
+    Note: For trace capture, would need fixed-shape cache with masking.
     """
     key_cache: ttnn.Tensor | None = None
     value_cache: ttnn.Tensor | None = None
     seq_len_cached: int = 0
-    max_seq_len: int = 4096
-    batch_size: int = 1
-    num_kv_heads: int = 1
-    head_dim: int = 128
-    device: ttnn.Device | None = None
-    _preallocated: bool = False
 
-    def preallocate(
-        self,
-        batch_size: int,
-        num_kv_heads: int,
-        max_seq_len: int,
-        head_dim: int,
-        device: ttnn.Device,
-    ) -> None:
-        """Pre-allocate cache buffers for maximum sequence length."""
-        self.batch_size = batch_size
-        self.num_kv_heads = num_kv_heads
-        self.max_seq_len = max_seq_len
-        self.head_dim = head_dim
-        self.device = device
-
-        # Shape: [batch, num_kv_heads, max_seq_len, head_dim]
-        # Fixed shape enables trace capture!
-        cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
-        zeros = torch.zeros(cache_shape, dtype=torch.bfloat16)
-
-        self.key_cache = ttnn.from_torch(
-            zeros,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        self.value_cache = ttnn.from_torch(
-            zeros,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        self.seq_len_cached = 0
-        self._preallocated = True
-
-    def update_prefill(
+    def update(
         self,
         key_states: ttnn.Tensor,
         value_states: ttnn.Tensor,
-        start_pos: int = 0,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """
-        Update cache for prefill mode.
-
-        Prefill runs once, so use simple approach.
-        Returns the key/value states directly for attention.
-        Cache is updated for subsequent decode steps.
-        """
-        seq_len = key_states.shape[2]
-
-        if not self._preallocated:
-            # Non-preallocated mode: just store directly
-            self.key_cache = key_states
-            self.value_cache = value_states
-            self.seq_len_cached = seq_len
-            return key_states, value_states
-
-        # Preallocated mode: Store for decode, return original for prefill attention
-        # For prefill, we return the input KV directly (no need to read from cache)
-        # The decode phase will use the cached version
-        self.seq_len_cached = start_pos + seq_len
-
-        # Store reference for decode to build upon
-        # Note: We keep track of seq_len_cached, decode will update from there
-        self._prefill_key = key_states
-        self._prefill_value = value_states
-
-        return key_states, value_states
-
-    def update_decode(
-        self,
-        key_states: ttnn.Tensor,
-        value_states: ttnn.Tensor,
-        seq_position: int,
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """
-        Update cache for decode mode (single token).
-
-        Uses concat to append new KV to cache.
-        Note: paged_update_cache requires specific tensor format (1BKD)
-        that differs from our format (B,KV,S,D).
-        """
-        # Build cache from prefill KV if this is first decode
-        if hasattr(self, '_prefill_key') and self._prefill_key is not None:
-            self.key_cache = self._prefill_key
-            self.value_cache = self._prefill_value
-            self._prefill_key = None
-            self._prefill_value = None
-
+        """Update cache by concatenating new KV."""
         if self.key_cache is None:
             self.key_cache = key_states
             self.value_cache = value_states
@@ -148,19 +52,12 @@ class KVCache:
             self.value_cache = ttnn.concat([self.value_cache, value_states], dim=2)
 
         self.seq_len_cached = self.key_cache.shape[2]
-
         return self.key_cache, self.value_cache
 
-    def update(
-        self,
-        key_states: ttnn.Tensor,
-        value_states: ttnn.Tensor,
-    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Update cache (legacy interface, uses prefill mode)."""
-        return self.update_prefill(key_states, value_states, self.seq_len_cached)
-
     def reset(self) -> None:
-        """Reset cache position (keep pre-allocated buffers)."""
+        """Reset cache."""
+        self.key_cache = None
+        self.value_cache = None
         self.seq_len_cached = 0
 
     def clear(self) -> None:
@@ -172,7 +69,6 @@ class KVCache:
         self.key_cache = None
         self.value_cache = None
         self.seq_len_cached = 0
-        self._preallocated = False
 
 
 def precompute_freqs_cis(
@@ -341,11 +237,7 @@ class MultiHeadAttention:
             if past_key_value is None:
                 past_key_value = KVCache()
 
-            if mode == "decode":
-                key_full, value_full = past_key_value.update_decode(key, value, current_pos)
-            else:
-                key_full, value_full = past_key_value.update_prefill(key, value)
-
+            key_full, value_full = past_key_value.update(key, value)
             updated_cache = past_key_value
         else:
             key_full, value_full = key, value
@@ -371,15 +263,11 @@ class MultiHeadAttention:
         )
 
         # Concatenate heads: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
-        # Use optimized ttnn.transformer.concatenate_heads to avoid layout conversions
-        try:
-            attn_output = ttnn.transformer.concatenate_heads(attn_output)
-        except (RuntimeError, TypeError):
-            # Fallback to manual reshape
-            attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-            attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
-            attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
-            attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
+        # Manual reshape (concatenate_heads may have different shape expectations)
+        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
+        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
+        attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
+        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)

@@ -142,69 +142,14 @@ class TextGenerator:
         self.tokenizer = tokenizer
         self.enable_trace = enable_trace
 
-        # Trace state (dict for different sampling modes)
-        self._trace_id: dict = {}
-        self._trace_inputs: dict = {}
-        self._trace_output: dict = {}
-        self._trace_captured: bool = False
-
-        # Pre-allocated KV cache for fixed tensor shapes (enables trace)
-        self._kv_cache: Optional[list[KVCache]] = None
-        self._max_seq_len: int = 4096  # Default max sequence length
+        # Trace state
+        self._trace_id: Optional[int] = None
+        self._trace_inputs: Optional[list] = None
+        self._trace_output: Optional[ttnn.Tensor] = None
 
         # Load default tokenizer if not provided
         if self.tokenizer is None:
             self._load_default_tokenizer()
-
-    def preallocate_kv_cache(
-        self,
-        batch_size: int = 1,
-        max_seq_len: int = 4096,
-    ) -> list[KVCache]:
-        """
-        Pre-allocate KV cache for all layers.
-
-        This enables trace capture by keeping tensor shapes fixed.
-
-        Args:
-            batch_size: Batch size
-            max_seq_len: Maximum sequence length to support
-
-        Returns:
-            List of pre-allocated KVCache for each layer
-        """
-        self._max_seq_len = max_seq_len
-        num_layers = self.model.config.num_layers
-        num_kv_heads = self.model.config.num_key_value_heads
-        head_dim = self.model.config.head_dim
-
-        kv_caches = []
-        for _ in range(num_layers):
-            cache = KVCache()
-            cache.preallocate(
-                batch_size=batch_size,
-                num_kv_heads=num_kv_heads,
-                max_seq_len=max_seq_len,
-                head_dim=head_dim,
-                device=self.device,
-            )
-            kv_caches.append(cache)
-
-        self._kv_cache = kv_caches
-        return kv_caches
-
-    def get_preallocated_cache(self) -> Optional[list[KVCache]]:
-        """Get pre-allocated KV cache, creating if needed."""
-        if self._kv_cache is None:
-            self.preallocate_kv_cache()
-        return self._kv_cache
-
-    def reset_kv_cache(self) -> None:
-        """Reset KV cache positions (keep pre-allocated buffers)."""
-        if self._kv_cache is not None:
-            for cache in self._kv_cache:
-                cache.reset()
-        self._trace_captured = False
 
     def _load_default_tokenizer(self) -> None:
         """Load the default tokenizer for BitNet."""
