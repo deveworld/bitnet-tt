@@ -5,7 +5,7 @@ This module defines configuration classes for different BitNet model sizes,
 including a mini test model and the full BitNet b1.58 2B4T model.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -101,9 +101,6 @@ class BitNetConfig:
         # If device is provided, create sharded configs for better performance
         if device is not None:
             try:
-                core_grid = device.compute_with_storage_grid_size()
-                batch_size = 1  # Single user for now
-
                 # RoPE transformation matrix config (HEIGHT sharded)
                 config["ROPE_TRANS_MAT_MEMCFG"] = ttnn.create_sharded_memory_config(
                     shape=(ttnn.TILE_SIZE, ttnn.TILE_SIZE),

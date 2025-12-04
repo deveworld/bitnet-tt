@@ -20,7 +20,7 @@ import torch
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.bitlinear import Linear, RMSNorm, numpy_to_ttnn
+from bitnet_tt.layers.bitlinear import Linear, RMSNorm
 from bitnet_tt.layers.rope import RotarySetup, apply_rope_ttnn
 
 
@@ -418,7 +418,6 @@ class MultiHeadAttention:
             updated_cache = past_key_value
 
         # Expand KV heads for GQA
-        kv_seq_len = key.shape[2]
         if self.num_kv_groups > 1:
             key = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
             value = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)

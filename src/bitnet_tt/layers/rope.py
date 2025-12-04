@@ -9,10 +9,8 @@ This module provides optimized RoPE for Tenstorrent hardware with:
 Based on tt_transformers/tt/rope.py patterns.
 """
 
-import math
-from typing import Optional, Tuple
+from typing import Tuple
 
-import numpy as np
 import torch
 import ttnn
 

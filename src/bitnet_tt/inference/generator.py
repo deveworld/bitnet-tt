@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional
 
 import numpy as np
-import torch
 import ttnn
 from numpy.typing import NDArray
 

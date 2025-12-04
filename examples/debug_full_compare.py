@@ -84,7 +84,7 @@ def compare_top_k_predictions(hf_logits: np.ndarray, ttnn_logits: np.ndarray, to
     if hf_top_k_idx[0] == ttnn_top_k_idx[0]:
         print(f"  Top-1 prediction MATCHES: {repr(tokenizer.decode([hf_top_k_idx[0]]))}")
     else:
-        print(f"  Top-1 prediction DIFFERS:")
+        print("  Top-1 prediction DIFFERS:")
         print(f"    HF:    {repr(tokenizer.decode([hf_top_k_idx[0]]))} (logit: {hf_last[hf_top_k_idx[0]]:.4f})")
         print(f"    TT-NN: {repr(tokenizer.decode([ttnn_top_k_idx[0]]))} (logit: {ttnn_last[ttnn_top_k_idx[0]]:.4f})")
 
@@ -124,9 +124,9 @@ def generate_and_compare(prompt: str, hf_model, ttnn_model, tokenizer, device, m
 
     ttnn_text = tokenizer.decode(ttnn_input_ids[0], skip_special_tokens=True)
 
-    print(f"\n  HuggingFace output:")
+    print("\n  HuggingFace output:")
     print(f"    {repr(hf_text)}")
-    print(f"\n  TT-NN output:")
+    print("\n  TT-NN output:")
     print(f"    {repr(ttnn_text)}")
 
     # Compare token by token
@@ -178,7 +178,7 @@ def main():
     try:
         from bitnet_tt.model.bitnet import create_model
         from bitnet_tt.utils.weights import load_bitnet_weights, load_weights_to_model
-        from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn, ttnn_to_numpy
+        from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn
 
         state_dict, config = load_bitnet_weights("microsoft/bitnet-b1.58-2B-4T-bf16")
         ttnn_model = create_model(config, device)
