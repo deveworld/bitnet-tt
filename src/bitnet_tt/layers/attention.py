@@ -334,16 +334,12 @@ class MultiHeadAttention:
             attn_mask=attention_mask,
             is_causal=is_causal,
             scale=self.scale,
-            memory_config=ttnn.L1_MEMORY_CONFIG,  # Use L1 for faster access
         )
 
         # Concatenate heads: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
         # Use optimized ttnn.transformer.concatenate_heads to avoid layout conversions
         try:
-            attn_output = ttnn.transformer.concatenate_heads(
-                attn_output,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
+            attn_output = ttnn.transformer.concatenate_heads(attn_output)
         except (RuntimeError, TypeError):
             # Fallback to manual reshape
             attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)

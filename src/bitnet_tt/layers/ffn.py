@@ -92,32 +92,25 @@ class FeedForward:
 
     def __call__(self, x: ttnn.Tensor, mode: str = "prefill") -> ttnn.Tensor:
         """
-        Forward pass with mode-aware optimization.
+        Forward pass.
 
         Args:
             x: Input tensor of shape (batch, seq_len, hidden_size)
-            mode: "prefill" or "decode" - affects memory config
+            mode: "prefill" or "decode" (kept for API compatibility)
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
-        # Select memory config based on mode
-        # L1 is ~10x faster than DRAM for decode mode
-        if mode == "decode":
-            mem_config = self.model_config.get("MLP_L1_MEMCFG", ttnn.L1_MEMORY_CONFIG)
-        else:
-            mem_config = self.model_config.get("MLP_DRAM_MEMCFG", ttnn.DRAM_MEMORY_CONFIG)
-
         # Gate with squared ReLU
         gate = self.gate_proj(x)
         gate = ttnn.relu(gate)
-        gate = ttnn.multiply(gate, gate, memory_config=mem_config)  # Squared ReLU
+        gate = ttnn.multiply(gate, gate)  # Squared ReLU
 
         # Up projection
         up = self.up_proj(x)
 
         # Element-wise multiplication
-        hidden = ttnn.multiply(gate, up, memory_config=mem_config)
+        hidden = ttnn.multiply(gate, up)
 
         # Deallocate intermediates to save memory
         ttnn.deallocate(gate)
