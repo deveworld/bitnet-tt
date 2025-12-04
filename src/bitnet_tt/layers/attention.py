@@ -207,18 +207,21 @@ class MultiHeadAttention:
             self.head_dim, max_position_embeddings, rope_theta
         )
 
-        # Upload to device - slice directly from these in forward pass
-        self.cos_cache = ttnn.from_torch(
-            torch.from_numpy(cos_np),
+        # Upload as 2D [max_seq_len, head_dim] for embedding lookup
+        cos_2d = cos_np.squeeze((0, 1))  # [max_seq_len, head_dim]
+        sin_2d = sin_np.squeeze((0, 1))  # [max_seq_len, head_dim]
+
+        self.cos_cache_2d = ttnn.from_torch(
+            torch.from_numpy(cos_2d),
             device=device,
-            layout=ttnn.TILE_LAYOUT,
+            layout=ttnn.ROW_MAJOR_LAYOUT,  # ROW_MAJOR for embedding weight
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        self.sin_cache = ttnn.from_torch(
-            torch.from_numpy(sin_np),
+        self.sin_cache_2d = ttnn.from_torch(
+            torch.from_numpy(sin_2d),
             device=device,
-            layout=ttnn.TILE_LAYOUT,
+            layout=ttnn.ROW_MAJOR_LAYOUT,  # ROW_MAJOR for embedding weight
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
@@ -331,13 +334,22 @@ class MultiHeadAttention:
             attn_mask=attention_mask,
             is_causal=is_causal,
             scale=self.scale,
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # Use L1 for faster access
         )
 
-        # Reshape back: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
-        attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
-        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
+        # Concatenate heads: (batch, num_heads, seq, head_dim) -> (batch, seq, hidden)
+        # Use optimized ttnn.transformer.concatenate_heads to avoid layout conversions
+        try:
+            attn_output = ttnn.transformer.concatenate_heads(
+                attn_output,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+        except (RuntimeError, TypeError):
+            # Fallback to manual reshape
+            attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
+            attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
+            attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
+            attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
@@ -376,13 +388,28 @@ class MultiHeadAttention:
         seq_len: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """Manual RoPE implementation using device-cached cos/sin tables."""
-        # Slice cos/sin from device cache - avoid host->device transfer!
-        # cos_cache shape: [1, 1, max_seq_len, head_dim]
-        cos_ttnn = self.cos_cache[:, :, start_pos:start_pos + seq_len, :]
-        sin_ttnn = self.sin_cache[:, :, start_pos:start_pos + seq_len, :]
+        # Use ttnn.embedding for efficient lookup instead of slicing
+        # Create position indices tensor
+        pos_indices = torch.arange(start_pos, start_pos + seq_len, dtype=torch.int32)
+        pos_tensor = ttnn.from_torch(
+            pos_indices.unsqueeze(0),  # [1, seq_len]
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+
+        # Embedding lookup: cos_cache_2d shape [max_seq_len, head_dim]
+        cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
+        sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
+
+        # Reshape to [1, 1, seq_len, head_dim] for broadcasting
+        cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, seq_len, self.head_dim))
+        sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, seq_len, self.head_dim))
 
         query_rotated = self._apply_rope_to_tensor(query, cos_ttnn, sin_ttnn)
         key_rotated = self._apply_rope_to_tensor(key, cos_ttnn, sin_ttnn)
+
+        ttnn.deallocate(pos_tensor)
 
         return query_rotated, key_rotated
 
