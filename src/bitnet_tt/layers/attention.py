@@ -3,12 +3,14 @@ Optimized Multi-Head Attention implementation using TT-NN.
 
 This module implements the attention mechanism with:
 - Grouped Query Attention (GQA)
-- Pre-computed RoPE with embedding-based lookup (no host->device per token)
-- Pre-allocated KV-Cache with in-place updates
-- Decode-specific SDPA for single-token generation
+- Rotary Position Embeddings (RoPE)
+- KV-Cache for efficient autoregressive generation
 - attn_sub_norm applied after attention, before output projection
+- Mode-aware forward (prefill vs decode)
 
-Performance optimizations based on tt_transformers patterns.
+Key optimizations:
+- Pre-transposed weights (no transpose per forward)
+- Mode parameter for prefill/decode optimization
 """
 
 import math
@@ -16,21 +18,18 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.bitlinear import Linear, RMSNorm
-from bitnet_tt.layers.rope import RotarySetup, apply_rope_ttnn
+from bitnet_tt.layers.bitlinear import Linear, RMSNorm, numpy_to_ttnn
 
 
 @dataclass
 class KVCache:
     """
-    Pre-allocated Key-Value cache for efficient autoregressive generation.
+    Key-Value cache for efficient autoregressive generation.
 
-    Uses fixed-size buffers with position tracking to avoid memory reallocation.
-    Supports both concat-based and in-place update modes.
+    Stores past key and value states to avoid recomputation.
     """
     key_cache: ttnn.Tensor | None = None
     value_cache: ttnn.Tensor | None = None
@@ -50,40 +49,18 @@ class KVCache:
         head_dim: int,
         device: ttnn.Device,
     ) -> None:
-        """
-        Pre-allocate cache buffers for maximum sequence length.
-
-        Args:
-            batch_size: Batch size
-            num_kv_heads: Number of key/value heads
-            max_seq_len: Maximum sequence length to cache
-            head_dim: Head dimension
-            device: TT-NN device
-        """
+        """Pre-allocate cache buffers for maximum sequence length."""
         self.batch_size = batch_size
         self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         self.device = device
 
-        # Create zero-filled buffers [batch, num_kv_heads, max_seq_len, head_dim]
         cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
-        zeros = torch.zeros(cache_shape, dtype=torch.bfloat16)
+        zeros = np.zeros(cache_shape, dtype=np.float32)
 
-        self.key_cache = ttnn.from_torch(
-            zeros,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        self.value_cache = ttnn.from_torch(
-            zeros,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        self.key_cache = numpy_to_ttnn(zeros, device)
+        self.value_cache = numpy_to_ttnn(zeros, device)
         self.seq_len_cached = 0
         self._preallocated = True
 
@@ -92,18 +69,7 @@ class KVCache:
         key_states: ttnn.Tensor,
         value_states: ttnn.Tensor,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """
-        Update cache with new key/value states using concat.
-
-        This is the fallback method that works reliably.
-
-        Args:
-            key_states: New key states (batch, num_kv_heads, seq_len, head_dim)
-            value_states: New value states (batch, num_kv_heads, seq_len, head_dim)
-
-        Returns:
-            Updated (key_states, value_states) including cached values
-        """
+        """Update cache with new key/value states using concat."""
         new_seq_len = key_states.shape[2]
 
         if self.key_cache is None:
@@ -112,19 +78,14 @@ class KVCache:
             self.seq_len_cached = new_seq_len
             return key_states, value_states
 
-        # Concatenate along sequence dimension
         self.key_cache = ttnn.concat([self.key_cache, key_states], dim=2)
         self.value_cache = ttnn.concat([self.value_cache, value_states], dim=2)
         self.seq_len_cached = self.key_cache.shape[2]
 
         return self.key_cache, self.value_cache
 
-    def get_kv_for_decode(self) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Get current KV cache for decode attention."""
-        return self.key_cache, self.value_cache
-
     def reset(self) -> None:
-        """Reset cache position without deallocating."""
+        """Reset cache position."""
         self.seq_len_cached = 0
         if not self._preallocated:
             self.key_cache = None
@@ -142,17 +103,42 @@ class KVCache:
         self._preallocated = False
 
 
+def precompute_freqs_cis(
+    dim: int,
+    max_seq_len: int,
+    theta: float = 10000.0,
+) -> Tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """
+    Precompute cosine and sine frequencies for RoPE.
+
+    Args:
+        dim: Head dimension
+        max_seq_len: Maximum sequence length
+        theta: Base frequency
+
+    Returns:
+        Tuple of (cos, sin) arrays of shape (1, 1, max_seq_len, dim)
+    """
+    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+    t = np.arange(max_seq_len, dtype=np.float32)
+    freqs = np.outer(t, freqs)
+    emb = np.concatenate([freqs, freqs], axis=-1)
+
+    cos = np.cos(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
+    sin = np.sin(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
+
+    return cos, sin
+
+
 class MultiHeadAttention:
     """
     Optimized TT-NN Multi-Head Attention with GQA, RoPE, and KV-Cache.
 
     Key optimizations:
     - Pre-transposed weights (no transpose per forward)
-    - Embedding-based RoPE lookup (no host->device per token in decode)
     - Mode-aware forward (prefill vs decode)
-    - Decode-specific SDPA for single-token generation
 
-    Architecture (matching HuggingFace Transformers):
+    Architecture:
         Q, K, V = q_proj(x), k_proj(x), v_proj(x)
         Q, K = apply_rope(Q, K)
         K, V = update_kv_cache(K, V)
@@ -172,19 +158,7 @@ class MultiHeadAttention:
         eps: float = 1e-5,
         layer_idx: int = 0,
     ) -> None:
-        """
-        Initialize attention layer.
-
-        Args:
-            hidden_size: Hidden dimension
-            num_attention_heads: Number of attention heads
-            num_key_value_heads: Number of key/value heads (for GQA)
-            device: TT-NN device
-            max_position_embeddings: Maximum sequence length
-            rope_theta: RoPE base frequency (500000 for BitNet)
-            eps: Epsilon for numerical stability
-            layer_idx: Layer index for cache management
-        """
+        """Initialize attention layer."""
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
@@ -204,13 +178,9 @@ class MultiHeadAttention:
         # Sub-norm applied after attention, before o_proj (BitNet-specific)
         self.attn_sub_norm = RMSNorm(hidden_size, device, eps)
 
-        # RoPE setup - pre-computed tables on device
-        self.rope_setup = RotarySetup(
-            device=device,
-            head_dim=self.head_dim,
-            max_seq_len=max_position_embeddings,
-            rope_theta=rope_theta,
-            batch_size=1,
+        # Precompute RoPE frequencies
+        self.cos_np, self.sin_np = precompute_freqs_cis(
+            self.head_dim, max_position_embeddings, rope_theta
         )
         self.max_position_embeddings = max_position_embeddings
 
@@ -222,16 +192,7 @@ class MultiHeadAttention:
         o_weight: NDArray[np.floating],
         attn_sub_norm_weight: NDArray[np.floating] | None = None,
     ) -> None:
-        """
-        Load all projection weights.
-
-        Args:
-            q_weight: Query projection weight
-            k_weight: Key projection weight
-            v_weight: Value projection weight
-            o_weight: Output projection weight
-            attn_sub_norm_weight: Sub-norm weight (applied after attention)
-        """
+        """Load all projection weights."""
         self.q_proj.load_weights(q_weight)
         self.k_proj.load_weights(k_weight)
         self.v_proj.load_weights(v_weight)
@@ -255,123 +216,13 @@ class MultiHeadAttention:
         Args:
             hidden_states: Input tensor (batch, seq_len, hidden_size)
             attention_mask: Optional attention mask
-            position_ids: Position indices or starting position (int for decode)
+            position_ids: Position indices (int for decode mode)
             past_key_value: Optional KV-Cache
             use_cache: Whether to return updated KV-Cache
             mode: "prefill" or "decode"
 
         Returns:
             (output tensor, updated KV-Cache if use_cache else None)
-        """
-        if mode == "decode":
-            return self._forward_decode(
-                hidden_states, attention_mask, position_ids, past_key_value, use_cache
-            )
-        else:
-            return self._forward_prefill(
-                hidden_states, attention_mask, position_ids, past_key_value, use_cache
-            )
-
-    def _forward_decode(
-        self,
-        hidden_states: ttnn.Tensor,
-        attention_mask: ttnn.Tensor | None,
-        current_pos: int,
-        past_key_value: KVCache | None,
-        use_cache: bool,
-    ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
-        """
-        Optimized decode forward for single-token generation.
-
-        Uses embedding-based RoPE lookup (no host->device transfer).
-        """
-        batch_size = hidden_states.shape[0]
-        seq_len = hidden_states.shape[1]  # Should be 1 for decode
-
-        # QKV projections
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-
-        # Reshape to 4D for attention
-        query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
-
-        query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
-        key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
-        value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
-
-        # Transpose to (batch, num_heads, seq, head_dim)
-        query = ttnn.permute(query, (0, 2, 1, 3))
-        key = ttnn.permute(key, (0, 2, 1, 3))
-        value = ttnn.permute(value, (0, 2, 1, 3))
-
-        query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
-
-        # Get RoPE embeddings via device-side lookup
-        position_tensor = torch.tensor([current_pos], dtype=torch.long)
-        cos, sin = self.rope_setup.get_rot_mats_decode(position_tensor)
-        trans_mat = self.rope_setup.transformation_mat
-
-        # Apply RoPE
-        query, key = apply_rope_ttnn(query, key, cos, sin, trans_mat, is_decode_mode=True)
-
-        # Update KV-Cache
-        updated_cache = None
-        if use_cache:
-            if past_key_value is None:
-                past_key_value = KVCache()
-            key, value = past_key_value.update(key, value)
-            updated_cache = past_key_value
-
-        # Expand KV heads for GQA
-        if self.num_kv_groups > 1:
-            key = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
-            value = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)
-
-        # Try decode-optimized SDPA, fall back to general
-        try:
-            attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
-                query,
-                key,
-                value,
-                cur_pos=[current_pos],
-                scale=self.scale,
-            )
-        except (AttributeError, RuntimeError):
-            # Fallback to general SDPA
-            attn_output = ttnn.transformer.scaled_dot_product_attention(
-                query, key, value,
-                attn_mask=attention_mask,
-                is_causal=False,  # Causality handled by KV cache
-                scale=self.scale,
-            )
-
-        # Reshape back
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
-        attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
-        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
-
-        # Apply sub-norm and output projection
-        attn_output = self.attn_sub_norm(attn_output)
-        output = self.o_proj(attn_output)
-
-        return output, updated_cache
-
-    def _forward_prefill(
-        self,
-        hidden_states: ttnn.Tensor,
-        attention_mask: ttnn.Tensor | None,
-        position_ids: NDArray[np.integer] | None,
-        past_key_value: KVCache | None,
-        use_cache: bool,
-    ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
-        """
-        Prefill forward for processing prompt tokens.
         """
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -398,16 +249,25 @@ class MultiHeadAttention:
         key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
         value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
 
-        # Get RoPE embeddings for prefill (upload from CPU)
-        start_pos = 0
-        if past_key_value is not None and past_key_value.seq_len_cached > 0:
+        # Determine position IDs for RoPE
+        if mode == "decode" and isinstance(position_ids, int):
+            # Decode mode: single position
+            pos_ids = np.array([position_ids], dtype=np.int64)
+        elif past_key_value is not None and past_key_value.seq_len_cached > 0:
             start_pos = past_key_value.seq_len_cached
+            pos_ids = np.arange(start_pos, start_pos + seq_len, dtype=np.int64)
+        else:
+            pos_ids = np.arange(seq_len, dtype=np.int64)
 
-        cos, sin = self.rope_setup.get_rot_mats_prefill(seq_len, start_pos)
-        trans_mat = self.rope_setup.transformation_mat_prefill
+        # Get RoPE embeddings for current positions
+        cos = self.cos_np[:, :, pos_ids, :]
+        sin = self.sin_np[:, :, pos_ids, :]
+        cos_ttnn = numpy_to_ttnn(cos.astype(np.float32), self.device)
+        sin_ttnn = numpy_to_ttnn(sin.astype(np.float32), self.device)
 
         # Apply RoPE
-        query, key = apply_rope_ttnn(query, key, cos, sin, trans_mat, is_decode_mode=False)
+        query = self._apply_rope(query, cos_ttnn, sin_ttnn)
+        key = self._apply_rope(key, cos_ttnn, sin_ttnn)
 
         # Update KV-Cache
         updated_cache = None
@@ -422,8 +282,8 @@ class MultiHeadAttention:
             key = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
             value = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)
 
-        # Causal attention for prefill
-        is_causal = (past_key_value is None or past_key_value.seq_len_cached == seq_len)
+        # Scaled dot product attention
+        is_causal = past_key_value is None or past_key_value.seq_len_cached == seq_len
 
         attn_output = ttnn.transformer.scaled_dot_product_attention(
             query, key, value,
@@ -444,22 +304,36 @@ class MultiHeadAttention:
 
         return output, updated_cache
 
+    def _apply_rope(
+        self,
+        x: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """
+        Apply rotary position embeddings.
 
-# Legacy function for backward compatibility
-def precompute_freqs_cis(
-    dim: int,
-    max_seq_len: int,
-    theta: float = 10000.0,
-) -> Tuple[NDArray[np.floating], NDArray[np.floating]]:
-    """
-    Precompute cosine and sine frequencies for RoPE.
+        Args:
+            x: Input tensor (batch, num_heads, seq, head_dim)
+            cos: Cosine frequencies (1, 1, seq, head_dim)
+            sin: Sine frequencies (1, 1, seq, head_dim)
 
-    Note: For new code, use RotarySetup instead.
-    """
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
-    t = np.arange(max_seq_len, dtype=np.float32)
-    freqs = np.outer(t, freqs)
-    emb = np.concatenate([freqs, freqs], axis=-1)
-    cos = np.cos(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
-    sin = np.sin(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
-    return cos, sin
+        Returns:
+            Tensor with RoPE applied
+        """
+        num_heads = x.shape[1]
+
+        # Expand cos/sin to match x shape
+        cos_expanded = ttnn.repeat(cos, ttnn.Shape([1, num_heads, 1, 1]))
+        sin_expanded = ttnn.repeat(sin, ttnn.Shape([1, num_heads, 1, 1]))
+
+        # rotate_half: [x1, x2] -> [-x2, x1]
+        half_dim = self.head_dim // 2
+        x1 = x[:, :, :, :half_dim]
+        x2 = x[:, :, :, half_dim:]
+        x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+
+        # Apply rotation: x * cos + rotate_half(x) * sin
+        x_cos = ttnn.multiply(x, cos_expanded)
+        x_rot_sin = ttnn.multiply(x_rotated, sin_expanded)
+        return ttnn.add(x_cos, x_rot_sin)
