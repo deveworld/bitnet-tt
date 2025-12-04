@@ -472,6 +472,7 @@ class TextGenerator:
         temperature: float = 1.0,
         top_k: int | None = 50,
         do_sample: bool = True,
+        use_cache: bool = True,  # Always True in optimized version
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """
         Generate text with streaming output.
@@ -579,6 +580,7 @@ class TextGenerator:
         messages: list[dict[str, str]],
         max_new_tokens: int = 256,
         temperature: float = 0.7,
+        use_cache: bool = True,  # Always True in optimized version
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """Generate a chat response with streaming output."""
         if self.tokenizer is None:
@@ -595,4 +597,5 @@ class TextGenerator:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=True,
+            use_cache=use_cache,
         )
