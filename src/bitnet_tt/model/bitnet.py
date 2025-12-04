@@ -1,12 +1,18 @@
 """
-BitNet model implementation using TT-NN.
+Optimized BitNet model implementation using TT-NN.
 
-This module provides the complete BitNet model for causal language modeling,
-including:
+This module provides the complete BitNet model for causal language modeling:
 - Token embedding
 - Stack of Transformer blocks with KV-Cache support
 - Final normalization
 - Language model head
+
+Performance optimizations:
+- Mode-aware forward (prefill vs decode)
+- Pre-transposed LM head weight
+- Memory config optimizations
+
+Based on tt_transformers patterns.
 """
 
 from typing import Optional
@@ -122,30 +128,38 @@ class BitNetModel:
         """
         Load final norm and LM head weights.
 
+        LM head weight is pre-transposed to avoid transpose per forward.
+
         Args:
             norm_weight: Final norm weight
-            lm_head_weight: LM head weight
+            lm_head_weight: LM head weight (vocab_size, hidden_size)
         """
         self.norm.load_weights(norm_weight)
-        self.lm_head_weight = numpy_to_ttnn(lm_head_weight.astype(np.float32), self.device)
+        # Pre-transpose LM head: (vocab, hidden) -> (hidden, vocab)
+        lm_head_t = lm_head_weight.T.astype(np.float32).copy()
+        self.lm_head_weight = numpy_to_ttnn(lm_head_t, self.device)
 
     def __call__(
         self,
         input_ids: ttnn.Tensor,
         attention_mask: ttnn.Tensor | None = None,
-        position_ids: NDArray[np.integer] | None = None,
+        position_ids: NDArray[np.integer] | int | None = None,
         past_key_values: list[KVCache] | None = None,
         use_cache: bool = False,
+        mode: str = "prefill",
+        current_pos: int | None = None,
     ) -> tuple[ttnn.Tensor, Optional[list[KVCache]]]:
         """
-        Forward pass with optional KV-Cache support.
+        Forward pass with mode-aware optimization.
 
         Args:
             input_ids: Token indices tensor of shape (batch, seq_len)
             attention_mask: Optional attention mask
-            position_ids: Position indices for RoPE (seq_len,) or None
-            past_key_values: List of KV-Cache for each layer (from previous forward)
+            position_ids: Position indices for RoPE (int for decode mode)
+            past_key_values: List of KV-Cache for each layer
             use_cache: Whether to return updated KV-Cache
+            mode: "prefill" or "decode" - affects optimizations
+            current_pos: Current position for decode mode (used if position_ids not set)
 
         Returns:
             Tuple of (logits tensor, updated KV-Cache list if use_cache else None)
@@ -159,6 +173,11 @@ class BitNetModel:
 
         updated_caches: list[KVCache] = [] if use_cache else None
 
+        # Use current_pos as position_ids for decode mode if not explicitly set
+        effective_position_ids = position_ids
+        if mode == "decode" and position_ids is None and current_pos is not None:
+            effective_position_ids = current_pos
+
         # Process through transformer layers
         for layer_idx, layer in enumerate(self.layers):
             past_kv = past_key_values[layer_idx] if past_key_values else None
@@ -166,9 +185,10 @@ class BitNetModel:
             hidden_states, updated_cache = layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=effective_position_ids,
                 past_key_value=past_kv,
                 use_cache=use_cache,
+                mode=mode,
             )
 
             if use_cache:
@@ -177,11 +197,11 @@ class BitNetModel:
         # Final normalization
         hidden_states = self.norm(hidden_states)
 
-        # Language model head
+        # Language model head (weight is pre-transposed)
         if self.lm_head_weight is None:
             raise RuntimeError("LM head weights not loaded.")
 
-        logits = ttnn.matmul(hidden_states, ttnn.transpose(self.lm_head_weight, -2, -1))
+        logits = ttnn.matmul(hidden_states, self.lm_head_weight)
 
         return logits, updated_caches if use_cache else None
 

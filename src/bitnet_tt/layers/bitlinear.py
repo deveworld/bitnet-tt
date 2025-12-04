@@ -126,6 +126,8 @@ class BitLinear:
         """
         Load and quantize weights to device.
 
+        Weights are pre-transposed during load to avoid transpose per forward.
+
         Args:
             weight: Weight array of shape (out_features, in_features)
             norm_weight: Optional RMSNorm weight of shape (in_features,)
@@ -137,8 +139,11 @@ class BitLinear:
         # Convert to float32 for TT-NN (ternary values as floats)
         weight_float = weight_quant.astype(np.float32)
 
-        # Transfer to device
-        self.weight = numpy_to_ttnn(weight_float, self.device)
+        # Pre-transpose weights: (out, in) -> (in, out) to avoid runtime transpose
+        weight_t = weight_float.T.copy()
+
+        # Transfer to device (already transposed)
+        self.weight = numpy_to_ttnn(weight_t, self.device)
 
         # Load norm weight if provided
         if norm_weight is not None:
@@ -176,10 +181,10 @@ class BitLinear:
         # Dequantize for computation
         x_dequant = ttnn.multiply(x_quant, ttnn.reciprocal(scale_x))
 
-        # 3. Matrix multiplication with scaled weight
+        # 3. Matrix multiplication with pre-transposed weight
+        # Weight is already transposed at load time: (in, out)
         weight_scaled = ttnn.multiply(self.weight, self.weight_scale)
-        weight_t = ttnn.transpose(weight_scaled, -2, -1)
-        output = ttnn.matmul(x_dequant, weight_t)
+        output = ttnn.matmul(x_dequant, weight_scaled)
 
         return output
 
@@ -224,6 +229,8 @@ class Linear:
             s = 1.0 / weight.abs().mean()
             result = (weight * s).round().clamp(-1, 1) / s
 
+        Weights are pre-transposed to avoid transpose per forward.
+
         Args:
             weight: Weight array of shape (out_features, in_features)
         """
@@ -235,12 +242,15 @@ class Linear:
         s = 1.0 / max(scale, 1e-5)
         weight_quant = np.clip(np.round(weight * s), -1, 1) / s
 
-        # Store pre-quantized weights
-        self.weight = numpy_to_ttnn(weight_quant, self.device)
+        # Pre-transpose: (out, in) -> (in, out) to avoid runtime transpose
+        weight_t = weight_quant.T.copy()
+
+        # Store pre-quantized and pre-transposed weights
+        self.weight = numpy_to_ttnn(weight_t, self.device)
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         """
-        Forward pass with pre-quantized weights.
+        Forward pass with pre-quantized and pre-transposed weights.
 
         Args:
             x: Input tensor of shape (batch, seq_len, in_features)
@@ -251,8 +261,8 @@ class Linear:
         if self.weight is None:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
-        weight_t = ttnn.transpose(self.weight, -2, -1)
-        return ttnn.matmul(x, weight_t)
+        # Weight is already transposed at load time: (in, out)
+        return ttnn.matmul(x, self.weight)
 
 
 class RMSNorm:

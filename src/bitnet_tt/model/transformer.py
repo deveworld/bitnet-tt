@@ -1,11 +1,14 @@
 """
-Transformer block implementation using TT-NN.
+Optimized Transformer block implementation using TT-NN.
 
 This module implements the Transformer decoder block with:
 - Pre-normalization (RMSNorm before attention and FFN)
 - Residual connections
 - BitNet-style attention and FFN with sub-norms
 - KV-Cache support for efficient generation
+- Mode-aware optimization (prefill vs decode)
+
+Performance optimizations based on tt_transformers patterns.
 """
 
 from typing import Optional
@@ -137,19 +140,21 @@ class TransformerBlock:
         self,
         hidden_states: ttnn.Tensor,
         attention_mask: ttnn.Tensor | None = None,
-        position_ids: NDArray[np.integer] | None = None,
+        position_ids: NDArray[np.integer] | int | None = None,
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
+        mode: str = "prefill",
     ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
-        Forward pass with optional KV-Cache support.
+        Forward pass with mode-aware optimization.
 
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
             attention_mask: Optional attention mask
-            position_ids: Position indices for RoPE
+            position_ids: Position indices for RoPE (int for decode mode)
             past_key_value: Optional KV-Cache from previous forward passes
             use_cache: Whether to return updated KV-Cache
+            mode: "prefill" or "decode" - affects memory config and RoPE lookup
 
         Returns:
             Tuple of (output tensor, updated KV-Cache if use_cache else None)
@@ -166,6 +171,7 @@ class TransformerBlock:
             position_ids=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            mode=mode,
         )
 
         # Residual connection
@@ -176,7 +182,7 @@ class TransformerBlock:
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         # FFN (includes ffn_sub_norm before down_proj)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, mode=mode)
 
         # Residual connection
         hidden_states = ttnn.add(residual, hidden_states)

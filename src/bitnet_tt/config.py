@@ -5,7 +5,8 @@ This module defines configuration classes for different BitNet model sizes,
 including a mini test model and the full BitNet b1.58 2B4T model.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -53,6 +54,79 @@ class BitNetConfig:
     def num_kv_heads(self) -> int:
         """Alias for num_key_value_heads."""
         return self.num_key_value_heads
+
+    def get_model_config(self, device: Any = None) -> dict:
+        """
+        Get model configuration dictionary with memory configs for TT-NN.
+
+        This follows the pattern from tt_transformers/model_config.py for
+        optimized memory layouts in decode/prefill modes.
+
+        Args:
+            device: TT-NN device (required for sharded memory configs)
+
+        Returns:
+            Dictionary containing memory configs and model parameters
+        """
+        import ttnn
+
+        config = {}
+
+        # Basic model parameters
+        config["hidden_size"] = self.hidden_size
+        config["num_layers"] = self.num_layers
+        config["num_heads"] = self.num_attention_heads
+        config["num_kv_heads"] = self.num_key_value_heads
+        config["head_dim"] = self.head_dim
+        config["intermediate_size"] = self.intermediate_size
+
+        # Memory configurations
+        # For single device (P150a), use simple L1/DRAM configs
+        # L1 is ~10x faster than DRAM for intermediate tensors
+
+        # Decode mode: use L1 for fast residual access
+        config["DECODE_RESIDUAL_MEMCFG"] = ttnn.L1_MEMORY_CONFIG
+
+        # Prefill mode: use DRAM (larger sequences)
+        config["PREFILL_RESIDUAL_MEMCFG"] = ttnn.DRAM_MEMORY_CONFIG
+
+        # Attention intermediates: L1 for decode, DRAM for prefill
+        config["ATTN_L1_MEMCFG"] = ttnn.L1_MEMORY_CONFIG
+        config["ATTN_DRAM_MEMCFG"] = ttnn.DRAM_MEMORY_CONFIG
+
+        # MLP intermediates
+        config["MLP_L1_MEMCFG"] = ttnn.L1_MEMORY_CONFIG
+        config["MLP_DRAM_MEMCFG"] = ttnn.DRAM_MEMORY_CONFIG
+
+        # If device is provided, create sharded configs for better performance
+        if device is not None:
+            try:
+                core_grid = device.compute_with_storage_grid_size()
+                batch_size = 1  # Single user for now
+
+                # RoPE transformation matrix config (HEIGHT sharded)
+                config["ROPE_TRANS_MAT_MEMCFG"] = ttnn.create_sharded_memory_config(
+                    shape=(ttnn.TILE_SIZE, ttnn.TILE_SIZE),
+                    core_grid=ttnn.CoreGrid(y=1, x=1),
+                    strategy=ttnn.ShardStrategy.HEIGHT,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+
+                # RoPE cos/sin sharded config
+                config["ROPE_COS_SIN_MEMCFG"] = ttnn.create_sharded_memory_config(
+                    shape=(ttnn.TILE_SIZE, self.head_dim),
+                    core_grid=ttnn.CoreGrid(y=1, x=1),
+                    strategy=ttnn.ShardStrategy.HEIGHT,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+
+            except Exception:
+                # Fall back to non-sharded configs
+                pass
+
+        return config
 
 
 @dataclass
