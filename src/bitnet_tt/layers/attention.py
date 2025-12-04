@@ -207,11 +207,7 @@ class MultiHeadAttention:
             self.head_dim, max_position_embeddings, rope_theta
         )
 
-        # Keep numpy for fallback
-        self.cos_np = cos_np
-        self.sin_np = sin_np
-
-        # Upload to device for native RoPE op
+        # Upload to device - slice directly from these in forward pass
         self.cos_cache = ttnn.from_torch(
             torch.from_numpy(cos_np),
             device=device,
@@ -379,12 +375,11 @@ class MultiHeadAttention:
         start_pos: int,
         seq_len: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Manual RoPE implementation (fallback)."""
-        pos_ids = np.arange(start_pos, start_pos + seq_len, dtype=np.int64)
-        cos = self.cos_np[:, :, pos_ids, :]
-        sin = self.sin_np[:, :, pos_ids, :]
-        cos_ttnn = numpy_to_ttnn(cos.astype(np.float32), self.device)
-        sin_ttnn = numpy_to_ttnn(sin.astype(np.float32), self.device)
+        """Manual RoPE implementation using device-cached cos/sin tables."""
+        # Slice cos/sin from device cache - avoid host->device transfer!
+        # cos_cache shape: [1, 1, max_seq_len, head_dim]
+        cos_ttnn = self.cos_cache[:, :, start_pos:start_pos + seq_len, :]
+        sin_ttnn = self.sin_cache[:, :, start_pos:start_pos + seq_len, :]
 
         query_rotated = self._apply_rope_to_tensor(query, cos_ttnn, sin_ttnn)
         key_rotated = self._apply_rope_to_tensor(key, cos_ttnn, sin_ttnn)
