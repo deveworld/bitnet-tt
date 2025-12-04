@@ -384,28 +384,36 @@ class MultiHeadAttention:
         seq_len: int,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """Manual RoPE implementation using device-cached cos/sin tables."""
-        # Use ttnn.embedding for efficient lookup instead of slicing
-        # Create position indices tensor
-        pos_indices = torch.arange(start_pos, start_pos + seq_len, dtype=torch.int32)
-        pos_tensor = ttnn.from_torch(
-            pos_indices.unsqueeze(0),  # [1, seq_len]
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-        )
-
-        # Embedding lookup: cos_cache_2d shape [max_seq_len, head_dim]
-        cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
-        sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
-
-        # Reshape to [1, 1, seq_len, head_dim] for broadcasting
-        cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, seq_len, self.head_dim))
-        sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, seq_len, self.head_dim))
+        if seq_len == 1:
+            # Decode mode: use embedding lookup with single position
+            pos_tensor = ttnn.from_torch(
+                torch.tensor([[start_pos]], dtype=torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+            )
+            cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
+            sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
+            cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, 1, self.head_dim))
+            sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, 1, self.head_dim))
+            ttnn.deallocate(pos_tensor)
+        else:
+            # Prefill mode: use embedding lookup for range
+            pos_indices = torch.arange(start_pos, start_pos + seq_len, dtype=torch.int32)
+            pos_tensor = ttnn.from_torch(
+                pos_indices.unsqueeze(0),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+            )
+            cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
+            sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
+            cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, seq_len, self.head_dim))
+            sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, seq_len, self.head_dim))
+            ttnn.deallocate(pos_tensor)
 
         query_rotated = self._apply_rope_to_tensor(query, cos_ttnn, sin_ttnn)
         key_rotated = self._apply_rope_to_tensor(key, cos_ttnn, sin_ttnn)
-
-        ttnn.deallocate(pos_tensor)
 
         return query_rotated, key_rotated
 
