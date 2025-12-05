@@ -5,8 +5,12 @@ This module provides a high-level interface for text generation with:
 - Separate prefill and decode paths
 - Trace capture for decode loop (eliminates compilation overhead)
 - On-device sampling to minimize data transfer
+- RotarySetup for optimized RoPE (tt_transformers pattern)
 
-Performance optimizations based on tt_transformers patterns.
+Performance optimizations based on tt_transformers patterns:
+- Pre-computed cos/sin matrices with embedding lookup
+- Pre-allocated KV cache
+- Trace capture for decode loop
 """
 
 import time
@@ -14,11 +18,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional
 
 import numpy as np
+import torch
 import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.layers.attention import KVCache
 from bitnet_tt.layers.bitlinear import numpy_int_to_ttnn, ttnn_to_numpy
+from bitnet_tt.layers.rope_optimized import RotarySetup
 
 
 def _on_device_argmax(logits: ttnn.Tensor) -> NDArray[np.int64]:
@@ -128,6 +134,7 @@ class TextGenerator:
         model: "BitNetModel",
         tokenizer: Any = None,
         enable_trace: bool = True,
+        batch_size: int = 1,
     ) -> None:
         """
         Initialize the text generator.
@@ -136,16 +143,32 @@ class TextGenerator:
             model: BitNet model instance
             tokenizer: HuggingFace tokenizer (optional)
             enable_trace: Whether to use trace capture for decode (default: True)
+            batch_size: Maximum batch size for generation
         """
         self.model = model
         self.device = model.device
+        self.config = model.config
         self.tokenizer = tokenizer
         self.enable_trace = enable_trace
+        self.batch_size = batch_size
 
         # Trace state
         self._trace_id: Optional[int] = None
         self._trace_inputs: Optional[list] = None
         self._trace_output: Optional[ttnn.Tensor] = None
+
+        # Initialize RotarySetup for optimized RoPE (tt_transformers pattern)
+        # This pre-computes and uploads cos/sin matrices ONCE
+        self.rotary_setup = RotarySetup(
+            device=self.device,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_position_embeddings,
+            rope_theta=self.config.rope_theta,
+            batch_size=batch_size,
+        )
+
+        # Pre-allocate KV caches for all layers
+        self._preallocated_kv_caches: Optional[list[KVCache]] = None
 
         # Load default tokenizer if not provided
         if self.tokenizer is None:
@@ -162,6 +185,45 @@ class TextGenerator:
         except ImportError:
             print("Warning: transformers not installed. Cannot load tokenizer.")
             self.tokenizer = None
+
+    def _preallocate_kv_caches(self) -> list[KVCache]:
+        """
+        Pre-allocate KV caches for all layers.
+
+        This is required for the optimized decode path using paged_update_cache.
+        Cache format: [batch, n_kv_heads, max_seq_len, head_dim]
+        """
+        caches = []
+        for layer_idx in range(self.config.num_layers):
+            cache = KVCache(
+                max_seq_len=self.config.max_position_embeddings,
+                batch_size=self.batch_size,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_dim,
+                device=self.device,
+            )
+            cache.preallocate(
+                batch_size=self.batch_size,
+                num_kv_heads=self.config.num_key_value_heads,
+                max_seq_len=self.config.max_position_embeddings,
+                head_dim=self.config.head_dim,
+                device=self.device,
+            )
+            caches.append(cache)
+        return caches
+
+    def get_rot_mats_decode(self, current_pos: int) -> list:
+        """
+        Get rotation matrices for decode step using RotarySetup.
+
+        Uses embedding lookup instead of per-token tensor creation.
+        """
+        position_ids = torch.tensor([current_pos], dtype=torch.long)
+        return self.rotary_setup.get_rot_mats(position_ids)
+
+    def get_transformation_mat(self) -> ttnn.Tensor:
+        """Get transformation matrix for rotary_embedding_llama."""
+        return self.rotary_setup.get_transformation_mats()["decode"]
 
     def prefill_forward(
         self,

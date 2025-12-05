@@ -704,3 +704,109 @@ class MultiHeadAttention:
         x_cos = ttnn.multiply(x, cos)
         x_rot_sin = ttnn.multiply(x_rotated, sin)
         return ttnn.add(x_cos, x_rot_sin)
+
+    def _forward_decode_optimized(
+        self,
+        xqkv_fused: ttnn.Tensor,
+        past_key_value: KVCache,
+        current_pos: int,
+        rot_mats: list,
+        transformation_mat: ttnn.Tensor,
+        batch_size: int,
+    ) -> Tuple[ttnn.Tensor, KVCache]:
+        """
+        Optimized decode forward using tt_transformers patterns.
+
+        Key optimizations (from tt_transformers):
+        1. nlp_create_qkv_heads_decode - single fused op for QKV head creation
+        2. rotary_embedding_llama - fused RoPE with transformation matrix
+        3. paged_update_cache - in-place cache update
+        4. scaled_dot_product_attention_decode - decode-optimized SDPA
+        5. nlp_concat_heads_decode - single fused op for head concatenation
+
+        Args:
+            xqkv_fused: Fused QKV output [batch, 1, qkv_dim] from concatenated projection
+            past_key_value: Pre-allocated KV cache
+            current_pos: Current sequence position
+            rot_mats: [cos, sin] rotation matrices from RotarySetup
+            transformation_mat: Transformation matrix for rotary_embedding_llama
+            batch_size: Batch size
+
+        Returns:
+            (output, updated_cache)
+        """
+        # 1. Create QKV heads using optimized fused op
+        # Input: [batch, 1, (n_heads + 2*n_kv_heads) * head_dim]
+        # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
+        q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
+            xqkv_fused,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(xqkv_fused)
+
+        # 2. Apply RoPE using fused rotary_embedding_llama
+        q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
+            q_heads_1bqd,
+            rot_mats[0],  # cos
+            rot_mats[1],  # sin
+            transformation_mat,
+            is_decode_mode=True,
+        )
+        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+            k_heads_1bkd,
+            rot_mats[0],
+            rot_mats[1],
+            transformation_mat,
+            is_decode_mode=True,
+        )
+
+        # 3. Update KV cache in-place using paged_update_cache
+        # Create position tensor for cache update
+        cur_pos_tensor = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+
+        ttnn.experimental.paged_update_cache(
+            past_key_value.key_cache,
+            k_heads_1bkd,
+            update_idxs_tensor=cur_pos_tensor,
+        )
+        ttnn.experimental.paged_update_cache(
+            past_key_value.value_cache,
+            v_heads_1bkd,
+            update_idxs_tensor=cur_pos_tensor,
+        )
+        ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
+
+        past_key_value.seq_len_cached = current_pos + 1
+
+        # 4. Scaled dot-product attention for decode
+        attn_output_1g4d = ttnn.transformer.scaled_dot_product_attention_decode(
+            q_heads_1bqd,
+            past_key_value.key_cache,
+            past_key_value.value_cache,
+            cur_pos_tensor=cur_pos_tensor,
+            scale=self.scale,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(q_heads_1bqd)
+        ttnn.deallocate(cur_pos_tensor)
+
+        # 5. Concat heads using optimized fused op
+        attn_output = ttnn.experimental.nlp_concat_heads_decode(
+            attn_output_1g4d,
+            num_heads=self.num_heads,
+        )
+        ttnn.deallocate(attn_output_1g4d)
+
+        # Apply sub-norm and output projection
+        attn_output = self.attn_sub_norm(attn_output)
+        output = self.o_proj(attn_output)
+
+        return output, past_key_value
