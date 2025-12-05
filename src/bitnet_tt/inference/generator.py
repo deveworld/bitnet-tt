@@ -235,46 +235,28 @@ class TextGenerator:
             if prefill_key is not None and prefill_len > 0:
                 # Prefill KV is in BKSD format: [batch, heads, seq, head_dim]
                 # Cache is also BKSD format: [batch, heads, max_seq, head_dim]
-                # Use fill_cache_for_user_ or scatter to copy prefill data
-
-                # For now, use paged_fill_cache or manual tensor ops
-                # This copies the prefill KV to positions 0:prefill_len
+                # Use fill_cache_for_user_ to copy prefill data position by position
                 try:
-                    # Create position indices for fill
-                    page_table = ttnn.from_torch(
-                        torch.arange(prefill_len, dtype=torch.int32).unsqueeze(0),
-                        dtype=ttnn.int32,
-                        layout=ttnn.ROW_MAJOR_LAYOUT,
-                        device=self.device,
-                    )
+                    # Fill cache position by position using fill_cache_for_user_
+                    # This is slower than paged_fill_cache but doesn't require sharding
+                    for pos in range(prefill_len):
+                        # Extract single position: [batch, heads, 1, head_dim]
+                        key_at_pos = prefill_key[:, :, pos:pos+1, :]
+                        value_at_pos = prefill_value[:, :, pos:pos+1, :]
 
-                    # Transpose prefill KV to 1BKD for paged_fill_cache
-                    # BKSD [batch, heads, seq, head_dim] -> SBKD [seq, batch, heads, head_dim]
-                    prefill_key_sbkd = ttnn.to_layout(prefill_key, ttnn.ROW_MAJOR_LAYOUT)
-                    prefill_key_sbkd = ttnn.permute(prefill_key_sbkd, (2, 0, 1, 3))
-                    prefill_key_sbkd = ttnn.to_layout(prefill_key_sbkd, ttnn.TILE_LAYOUT)
+                        ttnn.kv_cache.fill_cache_for_user_(
+                            cache.key_cache, key_at_pos, pos
+                        )
+                        ttnn.kv_cache.fill_cache_for_user_(
+                            cache.value_cache, value_at_pos, pos
+                        )
 
-                    prefill_value_sbkd = ttnn.to_layout(prefill_value, ttnn.ROW_MAJOR_LAYOUT)
-                    prefill_value_sbkd = ttnn.permute(prefill_value_sbkd, (2, 0, 1, 3))
-                    prefill_value_sbkd = ttnn.to_layout(prefill_value_sbkd, ttnn.TILE_LAYOUT)
-
-                    # Fill cache with prefill data
-                    ttnn.experimental.paged_fill_cache(
-                        cache.key_cache, prefill_key_sbkd, page_table
-                    )
-                    ttnn.experimental.paged_fill_cache(
-                        cache.value_cache, prefill_value_sbkd, page_table
-                    )
                     if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: paged_fill_cache SUCCESS, prefill_len={prefill_len}")
-
-                    ttnn.deallocate(page_table)
-                    ttnn.deallocate(prefill_key_sbkd)
-                    ttnn.deallocate(prefill_value_sbkd)
+                        print(f"[DEBUG] Layer 0: fill_cache_for_user_ SUCCESS, prefill_len={prefill_len}")
                 except (RuntimeError, AttributeError) as e:
                     # Fallback: Keep prefill tensors and handle in first decode
                     if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: paged_fill_cache FAILED: {e}")
+                        print(f"[DEBUG] Layer 0: fill_cache FAILED: {e}")
                     cache._prefill_key = prefill_key
                     cache._prefill_value = prefill_value
                     continue

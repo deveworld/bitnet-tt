@@ -123,20 +123,27 @@ class KVCache:
             self._prefill_key = None
             self._prefill_value = None
 
-        # Update cache in-place using paged_update_cache
-        # Input: [1, batch, kv_heads, head_dim] (1BKD)
-        # Cache: [batch, kv_heads, max_seq_len, head_dim]
+        # Update cache using fill_cache_for_user_ (doesn't require sharding)
+        # Need to transpose 1BKD to BKSD first
+        # 1BKD: [1, batch, kv_heads, head_dim] -> BKSD: [batch, kv_heads, 1, head_dim]
+        key_bksd = ttnn.to_layout(key_states_1bkd, ttnn.ROW_MAJOR_LAYOUT)
+        key_bksd = ttnn.permute(key_bksd, (1, 2, 0, 3))  # [batch, kv_heads, 1, head_dim]
+        key_bksd = ttnn.to_layout(key_bksd, ttnn.TILE_LAYOUT)
+
+        value_bksd = ttnn.to_layout(value_states_1bkd, ttnn.ROW_MAJOR_LAYOUT)
+        value_bksd = ttnn.permute(value_bksd, (1, 2, 0, 3))
+        value_bksd = ttnn.to_layout(value_bksd, ttnn.TILE_LAYOUT)
+
+        # Use fill_cache_for_user_ which updates cache at specific position
         try:
-            ttnn.experimental.paged_update_cache(
-                self.key_cache, key_states_1bkd,
-                update_idxs_tensor=cur_pos_tensor
+            ttnn.kv_cache.fill_cache_for_user_(
+                self.key_cache, key_bksd, current_pos
             )
-            ttnn.experimental.paged_update_cache(
-                self.value_cache, value_states_1bkd,
-                update_idxs_tensor=cur_pos_tensor
+            ttnn.kv_cache.fill_cache_for_user_(
+                self.value_cache, value_bksd, current_pos
             )
         except Exception as e:
-            print(f"[DEBUG] paged_update_cache FAILED: {e}")
+            print(f"[DEBUG] fill_cache_for_user_ FAILED: {e}")
             raise
 
         self.seq_len_cached = current_pos + 1
