@@ -103,50 +103,44 @@ class KVCache:
         self,
         key_states_1bkd: ttnn.Tensor,
         value_states_1bkd: ttnn.Tensor,
-        cur_pos_tensor: ttnn.Tensor,
         current_pos: int,
-    ) -> None:
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
         Update cache for decode mode with 1BKD format input.
+        Uses concat-based approach (works without sharding).
 
         Args:
             key_states_1bkd: K in [1, batch, kv_heads, head_dim] format
             value_states_1bkd: V in [1, batch, kv_heads, head_dim] format
-            cur_pos_tensor: Position tensor (reused to avoid re-creation)
             current_pos: Current sequence position (int)
+
+        Returns:
+            (key_cache, value_cache) for attention
         """
-        if not self._preallocated:
-            raise RuntimeError("Cache not preallocated for decode")
-
-        # First decode: clear prefill references (data already copied in preallocate)
-        if hasattr(self, '_prefill_key') and self._prefill_key is not None:
-            self._prefill_key = None
-            self._prefill_value = None
-
-        # Update cache using fill_cache_for_user_ (doesn't require sharding)
-        # Need to transpose 1BKD to BKSD first
+        # Transpose 1BKD to BKSD for concat
         # 1BKD: [1, batch, kv_heads, head_dim] -> BKSD: [batch, kv_heads, 1, head_dim]
         key_bksd = ttnn.to_layout(key_states_1bkd, ttnn.ROW_MAJOR_LAYOUT)
-        key_bksd = ttnn.permute(key_bksd, (1, 2, 0, 3))  # [batch, kv_heads, 1, head_dim]
+        key_bksd = ttnn.permute(key_bksd, (1, 2, 0, 3))
         key_bksd = ttnn.to_layout(key_bksd, ttnn.TILE_LAYOUT)
 
         value_bksd = ttnn.to_layout(value_states_1bkd, ttnn.ROW_MAJOR_LAYOUT)
         value_bksd = ttnn.permute(value_bksd, (1, 2, 0, 3))
         value_bksd = ttnn.to_layout(value_bksd, ttnn.TILE_LAYOUT)
 
-        # Use fill_cache_for_user_ which updates cache at specific position
-        try:
-            ttnn.kv_cache.fill_cache_for_user_(
-                self.key_cache, key_bksd, current_pos
-            )
-            ttnn.kv_cache.fill_cache_for_user_(
-                self.value_cache, value_bksd, current_pos
-            )
-        except Exception as e:
-            print(f"[DEBUG] fill_cache_for_user_ FAILED: {e}")
-            raise
+        # Concat-based cache update
+        if self.key_cache is None:
+            self.key_cache = key_bksd
+            self.value_cache = value_bksd
+        else:
+            new_key = ttnn.concat([self.key_cache, key_bksd], dim=2)
+            new_value = ttnn.concat([self.value_cache, value_bksd], dim=2)
+            ttnn.deallocate(self.key_cache)
+            ttnn.deallocate(self.value_cache)
+            self.key_cache = new_key
+            self.value_cache = new_value
 
         self.seq_len_cached = current_pos + 1
+        return self.key_cache, self.value_cache
 
     def reset(self) -> None:
         """Reset cache position (keep pre-allocated buffers)."""
@@ -356,23 +350,27 @@ class MultiHeadAttention:
         # Apply RoPE for decode
         query, key = self._apply_rope_decode_1bkd(query, key, current_pos)
 
-        # Create position tensor once (reused for cache update and SDPA)
+        # Update KV-Cache with 1BKD input (returns updated cache tensors)
+        updated_cache = past_key_value
+        if use_cache and past_key_value is not None:
+            key_cache, value_cache = past_key_value.update_decode_1bkd(key, value, current_pos)
+            updated_cache = past_key_value
+        else:
+            # No cache - just use current KV (shouldn't happen in normal decode)
+            key_cache = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
+            key_cache = ttnn.permute(key_cache, (1, 2, 0, 3))
+            key_cache = ttnn.to_layout(key_cache, ttnn.TILE_LAYOUT)
+            value_cache = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+            value_cache = ttnn.permute(value_cache, (1, 2, 0, 3))
+            value_cache = ttnn.to_layout(value_cache, ttnn.TILE_LAYOUT)
+
+        # Create position tensor for SDPA decode
         cur_pos_tensor = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
             dtype=ttnn.int32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=self.device,
         )
-
-        # Update KV-Cache with 1BKD input using paged_update_cache
-        updated_cache = past_key_value
-        if use_cache and past_key_value is not None:
-            past_key_value.update_decode_1bkd(key, value, cur_pos_tensor, current_pos)
-            updated_cache = past_key_value
-
-        # Get full KV cache for attention (BKSD format: [batch, kv_heads, max_seq, head_dim])
-        key_cache = past_key_value.key_cache
-        value_cache = past_key_value.value_cache
 
         # Transpose Q from 1BQD to BQSD for SDPA decode
         # 1BQD: [1, batch, heads, head_dim] -> BQSD: [batch, heads, 1, head_dim]

@@ -187,81 +187,16 @@ class TextGenerator:
         )
         ttnn.deallocate(input_tensor)
 
-        # Pre-allocate KV caches for decode with 1BKD format support
-        batch_size = tokens.shape[0]
-        self._preallocate_kv_caches(kv_cache, batch_size)
+        # Initialize KV caches for decode (concat-based, no preallocation needed)
+        for cache in kv_cache:
+            # Move prefill KV from temporary storage to cache
+            if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
+                cache.key_cache = cache._prefill_key
+                cache.value_cache = cache._prefill_value
+                cache._prefill_key = None
+                cache._prefill_value = None
 
         return logits, kv_cache
-
-    def _preallocate_kv_caches(
-        self,
-        kv_caches: list[KVCache],
-        batch_size: int,
-    ) -> None:
-        """
-        Pre-allocate KV cache buffers for decode mode.
-
-        After prefill, the KV cache stores references to prefill KV tensors.
-        This method allocates fixed-size buffers and copies prefill data to them.
-        This enables paged_update_cache and trace capture in decode mode.
-        """
-        import torch
-
-        # Get model config
-        config = self.model.config
-        num_kv_heads = config.num_key_value_heads
-        head_dim = config.hidden_size // config.num_attention_heads
-        max_seq_len = getattr(config, 'max_position_embeddings', 4096)
-
-        for layer_idx, cache in enumerate(kv_caches):
-            if cache._preallocated:
-                continue
-
-            # Save prefill KV before preallocation
-            prefill_key = getattr(cache, '_prefill_key', None)
-            prefill_value = getattr(cache, '_prefill_value', None)
-            prefill_len = cache.seq_len_cached
-
-            # Preallocate cache buffers
-            cache.preallocate(
-                batch_size=batch_size,
-                num_kv_heads=num_kv_heads,
-                max_seq_len=max_seq_len,
-                head_dim=head_dim,
-                device=self.device,
-            )
-
-            # Copy prefill KV to preallocated cache
-            if prefill_key is not None and prefill_len > 0:
-                # Prefill KV is in BKSD format: [batch, heads, seq, head_dim]
-                # Cache is also BKSD format: [batch, heads, max_seq, head_dim]
-                # Use fill_cache_for_user_ to copy prefill data position by position
-                try:
-                    # Fill cache position by position using fill_cache_for_user_
-                    # This is slower than paged_fill_cache but doesn't require sharding
-                    for pos in range(prefill_len):
-                        # Extract single position: [batch, heads, 1, head_dim]
-                        key_at_pos = prefill_key[:, :, pos:pos+1, :]
-                        value_at_pos = prefill_value[:, :, pos:pos+1, :]
-
-                        ttnn.kv_cache.fill_cache_for_user_(
-                            cache.key_cache, key_at_pos, pos
-                        )
-                        ttnn.kv_cache.fill_cache_for_user_(
-                            cache.value_cache, value_at_pos, pos
-                        )
-
-                    if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: fill_cache_for_user_ SUCCESS, prefill_len={prefill_len}")
-                except (RuntimeError, AttributeError) as e:
-                    # Fallback: Keep prefill tensors and handle in first decode
-                    if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: fill_cache FAILED: {e}")
-                    cache._prefill_key = prefill_key
-                    cache._prefill_value = prefill_value
-                    continue
-
-            cache.seq_len_cached = prefill_len
 
     def decode_forward(
         self,
