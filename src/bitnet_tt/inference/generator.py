@@ -273,130 +273,377 @@ class TextGenerator:
 
         return logits, kv_cache
 
-    def decode_forward(
-        self,
-        token: NDArray[np.int64],
-        current_pos: int,
-        kv_cache: list[KVCache],
-        use_optimized: bool | None = None,  # Auto-detect based on cache type
-    ) -> tuple[ttnn.Tensor, list[KVCache]]:
-        """
-        Generate single token (decode phase).
+        def _capture_decode_trace(
 
-        Args:
-            token: Single token ID (batch, 1)
-            current_pos: Current position in sequence
-            kv_cache: KV cache from prefill
-            use_optimized: Use optimized decode path with rot_mats
-                           (None = auto-detect based on cache._preallocated)
+            self,
 
-        Returns:
-            (logits, updated_kv_cache)
-        """
-        input_tensor = numpy_int_to_ttnn(token, self.device)
+            token: NDArray[np.int64],
 
-        # Auto-detect whether to use optimized path based on cache state
-        if use_optimized is None:
-            # Check if any cache is pre-allocated (indicates optimized path can be used)
-            use_optimized = (
-                kv_cache is not None
-                and len(kv_cache) > 0
-                and kv_cache[0] is not None
-                and hasattr(kv_cache[0], '_preallocated')
-                and kv_cache[0]._preallocated
+            current_pos: int,
+
+            kv_cache: list[KVCache],
+
+        ) -> tuple[int, ttnn.Tensor, list[ttnn.Tensor]]:
+
+            """
+
+            Capture a trace for the decode forward pass.
+
+    
+
+            This compiles the decode graph once and reuses it for all subsequent
+
+            decode steps, eliminating compilation overhead (2-3x speedup).
+
+    
+
+            Returns:
+
+                (trace_id, output_tensor, [input_token_tensor, current_pos_tensor])
+
+            """
+
+            # 1. Prepare inputs
+
+            # Token tensor (persistent on device for trace input)
+
+            input_tensor = numpy_int_to_ttnn(token, self.device)
+
+            
+
+            # Current position tensor (persistent on device for trace input)
+
+            # Used for RoPE embedding lookup and KV cache update
+
+            current_pos_tensor = ttnn.from_torch(
+
+                torch.tensor([current_pos], dtype=torch.int32),
+
+                dtype=ttnn.int32,
+
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+
+                device=self.device,
+
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+
             )
 
-        # Get rot_mats for optimized decode path
-        rot_mats = None
-        transformation_mat = None
-        if use_optimized:
-            rot_mats = self.get_rot_mats_decode(current_pos)
+    
+
+            # Get transformation mat (constant)
+
             transformation_mat = self.get_transformation_mat()
 
-        logits, kv_cache = self.model(
-            input_tensor,
-            past_key_values=kv_cache,
-            use_cache=True,
-            mode="decode",
-            current_pos=current_pos,
-            rot_mats=rot_mats,
-            transformation_mat=transformation_mat,
-        )
-        ttnn.deallocate(input_tensor)
-        return logits, kv_cache
+            
 
-    def _capture_decode_trace(
-        self,
-        token: NDArray[np.int64],
-        current_pos: int,
-        kv_cache: list[KVCache],
-    ) -> tuple[int, ttnn.Tensor, ttnn.Tensor]:
-        """
-        Capture a trace for the decode forward pass.
+            # Get rot_mats using the persistent position tensor
 
-        This compiles the decode graph once and reuses it for all subsequent
-        decode steps, eliminating compilation overhead (2-3x speedup).
+            # The trace will record the embedding lookup using this tensor
 
-        Returns:
-            (trace_id, output_tensor, input_tensor)
-        """
-        # Compile run (warm up)
-        input_tensor = numpy_int_to_ttnn(token, self.device)
-        _, _ = self.model(
-            input_tensor,
-            past_key_values=kv_cache,
-            use_cache=True,
-            mode="decode",
-            current_pos=current_pos,
-        )
-        ttnn.synchronize_device(self.device)
+            rot_mats = self.rotary_setup.get_rot_mats(current_pos_tensor)
 
-        # Capture trace
-        trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
-        logits, _ = self.model(
-            input_tensor,
-            past_key_values=kv_cache,
-            use_cache=True,
-            mode="decode",
-            current_pos=current_pos,
-        )
-        ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
-        ttnn.synchronize_device(self.device)
+    
 
-        return trace_id, logits, input_tensor
+            # 2. Compile run (warm up)
 
-    def _execute_decode_trace(
-        self,
-        token: NDArray[np.int64],
-    ) -> ttnn.Tensor:
-        """
-        Execute the captured decode trace with new input.
+            _, _ = self.model(
 
-        Args:
-            token: New token to process
+                input_tensor,
 
-        Returns:
-            Output logits tensor
-        """
-        # Copy new token to the trace input tensor
-        new_input = numpy_int_to_ttnn(token, self.device)
-        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs)
+                past_key_values=kv_cache,
 
-        # Execute trace
-        ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
+                use_cache=True,
 
-        return self._trace_output
+                mode="decode",
 
-    def reset_trace(self) -> None:
-        """Reset the decode trace (call when starting a new generation)."""
-        if self._trace_id is not None:
-            try:
-                ttnn.release_trace(self.device, self._trace_id)
-            except Exception:
-                pass
-        self._trace_id = None
-        self._trace_inputs = None
-        self._trace_output = None
+                current_pos=current_pos, # Passed for logic, but tensor used for ops
+
+                rot_mats=rot_mats,
+
+                transformation_mat=transformation_mat,
+
+                current_pos_tensor=current_pos_tensor,
+
+            )
+
+            ttnn.synchronize_device(self.device)
+
+    
+
+            # 3. Capture trace
+
+            trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
+
+            logits, _ = self.model(
+
+                input_tensor,
+
+                past_key_values=kv_cache,
+
+                use_cache=True,
+
+                mode="decode",
+
+                current_pos=current_pos,
+
+                rot_mats=rot_mats,
+
+                transformation_mat=transformation_mat,
+
+                current_pos_tensor=current_pos_tensor,
+
+            )
+
+            ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
+
+            ttnn.synchronize_device(self.device)
+
+    
+
+            return trace_id, logits, [input_tensor, current_pos_tensor]
+
+    
+
+        def _execute_decode_trace(
+
+            self,
+
+            token: NDArray[np.int64],
+
+            current_pos: int,
+
+        ) -> ttnn.Tensor:
+
+            """
+
+            Execute the captured decode trace with new input.
+
+    
+
+            Args:
+
+                token: New token to process
+
+                current_pos: New current position
+
+    
+
+            Returns:
+
+                Output logits tensor
+
+            """
+
+            # Update token tensor
+
+            new_token = numpy_int_to_ttnn(token, self.device)
+
+            ttnn.copy_host_to_device_tensor(new_token, self._trace_inputs[0])
+
+            ttnn.deallocate(new_token)
+
+    
+
+            # Update position tensor
+
+            new_pos = ttnn.from_torch(
+
+                torch.tensor([current_pos], dtype=torch.int32),
+
+                dtype=ttnn.int32,
+
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+
+                device=self.device,
+
+            )
+
+            ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
+
+            ttnn.deallocate(new_pos)
+
+    
+
+            # Execute trace
+
+            ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
+
+    
+
+            return self._trace_output
+
+    
+
+        def reset_trace(self) -> None:
+
+            """Reset the decode trace (call when starting a new generation)."""
+
+            if self._trace_id is not None:
+
+                try:
+
+                    ttnn.release_trace(self.device, self._trace_id)
+
+                except Exception:
+
+                    pass
+
+                
+
+                # Deallocate trace inputs
+
+                if self._trace_inputs:
+
+                    for tensor in self._trace_inputs:
+
+                        ttnn.deallocate(tensor)
+
+                        
+
+                if self._trace_output is not None:
+
+                    ttnn.deallocate(self._trace_output)
+
+    
+
+            self._trace_id = None
+
+            self._trace_inputs = None
+
+            self._trace_output = None
+
+    
+
+        def decode_forward(
+
+            self,
+
+            token: NDArray[np.int64],
+
+            current_pos: int,
+
+            kv_cache: list[KVCache],
+
+            use_optimized: bool | None = None,  # Auto-detect based on cache type
+
+        ) -> tuple[ttnn.Tensor, list[KVCache]]:
+
+            """
+
+            Generate single token (decode phase).
+
+    
+
+            Args:
+
+                token: Single token ID (batch, 1)
+
+                current_pos: Current position in sequence
+
+                kv_cache: KV cache from prefill
+
+                use_optimized: Use optimized decode path with rot_mats
+
+                               (None = auto-detect based on cache._preallocated)
+
+    
+
+            Returns:
+
+                (logits, updated_kv_cache)
+
+            """
+
+            # Auto-detect whether to use optimized path based on cache state
+
+            if use_optimized is None:
+
+                # Check if any cache is pre-allocated (indicates optimized path can be used)
+
+                use_optimized = (
+
+                    kv_cache is not None
+
+                    and len(kv_cache) > 0
+
+                    and kv_cache[0] is not None
+
+                    and hasattr(kv_cache[0], '_preallocated')
+
+                    and kv_cache[0]._preallocated
+
+                )
+
+    
+
+            # Use trace if enabled and using optimized path
+
+            if self.enable_trace and use_optimized:
+
+                if self._trace_id is None:
+
+                    # Capture trace on first run
+
+                    self._trace_id, self._trace_output, self._trace_inputs = self._capture_decode_trace(
+
+                        token, current_pos, kv_cache
+
+                    )
+
+                else:
+
+                    # Execute captured trace
+
+                    self._execute_decode_trace(token, current_pos)
+
+                
+
+                return self._trace_output, kv_cache
+
+    
+
+            # Standard / Fallback path (no trace or unoptimized)
+
+            input_tensor = numpy_int_to_ttnn(token, self.device)
+
+            
+
+            # Get rot_mats for optimized decode path
+
+            rot_mats = None
+
+            transformation_mat = None
+
+            if use_optimized:
+
+                rot_mats = self.get_rot_mats_decode(current_pos)
+
+                transformation_mat = self.get_transformation_mat()
+
+    
+
+            logits, kv_cache = self.model(
+
+                input_tensor,
+
+                past_key_values=kv_cache,
+
+                use_cache=True,
+
+                mode="decode",
+
+                current_pos=current_pos,
+
+                rot_mats=rot_mats,
+
+                transformation_mat=transformation_mat,
+
+            )
+
+            ttnn.deallocate(input_tensor)
+
+            return logits, kv_cache
 
     def generate(
         self,

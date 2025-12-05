@@ -157,7 +157,7 @@ class RotarySetup:
 
     def get_rot_mats(
         self,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | ttnn.Tensor,
     ) -> List[ttnn.Tensor]:
         """
         Get rotation matrices for given positions using embedding lookup.
@@ -167,27 +167,32 @@ class RotarySetup:
         2. Uses device-side embedding lookup
 
         Args:
-            position_ids: [batch] tensor of position indices
+            position_ids: [batch] tensor of position indices (torch or ttnn)
 
         Returns:
             [cos, sin] tensors for rotary embedding
         """
-        batch = position_ids.shape[0]
+        if isinstance(position_ids, ttnn.Tensor):
+            # Already on device (for trace)
+            rot_idxs = position_ids
+            batch = position_ids.shape[1] # Assuming [1, batch] from trace setup
+        else:
+            batch = position_ids.shape[0]
 
-        # Pad to tile size if needed
-        if batch % 32 != 0:
-            pad_size = ((batch + 31) // 32) * 32 - batch
-            position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), value=0)
+            # Pad to tile size if needed
+            if batch % 32 != 0:
+                pad_size = ((batch + 31) // 32) * 32 - batch
+                position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), value=0)
 
-        # Create position index tensor on device
-        position_ids_2d = position_ids.reshape(1, -1)  # [1, batch_padded]
-        rot_idxs = ttnn.from_torch(
-            position_ids_2d,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+            # Create position index tensor on device
+            position_ids_2d = position_ids.reshape(1, -1)  # [1, batch_padded]
+            rot_idxs = ttnn.from_torch(
+                position_ids_2d,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
 
         # Use embedding lookup for cos/sin (device-side operation!)
         cos = ttnn.embedding(rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT)  # [1, batch, head_dim]

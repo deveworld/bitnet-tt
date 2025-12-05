@@ -455,6 +455,7 @@ class MultiHeadAttention:
         mode: str = "prefill",
         rot_mats: list | None = None,
         transformation_mat: ttnn.Tensor | None = None,
+        current_pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -468,6 +469,7 @@ class MultiHeadAttention:
             mode: "prefill" or "decode"
             rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
             transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
+            current_pos_tensor: Optional tensor containing current position (for trace optimization)
         """
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -495,7 +497,8 @@ class MultiHeadAttention:
             xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
             return self._forward_decode_optimized(
                 xqkv_fused, past_key_value, current_pos,
-                rot_mats, transformation_mat, batch_size
+                rot_mats, transformation_mat, batch_size,
+                current_pos_tensor=current_pos_tensor,
             )
 
         # Standard path: separate QKV projections
@@ -805,6 +808,7 @@ class MultiHeadAttention:
         rot_mats: list,
         transformation_mat: ttnn.Tensor,
         batch_size: int,
+        current_pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, KVCache]:
         """
         Optimized decode forward using tt_transformers patterns.
@@ -823,6 +827,7 @@ class MultiHeadAttention:
             rot_mats: [cos, sin] rotation matrices from RotarySetup
             transformation_mat: Transformation matrix for rotary_embedding_llama
             batch_size: Batch size
+            current_pos_tensor: Optional tensor containing current position (for trace)
 
         Returns:
             (output, updated_cache)
@@ -830,13 +835,19 @@ class MultiHeadAttention:
         # 1. Create QKV heads using optimized fused op
         # Input: [batch, 1, (n_heads + 2*n_kv_heads) * head_dim]
         # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
+
+        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, batch, 1, qkv_dim]
+        # xqkv_fused is [batch, 1, qkv_dim]
+        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, batch_size, 1, self._qkv_dim))
+        ttnn.deallocate(xqkv_fused)
+
         q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
-            xqkv_fused,
+            xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        ttnn.deallocate(xqkv_fused)
+        ttnn.deallocate(xqkv_fused_4d)
 
         # 2. Apply RoPE using fused rotary_embedding_llama
         q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
@@ -855,13 +866,16 @@ class MultiHeadAttention:
         )
 
         # 3. Update KV cache in-place using paged_update_cache
-        # Create position tensor for cache update
-        cur_pos_tensor = ttnn.from_torch(
-            torch.tensor([current_pos], dtype=torch.int32),
-            dtype=ttnn.int32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-        )
+        # Create position tensor for cache update if not provided
+        if current_pos_tensor is not None:
+            cur_pos_tensor = current_pos_tensor
+        else:
+            cur_pos_tensor = ttnn.from_torch(
+                torch.tensor([current_pos], dtype=torch.int32),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+            )
 
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache,
@@ -888,7 +902,10 @@ class MultiHeadAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(q_heads_1bqd)
-        ttnn.deallocate(cur_pos_tensor)
+        
+        # Only deallocate if we created it locally
+        if current_pos_tensor is None:
+            ttnn.deallocate(cur_pos_tensor)
 
         # 5. Concat heads using optimized fused op
         attn_output = ttnn.experimental.nlp_concat_heads_decode(
