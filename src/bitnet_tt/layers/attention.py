@@ -615,20 +615,19 @@ class MultiHeadAttention:
         sin: ttnn.Tensor,
         num_heads: int,
     ) -> ttnn.Tensor:
-        """Apply RoPE to 1BKD tensor [1, batch, heads, head_dim]."""
-        # Expand cos/sin to match batch and heads
-        # cos/sin are [1, 1, 1, head_dim], x is [1, batch, heads, head_dim]
-        batch_size = x.shape[1]
-        cos_expanded = ttnn.repeat(cos, ttnn.Shape([1, batch_size, num_heads, 1]))
-        sin_expanded = ttnn.repeat(sin, ttnn.Shape([1, batch_size, num_heads, 1]))
+        """Apply RoPE to 1BKD tensor [1, batch, heads, head_dim].
 
+        Uses TTNN broadcasting in multiply (no explicit repeat needed).
+        cos/sin are [1, 1, 1, head_dim], x is [1, batch, heads, head_dim].
+        """
         half_dim = self.head_dim // 2
         x1 = x[:, :, :, :half_dim]
         x2 = x[:, :, :, half_dim:]
         x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
-        x_cos = ttnn.multiply(x, cos_expanded)
-        x_rot_sin = ttnn.multiply(x_rotated, sin_expanded)
+        # Use broadcasting in multiply instead of explicit repeat
+        x_cos = ttnn.multiply(x, cos)
+        x_rot_sin = ttnn.multiply(x_rotated, sin)
         return ttnn.add(x_cos, x_rot_sin)
 
     def _apply_rope_prefill(
@@ -690,17 +689,18 @@ class MultiHeadAttention:
         cos: ttnn.Tensor,
         sin: ttnn.Tensor,
     ) -> ttnn.Tensor:
-        """Apply RoPE to a single tensor."""
-        num_heads = x.shape[1]
+        """Apply RoPE to a single tensor.
 
-        cos_expanded = ttnn.repeat(cos, ttnn.Shape([1, num_heads, 1, 1]))
-        sin_expanded = ttnn.repeat(sin, ttnn.Shape([1, num_heads, 1, 1]))
-
+        Uses TTNN broadcasting in multiply (no explicit repeat needed).
+        cos/sin are [1, 1, seq, head_dim], x is [batch, heads, seq, head_dim].
+        """
         half_dim = self.head_dim // 2
         x1 = x[:, :, :, :half_dim]
         x2 = x[:, :, :, half_dim:]
         x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
-        x_cos = ttnn.multiply(x, cos_expanded)
-        x_rot_sin = ttnn.multiply(x_rotated, sin_expanded)
+        # Use broadcasting in multiply instead of explicit repeat
+        # This eliminates 4 repeat ops per layer (120 total for 30 layers)
+        x_cos = ttnn.multiply(x, cos)
+        x_rot_sin = ttnn.multiply(x_rotated, sin)
         return ttnn.add(x_cos, x_rot_sin)
