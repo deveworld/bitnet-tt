@@ -126,14 +126,18 @@ class KVCache:
         # Update cache in-place using paged_update_cache
         # Input: [1, batch, kv_heads, head_dim] (1BKD)
         # Cache: [batch, kv_heads, max_seq_len, head_dim]
-        ttnn.experimental.paged_update_cache(
-            self.key_cache, key_states_1bkd,
-            update_idxs_tensor=cur_pos_tensor
-        )
-        ttnn.experimental.paged_update_cache(
-            self.value_cache, value_states_1bkd,
-            update_idxs_tensor=cur_pos_tensor
-        )
+        try:
+            ttnn.experimental.paged_update_cache(
+                self.key_cache, key_states_1bkd,
+                update_idxs_tensor=cur_pos_tensor
+            )
+            ttnn.experimental.paged_update_cache(
+                self.value_cache, value_states_1bkd,
+                update_idxs_tensor=cur_pos_tensor
+            )
+        except Exception as e:
+            print(f"[DEBUG] paged_update_cache FAILED: {e}")
+            raise
 
         self.seq_len_cached = current_pos + 1
 
@@ -320,6 +324,9 @@ class MultiHeadAttention:
         1BKD format: [seq_len=1, batch, heads, head_dim]
         This enables: paged_update_cache, scaled_dot_product_attention_decode
         """
+        if self.layer_idx == 0 and current_pos < 12:
+            print(f"[DEBUG L0] _forward_decode called, pos={current_pos}, cache_preallocated={past_key_value._preallocated if past_key_value else 'None'}")
+
         # Reshape QKV to 1BKD: [1, batch, heads, head_dim]
         query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
         key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
@@ -374,7 +381,11 @@ class MultiHeadAttention:
                 cur_pos_tensor=cur_pos_tensor,
                 scale=self.scale,
             )
+            if self.layer_idx == 0:
+                print(f"[DEBUG L0] SDPA decode SUCCESS at pos {current_pos}")
         except (RuntimeError, TypeError) as e:
+            if self.layer_idx == 0:
+                print(f"[DEBUG L0] SDPA decode FAILED: {e}, using fallback")
             # SDPA decode failed - need to expand KV for general SDPA
             # Only expand what we need (up to current_pos + 1)
             if self.num_kv_groups > 1:

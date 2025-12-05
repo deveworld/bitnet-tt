@@ -265,12 +265,16 @@ class TextGenerator:
                     ttnn.experimental.paged_fill_cache(
                         cache.value_cache, prefill_value_sbkd, page_table
                     )
+                    if layer_idx == 0:
+                        print(f"[DEBUG] Layer 0: paged_fill_cache SUCCESS, prefill_len={prefill_len}")
 
                     ttnn.deallocate(page_table)
                     ttnn.deallocate(prefill_key_sbkd)
                     ttnn.deallocate(prefill_value_sbkd)
                 except (RuntimeError, AttributeError) as e:
                     # Fallback: Keep prefill tensors and handle in first decode
+                    if layer_idx == 0:
+                        print(f"[DEBUG] Layer 0: paged_fill_cache FAILED: {e}")
                     cache._prefill_key = prefill_key
                     cache._prefill_value = prefill_value
                     continue
