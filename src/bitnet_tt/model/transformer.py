@@ -144,6 +144,8 @@ class TransformerBlock:
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
         mode: str = "prefill",
+        rot_mats: list | None = None,
+        transformation_mat: ttnn.Tensor | None = None,
     ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -155,6 +157,8 @@ class TransformerBlock:
             past_key_value: Optional KV-Cache from previous forward passes
             use_cache: Whether to return updated KV-Cache
             mode: "prefill" or "decode" - affects memory config and RoPE lookup
+            rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
+            transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
 
         Returns:
             Tuple of (output tensor, updated KV-Cache if use_cache else None)
@@ -172,6 +176,8 @@ class TransformerBlock:
             past_key_value=past_key_value,
             use_cache=use_cache,
             mode=mode,
+            rot_mats=rot_mats,
+            transformation_mat=transformation_mat,
         )
 
         # Residual connection

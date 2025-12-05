@@ -273,6 +273,53 @@ class KVCache:
         self.seq_len_cached = 0
         self._preallocated = False
 
+    def copy_from_prefill(
+        self,
+        key_states: ttnn.Tensor,
+        value_states: ttnn.Tensor,
+        seq_len: int,
+    ) -> None:
+        """
+        Copy prefill results into pre-allocated cache.
+
+        This enables the optimized decode path after standard prefill.
+
+        Args:
+            key_states: Key tensor [batch, n_kv_heads, seq_len, head_dim]
+            value_states: Value tensor [batch, n_kv_heads, seq_len, head_dim]
+            seq_len: Sequence length of prefill
+        """
+        if not self._preallocated:
+            raise RuntimeError("Cache not preallocated")
+
+        # Copy prefill KV to the start of pre-allocated cache
+        # Use slice assignment: cache[:, :, :seq_len, :] = states
+        # TT-NN doesn't have direct slice assignment, so we use paged_update_cache
+        # for each position, or slice + concat
+
+        # For efficiency, we'll slice the pre-allocated cache and copy
+        # Actually, for prefill we need to write to positions 0..seq_len-1
+
+        # Simple approach: just overwrite the pre-allocated cache with the prefill result
+        # The cache tensors from prefill should fit within the pre-allocated size
+        if key_states.shape[2] <= self.max_seq_len:
+            # The prefill cache is smaller than or equal to max_seq_len
+            # We can use it directly for decode since SDPA will use cur_pos to limit
+            # But we need the pre-allocated format for paged_update_cache
+
+            # For now, store the prefill cache and use it
+            # The decode path will check seq_len_cached
+            # Note: This isn't truly pre-allocated mode but works as a fallback
+            if self.key_cache is not None:
+                ttnn.deallocate(self.key_cache)
+            if self.value_cache is not None:
+                ttnn.deallocate(self.value_cache)
+            self.key_cache = key_states
+            self.value_cache = value_states
+            self.seq_len_cached = seq_len
+            # Mark as NOT preallocated since we replaced the buffer
+            self._preallocated = False
+
 
 def precompute_freqs_cis(
     dim: int,
@@ -331,6 +378,10 @@ class MultiHeadAttention:
         self.v_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
         self.o_proj = Linear(num_attention_heads * self.head_dim, hidden_size, device)
 
+        # Fused QKV projection for optimized decode (created when weights are loaded)
+        self.qkv_fused_weight: ttnn.Tensor | None = None
+        self._qkv_dim = (num_attention_heads + 2 * num_key_value_heads) * self.head_dim
+
         # Sub-norm applied after attention, before o_proj (BitNet-specific)
         self.attn_sub_norm = RMSNorm(hidden_size, device, eps)
 
@@ -366,7 +417,7 @@ class MultiHeadAttention:
         o_weight: NDArray[np.floating],
         attn_sub_norm_weight: NDArray[np.floating] | None = None,
     ) -> None:
-        """Load all projection weights."""
+        """Load all projection weights and create fused QKV weight."""
         self.q_proj.load_weights(q_weight)
         self.k_proj.load_weights(k_weight)
         self.v_proj.load_weights(v_weight)
@@ -374,6 +425,25 @@ class MultiHeadAttention:
 
         if attn_sub_norm_weight is not None:
             self.attn_sub_norm.load_weights(attn_sub_norm_weight)
+
+        # Create fused QKV weight for optimized decode
+        # Concatenate Q, K, V weights: [hidden_size, qkv_dim]
+        # Original weights are [out_features, in_features], transposed for matmul
+        # Q: [num_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_heads * head_dim]
+        # K: [num_kv_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_kv_heads * head_dim]
+        # V: [num_kv_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_kv_heads * head_dim]
+        q_t = q_weight.T.astype(np.float32)  # [hidden_size, num_heads * head_dim]
+        k_t = k_weight.T.astype(np.float32)  # [hidden_size, num_kv_heads * head_dim]
+        v_t = v_weight.T.astype(np.float32)  # [hidden_size, num_kv_heads * head_dim]
+        qkv_fused = np.concatenate([q_t, k_t, v_t], axis=1)  # [hidden_size, qkv_dim]
+
+        self.qkv_fused_weight = ttnn.from_torch(
+            torch.from_numpy(qkv_fused),
+            device=self.device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
     def __call__(
         self,
@@ -383,6 +453,8 @@ class MultiHeadAttention:
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
         mode: str = "prefill",
+        rot_mats: list | None = None,
+        transformation_mat: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -394,14 +466,11 @@ class MultiHeadAttention:
             past_key_value: Optional KV-Cache
             use_cache: Whether to return updated KV-Cache
             mode: "prefill" or "decode"
+            rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
+            transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
         """
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
-
-        # QKV projections
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
 
         # Determine current position
         if mode == "decode" and isinstance(position_ids, int):
@@ -410,6 +479,29 @@ class MultiHeadAttention:
             current_pos = past_key_value.seq_len_cached
         else:
             current_pos = 0
+
+        # Use optimized prefill path when pre-allocated cache is provided
+        if (mode == "prefill" and past_key_value is not None
+                and hasattr(past_key_value, '_preallocated') and past_key_value._preallocated):
+            return self._forward_prefill_with_preallocated_cache(
+                hidden_states, past_key_value, batch_size, seq_len
+            )
+
+        # Use optimized decode path when rot_mats are provided and cache is pre-allocated
+        if (mode == "decode" and rot_mats is not None and transformation_mat is not None
+                and self.qkv_fused_weight is not None
+                and past_key_value is not None and past_key_value._preallocated):
+            # Fused QKV projection
+            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+            return self._forward_decode_optimized(
+                xqkv_fused, past_key_value, current_pos,
+                rot_mats, transformation_mat, batch_size
+            )
+
+        # Standard path: separate QKV projections
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
 
         # Use BKSD format for both prefill and decode
         # Note: 1BKD format + paged ops requires sharding, SDPA decode requires seq%32==0
@@ -808,5 +900,134 @@ class MultiHeadAttention:
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
+
+        return output, past_key_value
+
+    def _forward_prefill_with_preallocated_cache(
+        self,
+        hidden_states: ttnn.Tensor,
+        past_key_value: KVCache,
+        batch_size: int,
+        seq_len: int,
+    ) -> Tuple[ttnn.Tensor, KVCache]:
+        """
+        Prefill forward that stores non-expanded KV in pre-allocated cache.
+
+        This enables seamless transition to optimized decode path.
+        Cache stores [batch, n_kv_heads, max_seq_len, head_dim] (NOT GQA expanded).
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_size]
+            past_key_value: Pre-allocated KV cache
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            (output, updated_cache)
+        """
+        # QKV projections
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+
+        # Reshape to BKSD: [batch, heads, seq, head_dim]
+        query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
+        key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
+        value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+
+        query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
+        key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+
+        query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
+        key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
+        value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
+
+        query = ttnn.transpose(query, 1, 2)  # [batch, num_heads, seq, head_dim]
+        key = ttnn.transpose(key, 1, 2)      # [batch, num_kv_heads, seq, head_dim]
+        value = ttnn.transpose(value, 1, 2)  # [batch, num_kv_heads, seq, head_dim]
+
+        # Apply RoPE
+        query, key = self._apply_rope_manual(query, key, 0, seq_len)
+
+        # Store non-expanded KV in pre-allocated cache
+        # Copy KV states to the start of the pre-allocated cache
+        # For prefill, we store positions 0..seq_len-1
+
+        # Update cache position tracking
+        past_key_value.seq_len_cached = seq_len
+
+        # For prefill, we need to slice the pre-allocated cache and copy
+        # TT-NN slice and assign: cache[:, :, :seq_len, :] = key/value
+        # Since TT-NN doesn't have direct slice assignment, we replace the cache
+        # with a new tensor that has the prefill data
+
+        # Deallocate old cache and assign new data
+        if past_key_value.key_cache is not None:
+            ttnn.deallocate(past_key_value.key_cache)
+        if past_key_value.value_cache is not None:
+            ttnn.deallocate(past_key_value.value_cache)
+
+        # Pad key/value to max_seq_len if needed for SDPA compatibility
+        if seq_len < past_key_value.max_seq_len:
+            # Pad with zeros
+            pad_len = past_key_value.max_seq_len - seq_len
+            pad_shape = (batch_size, self.num_kv_heads, pad_len, self.head_dim)
+            zeros = torch.zeros(pad_shape, dtype=torch.bfloat16)
+            zeros_ttnn = ttnn.from_torch(
+                zeros,
+                device=self.device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            key_padded = ttnn.concat([key, zeros_ttnn], dim=2)
+            value_padded = ttnn.concat([value, zeros_ttnn], dim=2)
+            ttnn.deallocate(key)
+            ttnn.deallocate(value)
+            ttnn.deallocate(zeros_ttnn)
+            past_key_value.key_cache = key_padded
+            past_key_value.value_cache = value_padded
+        else:
+            past_key_value.key_cache = key
+            past_key_value.value_cache = value
+
+        # For prefill SDPA, we need to expand KV for GQA
+        if self.num_kv_groups > 1:
+            key_expanded = ttnn.repeat_interleave(
+                past_key_value.key_cache[:, :, :seq_len, :], self.num_kv_groups, dim=1
+            )
+            value_expanded = ttnn.repeat_interleave(
+                past_key_value.value_cache[:, :, :seq_len, :], self.num_kv_groups, dim=1
+            )
+        else:
+            key_expanded = past_key_value.key_cache[:, :, :seq_len, :]
+            value_expanded = past_key_value.value_cache[:, :, :seq_len, :]
+
+        # SDPA (causal attention for prefill)
+        attn_output = ttnn.transformer.scaled_dot_product_attention(
+            query, key_expanded, value_expanded,
+            attn_mask=None,
+            is_causal=True,
+            scale=self.scale,
+        )
+
+        # Cleanup expanded tensors
+        if self.num_kv_groups > 1:
+            ttnn.deallocate(key_expanded)
+            ttnn.deallocate(value_expanded)
+
+        # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
+        attn_output = ttnn.transpose(attn_output, 1, 2)
+        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
+        attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
+        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
+
+        # Apply sub-norm and output projection
+        attn_output = self.attn_sub_norm(attn_output)
+        output = self.o_proj(attn_output)
+
+        # Mark cache as properly initialized for optimized decode
+        past_key_value._preallocated = True
 
         return output, past_key_value

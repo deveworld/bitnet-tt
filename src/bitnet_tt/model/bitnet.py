@@ -148,6 +148,8 @@ class BitNetModel:
         use_cache: bool = False,
         mode: str = "prefill",
         current_pos: int | None = None,
+        rot_mats: list | None = None,
+        transformation_mat: ttnn.Tensor | None = None,
     ) -> tuple[ttnn.Tensor, Optional[list[KVCache]]]:
         """
         Forward pass with mode-aware optimization.
@@ -160,6 +162,8 @@ class BitNetModel:
             use_cache: Whether to return updated KV-Cache
             mode: "prefill" or "decode" - affects optimizations
             current_pos: Current position for decode mode (used if position_ids not set)
+            rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
+            transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
 
         Returns:
             Tuple of (logits tensor, updated KV-Cache list if use_cache else None)
@@ -189,6 +193,8 @@ class BitNetModel:
                 past_key_value=past_kv,
                 use_cache=use_cache,
                 mode=mode,
+                rot_mats=rot_mats,
+                transformation_mat=transformation_mat,
             )
 
             if use_cache:

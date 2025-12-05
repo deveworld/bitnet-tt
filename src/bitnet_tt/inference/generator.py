@@ -229,6 +229,7 @@ class TextGenerator:
         self,
         tokens: NDArray[np.int64],
         kv_cache: Optional[list[KVCache]] = None,
+        use_preallocated: bool = False,
     ) -> tuple[ttnn.Tensor, list[KVCache]]:
         """
         Process prompt tokens (prefill phase).
@@ -236,10 +237,20 @@ class TextGenerator:
         Args:
             tokens: Input token IDs (batch, seq_len)
             kv_cache: Optional existing KV cache
+            use_preallocated: Use pre-allocated KV caches for optimized decode
 
         Returns:
             (logits, updated_kv_cache)
         """
+        # Optionally use pre-allocated caches for optimized decode path
+        if use_preallocated and kv_cache is None:
+            if self._preallocated_kv_caches is None:
+                self._preallocated_kv_caches = self._preallocate_kv_caches()
+            # Reset caches for new generation
+            for cache in self._preallocated_kv_caches:
+                cache.seq_len_cached = 0
+            kv_cache = self._preallocated_kv_caches
+
         input_tensor = numpy_int_to_ttnn(tokens, self.device)
         logits, kv_cache = self.model(
             input_tensor,
@@ -267,6 +278,7 @@ class TextGenerator:
         token: NDArray[np.int64],
         current_pos: int,
         kv_cache: list[KVCache],
+        use_optimized: bool | None = None,  # Auto-detect based on cache type
     ) -> tuple[ttnn.Tensor, list[KVCache]]:
         """
         Generate single token (decode phase).
@@ -275,17 +287,40 @@ class TextGenerator:
             token: Single token ID (batch, 1)
             current_pos: Current position in sequence
             kv_cache: KV cache from prefill
+            use_optimized: Use optimized decode path with rot_mats
+                           (None = auto-detect based on cache._preallocated)
 
         Returns:
             (logits, updated_kv_cache)
         """
         input_tensor = numpy_int_to_ttnn(token, self.device)
+
+        # Auto-detect whether to use optimized path based on cache state
+        if use_optimized is None:
+            # Check if any cache is pre-allocated (indicates optimized path can be used)
+            use_optimized = (
+                kv_cache is not None
+                and len(kv_cache) > 0
+                and kv_cache[0] is not None
+                and hasattr(kv_cache[0], '_preallocated')
+                and kv_cache[0]._preallocated
+            )
+
+        # Get rot_mats for optimized decode path
+        rot_mats = None
+        transformation_mat = None
+        if use_optimized:
+            rot_mats = self.get_rot_mats_decode(current_pos)
+            transformation_mat = self.get_transformation_mat()
+
         logits, kv_cache = self.model(
             input_tensor,
             past_key_values=kv_cache,
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
+            rot_mats=rot_mats,
+            transformation_mat=transformation_mat,
         )
         ttnn.deallocate(input_tensor)
         return logits, kv_cache
@@ -370,6 +405,7 @@ class TextGenerator:
         temperature: float = 1.0,
         top_k: int | None = 50,
         do_sample: bool = True,
+        use_optimized: bool = True,
     ) -> str:
         """
         Generate text from a prompt.
@@ -380,6 +416,7 @@ class TextGenerator:
             temperature: Sampling temperature
             top_k: Top-k filtering
             do_sample: Whether to sample
+            use_optimized: Use optimized path with pre-allocated caches (default: True)
 
         Returns:
             Generated text including the prompt
@@ -396,6 +433,7 @@ class TextGenerator:
             temperature=temperature,
             top_k=top_k,
             do_sample=do_sample,
+            use_optimized=use_optimized,
         )
 
         return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -407,9 +445,18 @@ class TextGenerator:
         temperature: float,
         top_k: int | None,
         do_sample: bool,
+        use_optimized: bool = True,
     ) -> NDArray[np.int64]:
         """
         Generate tokens with optimized prefill/decode split.
+
+        Args:
+            input_ids: Input token IDs
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            do_sample: Whether to sample
+            use_optimized: Use optimized path with pre-allocated caches
         """
         batch_size, seq_len = input_ids.shape
         generated = input_ids.copy()
@@ -418,7 +465,8 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens
-        logits, kv_cache = self.prefill_forward(input_ids)
+        # Use pre-allocated caches for optimized decode
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -546,11 +594,21 @@ class TextGenerator:
         top_k: int | None = 50,
         do_sample: bool = True,
         use_cache: bool = True,  # Always True in optimized version
+        use_optimized: bool = True,  # Use optimized path with pre-allocated caches
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """
         Generate text with streaming output.
 
         Yields tokens as they are generated along with statistics.
+
+        Args:
+            prompt: Input prompt text
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            do_sample: Whether to sample
+            use_cache: Always True (kept for API compatibility)
+            use_optimized: Use optimized path with pre-allocated caches (default: True)
         """
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded.")
@@ -566,9 +624,9 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill (KV cache will be created during forward)
+        # Phase 1: Prefill (use pre-allocated caches for optimized decode)
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
@@ -654,6 +712,7 @@ class TextGenerator:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         use_cache: bool = True,  # Always True in optimized version
+        use_optimized: bool = True,  # Use optimized path with pre-allocated caches
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """Generate a chat response with streaming output."""
         if self.tokenizer is None:
@@ -671,4 +730,5 @@ class TextGenerator:
             temperature=temperature,
             do_sample=True,
             use_cache=use_cache,
+            use_optimized=use_optimized,
         )
