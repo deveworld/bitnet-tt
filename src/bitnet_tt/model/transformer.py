@@ -147,6 +147,7 @@ class TransformerBlock:
         rot_mats: list | None = None,
         transformation_mat: ttnn.Tensor | None = None,
         current_pos_tensor: ttnn.Tensor | None = None,
+        page_table: ttnn.Tensor | None = None,
     ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -161,6 +162,7 @@ class TransformerBlock:
             rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
             transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
             current_pos_tensor: Optional tensor containing current position (for trace)
+            page_table: Optional page table for paged attention
 
         Returns:
             Tuple of (output tensor, updated KV-Cache if use_cache else None)
@@ -181,6 +183,7 @@ class TransformerBlock:
             rot_mats=rot_mats,
             transformation_mat=transformation_mat,
             current_pos_tensor=current_pos_tensor,
+            page_table=page_table,
         )
 
         # Residual connection
