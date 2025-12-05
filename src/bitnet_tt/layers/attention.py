@@ -442,6 +442,7 @@ class MultiHeadAttention:
         This avoids expanding all cached positions every decode step.
         """
         # Reshape to BKSD: [batch, heads, seq, head_dim]
+        # Optimization: reshape in ROW_MAJOR, then transpose in TILE_LAYOUT
         query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
         key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
         value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
@@ -450,13 +451,15 @@ class MultiHeadAttention:
         key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
         value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
 
-        query = ttnn.permute(query, (0, 2, 1, 3))
-        key = ttnn.permute(key, (0, 2, 1, 3))
-        value = ttnn.permute(value, (0, 2, 1, 3))
-
+        # Convert to TILE before transpose (transpose may be faster in TILE_LAYOUT)
         query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
         key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
         value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
+
+        # Use transpose(1, 2) instead of permute - may be more efficient
+        query = ttnn.transpose(query, 1, 2)
+        key = ttnn.transpose(key, 1, 2)
+        value = ttnn.transpose(value, 1, 2)
 
         # Apply RoPE
         query, key = self._apply_rope_manual(query, key, current_pos, seq_len)
@@ -497,8 +500,9 @@ class MultiHeadAttention:
         )
 
         # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
+        # Optimization: transpose in TILE, reshape in ROW_MAJOR
+        attn_output = ttnn.transpose(attn_output, 1, 2)  # [b, s, h, d]
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
         attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
         attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
