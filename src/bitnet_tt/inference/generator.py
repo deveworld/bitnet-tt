@@ -187,11 +187,12 @@ class TextGenerator:
         )
         ttnn.deallocate(input_tensor)
 
-        # Initialize KV caches for decode (concat-based)
-        # Note: Pre-allocation + GQA expansion on full cache is slower than concat
-        # Pre-allocation only helps with SDPA decode which requires seq%32==0
+        # Initialize KV caches for decode using pre-expanded GQA cache
+        # Key optimization: Cache stores already-expanded heads, so decode
+        # only needs to expand the single new token (not all cached positions)
         for cache in kv_cache:
             if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
+                # _prefill_key/value are already GQA-expanded!
                 cache.key_cache = cache._prefill_key
                 cache.value_cache = cache._prefill_value
                 cache._prefill_key = None

@@ -31,10 +31,11 @@ class KVCache:
     """
     Key-Value cache for efficient autoregressive generation.
 
-    Uses pre-allocated fixed-shape cache for decode optimization.
-    Cache format: [batch, kv_heads, max_seq_len, head_dim]
+    Uses pre-expanded GQA cache for decode optimization.
+    Cache format: [batch, num_heads, seq_len, head_dim] (already expanded!)
 
-    For decode, uses paged_update_cache with 1BKD input format.
+    Key insight: Store cache already expanded for GQA to avoid
+    expanding all positions every decode step.
     """
     key_cache: ttnn.Tensor | None = None
     value_cache: ttnn.Tensor | None = None
@@ -42,9 +43,11 @@ class KVCache:
     max_seq_len: int = 4096
     batch_size: int = 1
     num_kv_heads: int = 1
+    num_heads: int = 1  # Full head count (for pre-expanded cache)
     head_dim: int = 128
     device: ttnn.Device | None = None
     _preallocated: bool = False
+    _gqa_expanded: bool = False  # Whether cache stores expanded heads
 
     def preallocate(
         self,
@@ -86,18 +89,83 @@ class KVCache:
         self,
         key_states: ttnn.Tensor,
         value_states: ttnn.Tensor,
+        num_kv_groups: int = 1,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
-        Update cache for prefill (store KV, return for attention).
+        Update cache for prefill (store EXPANDED KV, return for attention).
 
-        For prefill, we use the input KV directly for attention.
-        The cache is set up for subsequent decode steps.
+        Key optimization: Store KV already expanded for GQA to avoid
+        expanding all cached positions every decode step.
+
+        Args:
+            key_states: [batch, kv_heads, seq, head_dim]
+            value_states: [batch, kv_heads, seq, head_dim]
+            num_kv_groups: Number of query heads per KV head (for GQA expansion)
+
+        Returns:
+            Expanded key and value for attention
         """
         self.seq_len_cached = key_states.shape[2]
-        # Store for first decode step
-        self._prefill_key = key_states
-        self._prefill_value = value_states
-        return key_states, value_states
+        self.num_kv_heads = key_states.shape[1]
+        self.num_heads = self.num_kv_heads * num_kv_groups
+        self._gqa_expanded = (num_kv_groups > 1)
+
+        # Expand KV for GQA now (during prefill, not every decode step)
+        if num_kv_groups > 1:
+            key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
+            value_expanded = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
+        else:
+            key_expanded = key_states
+            value_expanded = value_states
+
+        # Store EXPANDED KV for decode (this is the key optimization!)
+        self._prefill_key = key_expanded
+        self._prefill_value = value_expanded
+
+        return key_expanded, value_expanded
+
+    def update_decode_expanded(
+        self,
+        key_states: ttnn.Tensor,
+        value_states: ttnn.Tensor,
+        num_kv_groups: int = 1,
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Update pre-expanded cache for decode.
+
+        Key optimization: Expand only the NEW token's KV (1 position),
+        then concat to cache. Avoids expanding all cached positions.
+
+        Args:
+            key_states: [batch, kv_heads, 1, head_dim] - single new token
+            value_states: [batch, kv_heads, 1, head_dim] - single new token
+            num_kv_groups: Number of query heads per KV head
+
+        Returns:
+            Updated (expanded) key and value caches
+        """
+        # Expand only the NEW token's KV (cheap - just 1 position!)
+        if num_kv_groups > 1:
+            key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
+            value_expanded = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
+        else:
+            key_expanded = key_states
+            value_expanded = value_states
+
+        # Concat expanded KV to expanded cache
+        if self.key_cache is None:
+            self.key_cache = key_expanded
+            self.value_cache = value_expanded
+        else:
+            new_key = ttnn.concat([self.key_cache, key_expanded], dim=2)
+            new_value = ttnn.concat([self.value_cache, value_expanded], dim=2)
+            ttnn.deallocate(self.key_cache)
+            ttnn.deallocate(self.value_cache)
+            self.key_cache = new_key
+            self.value_cache = new_value
+
+        self.seq_len_cached = self.key_cache.shape[2]
+        return self.key_cache, self.value_cache
 
     def update_decode_sharded(
         self,
@@ -365,10 +433,13 @@ class MultiHeadAttention:
         mode: str,
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
-        Simple unified forward using BKSD format with concat-based cache.
+        Optimized forward using pre-expanded GQA cache.
 
-        This is the baseline implementation without hardware-specific optimizations.
-        SDPA decode requires seq%32==0, paged ops require sharding - neither practical.
+        Key optimization: Cache stores already-expanded KV heads.
+        - Prefill: Expand full sequence, store in cache
+        - Decode: Expand only 1 new token, concat to expanded cache
+
+        This avoids expanding all cached positions every decode step.
         """
         # Reshape to BKSD: [batch, heads, seq, head_dim]
         query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
@@ -390,42 +461,33 @@ class MultiHeadAttention:
         # Apply RoPE
         query, key = self._apply_rope_manual(query, key, current_pos, seq_len)
 
-        # Update KV-Cache (concat-based)
+        # Update KV-Cache with pre-expanded GQA optimization
         updated_cache = None
         if use_cache:
             if past_key_value is None:
                 past_key_value = KVCache()
 
             if mode == "prefill":
-                key_full, value_full = past_key_value.update_prefill(key, value)
+                # Prefill: expand and store in cache
+                key_expanded, value_expanded = past_key_value.update_prefill(
+                    key, value, self.num_kv_groups
+                )
             else:
-                # Decode: concat new KV to cache
-                if past_key_value.key_cache is None:
-                    past_key_value.key_cache = key
-                    past_key_value.value_cache = value
-                else:
-                    new_key = ttnn.concat([past_key_value.key_cache, key], dim=2)
-                    new_value = ttnn.concat([past_key_value.value_cache, value], dim=2)
-                    ttnn.deallocate(past_key_value.key_cache)
-                    ttnn.deallocate(past_key_value.value_cache)
-                    past_key_value.key_cache = new_key
-                    past_key_value.value_cache = new_value
-                key_full = past_key_value.key_cache
-                value_full = past_key_value.value_cache
-            past_key_value.seq_len_cached = key_full.shape[2]
+                # Decode: expand only new token, concat to expanded cache
+                key_expanded, value_expanded = past_key_value.update_decode_expanded(
+                    key, value, self.num_kv_groups
+                )
             updated_cache = past_key_value
         else:
-            key_full, value_full = key, value
+            # No cache: expand inline
+            if self.num_kv_groups > 1:
+                key_expanded = ttnn.repeat_interleave(key, self.num_kv_groups, dim=1)
+                value_expanded = ttnn.repeat_interleave(value, self.num_kv_groups, dim=1)
+            else:
+                key_expanded = key
+                value_expanded = value
 
-        # Expand KV heads for GQA
-        if self.num_kv_groups > 1:
-            key_expanded = ttnn.repeat_interleave(key_full, self.num_kv_groups, dim=1)
-            value_expanded = ttnn.repeat_interleave(value_full, self.num_kv_groups, dim=1)
-        else:
-            key_expanded = key_full
-            value_expanded = value_full
-
-        # SDPA
+        # SDPA (cache is already expanded, no GQA expansion needed!)
         is_causal = (mode == "prefill")
         attn_output = ttnn.transformer.scaled_dot_product_attention(
             query, key_expanded, value_expanded,
