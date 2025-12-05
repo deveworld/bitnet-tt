@@ -343,87 +343,79 @@ class MultiHeadAttention:
         else:
             current_pos = 0
 
-        # Route based on mode
-        if mode == "decode" and seq_len == 1:
-            return self._forward_decode_optimized(
-                query, key, value, past_key_value, current_pos, use_cache, batch_size
-            )
-        else:
-            return self._forward_prefill(
-                query, key, value, attention_mask, past_key_value,
-                current_pos, seq_len, use_cache, batch_size
-            )
+        # Use BKSD format for both prefill and decode
+        # Note: 1BKD format + paged ops requires sharding, SDPA decode requires seq%32==0
+        # So we use simple concat-based cache with general SDPA for all cases
+        return self._forward_simple(
+            query, key, value, attention_mask, past_key_value,
+            current_pos, seq_len, use_cache, batch_size, mode
+        )
 
-    def _forward_decode_optimized(
+    def _forward_simple(
         self,
         query: ttnn.Tensor,
         key: ttnn.Tensor,
         value: ttnn.Tensor,
+        attention_mask: ttnn.Tensor | None,
         past_key_value: KVCache | None,
         current_pos: int,
+        seq_len: int,
         use_cache: bool,
         batch_size: int,
+        mode: str,
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
-        Optimized decode path using 1BKD format.
+        Simple unified forward using BKSD format with concat-based cache.
 
-        Tries sharded paged_update_cache, falls back to concat if it fails.
-        Uses general SDPA (SDPA decode requires seq%32==0 which is impractical).
+        This is the baseline implementation without hardware-specific optimizations.
+        SDPA decode requires seq%32==0, paged ops require sharding - neither practical.
         """
-        # Reshape QKV to 1BKD: [1, batch, heads, head_dim]
+        # Reshape to BKSD: [batch, heads, seq, head_dim]
         query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
         key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
         value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
 
-        query = ttnn.reshape(query, (batch_size, self.num_heads, self.head_dim))
-        key = ttnn.reshape(key, (batch_size, self.num_kv_heads, self.head_dim))
-        value = ttnn.reshape(value, (batch_size, self.num_kv_heads, self.head_dim))
+        query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
+        key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
 
-        query = ttnn.reshape(query, (1, batch_size, self.num_heads, self.head_dim))
-        key = ttnn.reshape(key, (1, batch_size, self.num_kv_heads, self.head_dim))
-        value = ttnn.reshape(value, (1, batch_size, self.num_kv_heads, self.head_dim))
+        query = ttnn.permute(query, (0, 2, 1, 3))
+        key = ttnn.permute(key, (0, 2, 1, 3))
+        value = ttnn.permute(value, (0, 2, 1, 3))
 
         query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
         key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
         value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
 
-        # Apply RoPE for decode
-        query, key = self._apply_rope_decode_1bkd(query, key, current_pos)
+        # Apply RoPE
+        query, key = self._apply_rope_manual(query, key, current_pos, seq_len)
 
-        # Update KV-Cache
-        updated_cache = past_key_value
-        use_preallocated = (
-            use_cache and past_key_value is not None and
-            past_key_value._preallocated and past_key_value.key_cache is not None
-        )
+        # Update KV-Cache (concat-based)
+        updated_cache = None
+        if use_cache:
+            if past_key_value is None:
+                past_key_value = KVCache()
 
-        if use_preallocated:
-            # Try sharded paged_update_cache
-            try:
-                past_key_value.update_decode_sharded(key, value, current_pos)
+            if mode == "prefill":
+                key_full, value_full = past_key_value.update_prefill(key, value)
+            else:
+                # Decode: concat new KV to cache
+                if past_key_value.key_cache is None:
+                    past_key_value.key_cache = key
+                    past_key_value.value_cache = value
+                else:
+                    new_key = ttnn.concat([past_key_value.key_cache, key], dim=2)
+                    new_value = ttnn.concat([past_key_value.value_cache, value], dim=2)
+                    ttnn.deallocate(past_key_value.key_cache)
+                    ttnn.deallocate(past_key_value.value_cache)
+                    past_key_value.key_cache = new_key
+                    past_key_value.value_cache = new_value
                 key_full = past_key_value.key_cache
                 value_full = past_key_value.value_cache
-            except Exception as e:
-                if self.layer_idx == 0:
-                    print(f"[DEBUG] Sharded update failed: {e}, using concat")
-                # Fallback to concat
-                key_full, value_full = past_key_value.update_decode_concat(key, value, current_pos)
-        elif use_cache and past_key_value is not None:
-            # Concat-based update
-            key_full, value_full = past_key_value.update_decode_concat(key, value, current_pos)
+            past_key_value.seq_len_cached = key_full.shape[2]
+            updated_cache = past_key_value
         else:
-            # No cache - transpose to BKSD
-            key_full = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-            key_full = ttnn.permute(key_full, (1, 2, 0, 3))
-            key_full = ttnn.to_layout(key_full, ttnn.TILE_LAYOUT)
-            value_full = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
-            value_full = ttnn.permute(value_full, (1, 2, 0, 3))
-            value_full = ttnn.to_layout(value_full, ttnn.TILE_LAYOUT)
-
-        # Transpose Q from 1BQD to BQSD for SDPA
-        query_bqsd = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-        query_bqsd = ttnn.permute(query_bqsd, (1, 2, 0, 3))
-        query_bqsd = ttnn.to_layout(query_bqsd, ttnn.TILE_LAYOUT)
+            key_full, value_full = key, value
 
         # Expand KV heads for GQA
         if self.num_kv_groups > 1:
@@ -433,18 +425,19 @@ class MultiHeadAttention:
             key_expanded = key_full
             value_expanded = value_full
 
-        # General SDPA (SDPA decode needs seq%32==0)
+        # SDPA
+        is_causal = (mode == "prefill")
         attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query_bqsd, key_expanded, value_expanded,
-            attn_mask=None,
-            is_causal=False,
+            query, key_expanded, value_expanded,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
             scale=self.scale,
         )
 
-        # Reshape output: [batch, heads, 1, head_dim] -> [batch, 1, hidden]
+        # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
         attn_output = ttnn.permute(attn_output, (0, 2, 1, 3))
-        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
+        attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
         attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
         # Apply sub-norm and output projection

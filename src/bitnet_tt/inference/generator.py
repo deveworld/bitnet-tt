@@ -187,74 +187,17 @@ class TextGenerator:
         )
         ttnn.deallocate(input_tensor)
 
-        # Pre-allocate KV caches for decode (enables sharded paged_update_cache)
-        batch_size = tokens.shape[0]
-        self._preallocate_kv_caches(kv_cache, batch_size)
+        # Initialize KV caches for decode (concat-based)
+        # Note: Pre-allocation + GQA expansion on full cache is slower than concat
+        # Pre-allocation only helps with SDPA decode which requires seq%32==0
+        for cache in kv_cache:
+            if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
+                cache.key_cache = cache._prefill_key
+                cache.value_cache = cache._prefill_value
+                cache._prefill_key = None
+                cache._prefill_value = None
 
         return logits, kv_cache
-
-    def _preallocate_kv_caches(
-        self,
-        kv_caches: list[KVCache],
-        batch_size: int,
-    ) -> None:
-        """
-        Pre-allocate KV cache buffers for decode mode.
-        Copies prefill KV data to fixed-size cache buffers.
-        """
-        import torch
-
-        config = self.model.config
-        num_kv_heads = config.num_key_value_heads
-        head_dim = config.hidden_size // config.num_attention_heads
-        max_seq_len = getattr(config, 'max_position_embeddings', 4096)
-
-        for layer_idx, cache in enumerate(kv_caches):
-            if cache._preallocated:
-                continue
-
-            # Get prefill KV
-            prefill_key = getattr(cache, '_prefill_key', None)
-            prefill_value = getattr(cache, '_prefill_value', None)
-            prefill_len = cache.seq_len_cached
-
-            # Preallocate cache buffers
-            cache.preallocate(
-                batch_size=batch_size,
-                num_kv_heads=num_kv_heads,
-                max_seq_len=max_seq_len,
-                head_dim=head_dim,
-                device=self.device,
-            )
-
-            # Copy prefill KV to preallocated cache using ttnn.fill_cache
-            if prefill_key is not None and prefill_len > 0:
-                try:
-                    # fill_cache expects BKSD format: [batch, heads, seq, head_dim]
-                    # and fills cache starting from position 0
-                    ttnn.fill_cache(
-                        cache.key_cache,
-                        prefill_key,
-                        0,  # batch_idx
-                    )
-                    ttnn.fill_cache(
-                        cache.value_cache,
-                        prefill_value,
-                        0,  # batch_idx
-                    )
-                    if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: fill_cache SUCCESS, prefill_len={prefill_len}")
-                except Exception as e:
-                    if layer_idx == 0:
-                        print(f"[DEBUG] Layer 0: fill_cache FAILED: {e}, using concat")
-                    # Fallback: just use prefill KV directly as cache
-                    cache.key_cache = prefill_key
-                    cache.value_cache = prefill_value
-                    cache._preallocated = False
-
-            cache.seq_len_cached = prefill_len
-            cache._prefill_key = None
-            cache._prefill_value = None
 
     def decode_forward(
         self,
