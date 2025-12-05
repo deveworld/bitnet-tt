@@ -174,8 +174,8 @@ def run_full_demo() -> None:
 
         print("    - Generator ready")
 
-        # Generate text without cache
-        print("\n[5] Generating text (without KV-Cache)...")
+        # Generate text with optimized 1BKD decode path
+        print("\n[5] Generating text (with optimized decode)...")
         prompt = "Hello, I am"
         print(f"    Prompt: {prompt}")
 
@@ -185,29 +185,11 @@ def run_full_demo() -> None:
             max_new_tokens=30,
             temperature=0.7,
             do_sample=True,
-            use_cache=False,
         )
         end = time.perf_counter()
 
         print(f"    Output: {output}")
-        print(f"    Generation time (no cache): {(end - start):.2f}s")
-
-        # Generate text with cache
-        print("\n[6] Generating text (with KV-Cache)...")
-        print(f"    Prompt: {prompt}")
-
-        start = time.perf_counter()
-        output = generator.generate(
-            prompt,
-            max_new_tokens=30,
-            temperature=0.7,
-            do_sample=True,
-            use_cache=True,
-        )
-        end = time.perf_counter()
-
-        print(f"    Output: {output}")
-        print(f"    Generation time (with cache): {(end - start):.2f}s")
+        print(f"    Generation time: {(end - start):.2f}s")
 
         print("\n" + "=" * 60)
         print("Full model demo completed successfully!")
