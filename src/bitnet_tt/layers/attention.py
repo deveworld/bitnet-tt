@@ -608,17 +608,19 @@ class MultiHeadAttention:
                 hidden_states, past_key_value, batch_size, seq_len
             )
 
-        # Use optimized decode path when rot_mats are provided and cache is pre-allocated
-        if (mode == "decode" and rot_mats is not None and transformation_mat is not None
-                and self.qkv_fused_weight is not None
-                and past_key_value is not None and past_key_value._preallocated):
-            # Fused QKV projection
-            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-            return self._forward_decode_optimized(
-                xqkv_fused, past_key_value, current_pos,
-                rot_mats, transformation_mat, batch_size,
-                current_pos_tensor=current_pos_tensor,
-            )
+        # NOTE: Optimized decode path with rotary_embedding_llama requires num_heads
+        # to be compatible with shard config (typically powers of 2 like 32).
+        # BitNet has num_heads=20 which is incompatible. Using _forward_simple instead.
+        # TODO: Implement custom RoPE that works with num_heads=20
+        # if (mode == "decode" and rot_mats is not None and transformation_mat is not None
+        #         and self.qkv_fused_weight is not None
+        #         and past_key_value is not None and past_key_value._preallocated):
+        #     xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+        #     return self._forward_decode_optimized(
+        #         xqkv_fused, past_key_value, current_pos,
+        #         rot_mats, transformation_mat, batch_size,
+        #         current_pos_tensor=current_pos_tensor,
+        #     )
 
         # Standard path: separate QKV projections
         query = self.q_proj(hidden_states)
