@@ -488,6 +488,9 @@ class MultiHeadAttention:
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
 
+        # HEIGHT_SHARDED memory configs for optimized decode (batch_size=32)
+        self._decode_mem_configs: dict | None = None  # Lazy init when batch_size known
+
         # Projections (weights pre-transposed in Linear.load_weights)
         self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device)
         self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
@@ -955,16 +958,31 @@ class MultiHeadAttention:
         # Input: [batch, 1, (n_heads + 2*n_kv_heads) * head_dim]
         # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
 
+        # Lazy init HEIGHT_SHARDED memory configs for batch_size=32
+        if self._decode_mem_configs is None and batch_size == 32:
+            from bitnet_tt.config import get_decode_memory_configs
+            self._decode_mem_configs = get_decode_memory_configs(
+                head_dim=self.head_dim,
+                batch_size=batch_size,
+            )
+
         # Reshape to 4D for nlp_create_qkv_heads_decode: [1, batch, 1, qkv_dim]
         # xqkv_fused is [batch, 1, qkv_dim]
         xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, batch_size, 1, self._qkv_dim))
         ttnn.deallocate(xqkv_fused)
 
+        # Use HEIGHT_SHARDED for batch_size=32, L1 for smaller batches
+        qkv_mem_config = (
+            self._decode_mem_configs["CREATE_QKV_DECODE_SHARD"]
+            if self._decode_mem_configs is not None
+            else ttnn.L1_MEMORY_CONFIG
+        )
+
         q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
+            memory_config=qkv_mem_config,
         )
         ttnn.deallocate(xqkv_fused_4d)
 
