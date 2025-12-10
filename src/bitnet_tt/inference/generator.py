@@ -133,7 +133,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = True,
+        enable_trace: bool = False,  # Disabled until in-place cache update is verified
         batch_size: int = 1,
     ) -> None:
         """
@@ -191,7 +191,11 @@ class TextGenerator:
         Pre-allocate KV caches for all layers.
 
         This is required for the optimized decode path using paged_update_cache.
-        Cache format: [batch, n_kv_heads, max_seq_len, head_dim]
+        Cache format: [batch, num_heads, max_seq_len, head_dim] (GQA-expanded)
+
+        Key optimization: Pre-allocate in GQA-expanded form to avoid
+        per-token expansion during decode. Memory increases by num_kv_groups
+        (e.g., 4x for 20 heads / 5 kv_heads) but eliminates expansion cost.
         """
         caches = []
         for layer_idx in range(self.config.num_layers):
@@ -199,6 +203,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
+                num_heads=self.config.num_attention_heads,  # For GQA expansion
                 head_dim=self.config.head_dim,
                 device=self.device,
             )
@@ -208,6 +213,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 head_dim=self.config.head_dim,
                 device=self.device,
+                num_heads=self.config.num_attention_heads,  # GQA-expanded cache
             )
             caches.append(cache)
         return caches
@@ -264,6 +270,10 @@ class TextGenerator:
         # Key optimization: Cache stores already-expanded heads, so decode
         # only needs to expand the single new token (not all cached positions)
         for cache in kv_cache:
+            # Skip if pre-allocated + GQA-expanded (already stored in buffer)
+            if cache._preallocated and cache._gqa_expanded:
+                continue
+            # Copy prefill results to cache for dynamic allocation mode
             if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
                 # _prefill_key/value are already GQA-expanded!
                 cache.key_cache = cache._prefill_key
@@ -372,12 +382,14 @@ class TextGenerator:
     def _execute_decode_trace(
         self,
         token: NDArray[np.int64],
+        current_pos: int,
     ) -> ttnn.Tensor:
         """
         Execute the captured decode trace with new input.
 
         Args:
             token: New token to process
+            current_pos: Current position in sequence (for KV cache update)
 
         Returns:
             Output logits tensor
@@ -387,6 +399,9 @@ class TextGenerator:
         ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs)
 
         # Execute trace
+        # Note: current_pos is passed for future use when trace supports
+        # position tensor updates for KV cache. Currently the trace captures
+        # a fixed position which may cause issues with long sequences.
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
 
         return self._trace_output
@@ -469,11 +484,9 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens
-        # NOTE: Disable pre-allocated caches for now - they are not GQA-expanded
-        # and incompatible with update_decode_expanded() which expects expanded cache.
-        # Pre-allocated caches have shape [batch, num_kv_heads, max_seq, head_dim]
-        # but update_decode_expanded needs [batch, num_heads, seq, head_dim]
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        # Use pre-allocated GQA-expanded caches for trace compatibility
+        # Cache shape: [batch, num_heads, max_seq, head_dim] (already expanded)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -495,12 +508,26 @@ class TextGenerator:
         for step in range(max_new_tokens - 1):
             current_pos += 1
 
-            # Decode forward (with trace if enabled)
-            logits, kv_cache = self.decode_forward(
-                generated[:, -1:],
-                current_pos,
-                kv_cache,
-            )
+            # Decode forward with trace capture if enabled
+            if self.enable_trace:
+                if self._trace_id is None:
+                    # First decode step: capture trace
+                    self._trace_id, self._trace_output, self._trace_inputs = \
+                        self._capture_decode_trace(
+                            generated[:, -1:],
+                            current_pos,
+                            kv_cache,
+                        )
+                    logits = self._trace_output
+                else:
+                    # Subsequent steps: execute captured trace
+                    logits = self._execute_decode_trace(generated[:, -1:], current_pos)
+            else:
+                logits, kv_cache = self.decode_forward(
+                    generated[:, -1:],
+                    current_pos,
+                    kv_cache,
+                )
 
             # Sample next token
             next_token = self._sample_next_token(
@@ -631,10 +658,9 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill
-        # NOTE: Disable pre-allocated caches - incompatible with update_decode_expanded()
+        # Phase 1: Prefill - use pre-allocated GQA-expanded caches
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
@@ -663,11 +689,26 @@ class TextGenerator:
             token_start = time.perf_counter()
             current_pos += 1
 
-            logits, kv_cache = self.decode_forward(
-                generated[:, -1:],
-                current_pos,
-                kv_cache,
-            )
+            # Decode forward with trace capture if enabled
+            if self.enable_trace:
+                if self._trace_id is None:
+                    # First decode step: capture trace
+                    self._trace_id, self._trace_output, self._trace_inputs = \
+                        self._capture_decode_trace(
+                            generated[:, -1:],
+                            current_pos,
+                            kv_cache,
+                        )
+                    logits = self._trace_output
+                else:
+                    # Subsequent steps: execute captured trace
+                    logits = self._execute_decode_trace(generated[:, -1:], current_pos)
+            else:
+                logits, kv_cache = self.decode_forward(
+                    generated[:, -1:],
+                    current_pos,
+                    kv_cache,
+                )
 
             token_end = time.perf_counter()
             token_time = token_end - token_start
