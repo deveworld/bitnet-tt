@@ -201,14 +201,6 @@ def get_create_qkv_decode_shard(head_dim: int = 128) -> "ttnn.MemoryConfig":
     - ttnn.experimental.rotary_embedding_llama (requires HEIGHT_SHARDED input)
     - ttnn.experimental.paged_update_cache (requires HEIGHT_SHARDED input)
 
-    Based on tt_transformers pattern:
-        model_config["CREATE_QKV_DECODE_SHARD"] = ttnn.create_sharded_memory_config(
-            shape=(ttnn.TILE_SIZE, head_dim),
-            core_grid=ttnn.CoreGrid(y=4, x=8),
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            ...
-        )
-
     Args:
         head_dim: Head dimension (default: 128 for BitNet 2B4T)
 
@@ -217,10 +209,6 @@ def get_create_qkv_decode_shard(head_dim: int = 128) -> "ttnn.MemoryConfig":
     """
     import ttnn
 
-    return ttnn.create_sharded_memory_config(
-        shape=(ttnn.TILE_SIZE, head_dim),  # (32, 128)
-        core_grid=ttnn.CoreGrid(y=4, x=8),  # 32 cores
-        strategy=ttnn.ShardStrategy.HEIGHT,
-        orientation=ttnn.ShardOrientation.ROW_MAJOR,
-        use_height_and_width_as_shard_shape=True,
-    )
+    # Use standard L1_HEIGHT_SHARDED for compatibility
+    # Custom CoreGrid may not work on all devices
+    return ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
