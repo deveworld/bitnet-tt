@@ -644,19 +644,20 @@ class MultiHeadAttention:
             q_dim = self.num_heads * self.head_dim
             k_dim = self.num_kv_heads * self.head_dim
 
-            # Use ttnn.split or slice to separate Q, K, V
+            # Use ttnn.slice to separate Q, K, V
             # Shape: [batch, seq, qkv_dim] or [1, 1, seq, qkv_dim]
             shape = xqkv.shape
-            if len(shape) == 4:
+            ndim = len(shape)
+            if ndim == 4:
                 # [1, 1, seq, qkv_dim]
-                query = ttnn.slice(xqkv, [0, 0, 0, 0], [shape[0], shape[1], shape[2], q_dim])
-                key = ttnn.slice(xqkv, [0, 0, 0, q_dim], [shape[0], shape[1], shape[2], q_dim + k_dim])
-                value = ttnn.slice(xqkv, [0, 0, 0, q_dim + k_dim], [shape[0], shape[1], shape[2], self._qkv_dim])
+                query = ttnn.slice(xqkv, slice_start=[0, 0, 0, 0], slice_end=[shape[0], shape[1], shape[2], q_dim])
+                key = ttnn.slice(xqkv, slice_start=[0, 0, 0, q_dim], slice_end=[shape[0], shape[1], shape[2], q_dim + k_dim])
+                value = ttnn.slice(xqkv, slice_start=[0, 0, 0, q_dim + k_dim], slice_end=[shape[0], shape[1], shape[2], self._qkv_dim])
             else:
-                # [batch, seq, qkv_dim]
-                query = ttnn.slice(xqkv, [0, 0, 0], [shape[0], shape[1], q_dim])
-                key = ttnn.slice(xqkv, [0, 0, q_dim], [shape[0], shape[1], q_dim + k_dim])
-                value = ttnn.slice(xqkv, [0, 0, q_dim + k_dim], [shape[0], shape[1], self._qkv_dim])
+                # [batch, seq, qkv_dim] - 3D
+                query = ttnn.slice(xqkv, slice_start=[0, 0, 0], slice_end=[shape[0], shape[1], q_dim])
+                key = ttnn.slice(xqkv, slice_start=[0, 0, q_dim], slice_end=[shape[0], shape[1], q_dim + k_dim])
+                value = ttnn.slice(xqkv, slice_start=[0, 0, q_dim + k_dim], slice_end=[shape[0], shape[1], self._qkv_dim])
 
             ttnn.deallocate(xqkv)
         else:

@@ -222,17 +222,26 @@ class BitNetModel:
         # vocab_size=128256 is large, so this saves significant compute
         if mode == "prefill":
             # Get sequence length from hidden_states shape
-            # hidden_states shape: [1, 1, seq_len, hidden_size]
+            # hidden_states can be [batch, seq_len, hidden_size] (3D) or [1, 1, seq_len, hidden_size] (4D)
             shape = hidden_states.shape
-            if len(shape) >= 3:
-                seq_len = shape[-2]
+            ndim = len(shape)
+            if ndim == 3:
+                # Shape: [batch, seq_len, hidden_size]
+                seq_len = shape[1]
                 if seq_len > 1:
-                    # Slice to get only last token: [1, 1, 1, hidden_size]
-                    # ttnn.slice uses [start, end) ranges
                     hidden_states = ttnn.slice(
                         hidden_states,
-                        starts=[0, 0, seq_len - 1, 0],
-                        ends=[shape[0], shape[1], seq_len, shape[-1]],
+                        slice_start=[0, seq_len - 1, 0],
+                        slice_end=[shape[0], seq_len, shape[2]],
+                    )
+            elif ndim == 4:
+                # Shape: [1, 1, seq_len, hidden_size]
+                seq_len = shape[2]
+                if seq_len > 1:
+                    hidden_states = ttnn.slice(
+                        hidden_states,
+                        slice_start=[0, 0, seq_len - 1, 0],
+                        slice_end=[shape[0], shape[1], seq_len, shape[3]],
                     )
 
         # Apply LM head with optimized compute kernel
