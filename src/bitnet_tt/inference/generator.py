@@ -296,15 +296,19 @@ class TextGenerator:
         input_tensor = numpy_int_to_ttnn(token, self.device)
 
         # Auto-detect whether to use optimized path based on cache state
+        # NOTE: Optimized path with rotary_embedding_llama requires HEIGHT_SHARDED inputs
+        # which is not yet properly configured. Using basic decode path for now.
         if use_optimized is None:
-            # Check if any cache is pre-allocated (indicates optimized path can be used)
-            use_optimized = (
-                kv_cache is not None
-                and len(kv_cache) > 0
-                and kv_cache[0] is not None
-                and hasattr(kv_cache[0], '_preallocated')
-                and kv_cache[0]._preallocated
-            )
+            # Disable optimized path until HEIGHT_SHARDED memory config is fixed
+            use_optimized = False
+            # Original logic (requires HEIGHT_SHARDED fix):
+            # use_optimized = (
+            #     kv_cache is not None
+            #     and len(kv_cache) > 0
+            #     and kv_cache[0] is not None
+            #     and hasattr(kv_cache[0], '_preallocated')
+            #     and kv_cache[0]._preallocated
+            # )
 
         # Get rot_mats for optimized decode path
         rot_mats = None
