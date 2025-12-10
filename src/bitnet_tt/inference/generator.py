@@ -134,7 +134,7 @@ class TextGenerator:
         model: "BitNetModel",
         tokenizer: Any = None,
         enable_trace: bool = False,  # Disabled until in-place cache update is verified
-        batch_size: int = 32,  # batch_size=32 required for HEIGHT_SHARDED optimization
+        batch_size: int = 1,
     ) -> None:
         """
         Initialize the text generator.
@@ -143,7 +143,7 @@ class TextGenerator:
             model: BitNet model instance
             tokenizer: HuggingFace tokenizer (optional)
             enable_trace: Whether to use trace capture for decode (default: True)
-            batch_size: Maximum batch size for generation (32 for HEIGHT_SHARDED)
+            batch_size: Maximum batch size for generation
         """
         self.model = model
         self.device = model.device
@@ -197,15 +197,10 @@ class TextGenerator:
         per-token expansion during decode. Memory increases by num_kv_groups
         (e.g., 4x for 20 heads / 5 kv_heads) but eliminates expansion cost.
         """
-        # Limit max_seq_len for KV cache to fit in DRAM with batch_size=32
-        # Full 4096 × 32 batch × 30 layers × 2 (K,V) = ~40GB > 32GB DRAM
-        # Use 512 for ~5GB KV cache which fits comfortably
-        kv_cache_max_seq = min(512, self.config.max_position_embeddings)
-
         caches = []
         for layer_idx in range(self.config.num_layers):
             cache = KVCache(
-                max_seq_len=kv_cache_max_seq,
+                max_seq_len=self.config.max_position_embeddings,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
                 num_heads=self.config.num_attention_heads,  # For GQA expansion
@@ -215,7 +210,7 @@ class TextGenerator:
             cache.preallocate(
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
-                max_seq_len=kv_cache_max_seq,
+                max_seq_len=self.config.max_position_embeddings,
                 head_dim=self.config.head_dim,
                 device=self.device,
                 num_heads=self.config.num_attention_heads,  # GQA-expanded cache
@@ -307,16 +302,19 @@ class TextGenerator:
         input_tensor = numpy_int_to_ttnn(token, self.device)
 
         # Auto-detect whether to use optimized path based on cache state
-        # Optimized path requires batch_size=32 for HEIGHT_SHARDED
+        # NOTE: Optimized path with rotary_embedding_llama requires HEIGHT_SHARDED inputs
+        # which is not yet properly configured. Using basic decode path for now.
         if use_optimized is None:
-            use_optimized = (
-                self.batch_size == 32
-                and kv_cache is not None
-                and len(kv_cache) > 0
-                and kv_cache[0] is not None
-                and hasattr(kv_cache[0], '_preallocated')
-                and kv_cache[0]._preallocated
-            )
+            # Disable optimized path until HEIGHT_SHARDED memory config is fixed
+            use_optimized = False
+            # Original logic (requires HEIGHT_SHARDED fix):
+            # use_optimized = (
+            #     kv_cache is not None
+            #     and len(kv_cache) > 0
+            #     and kv_cache[0] is not None
+            #     and hasattr(kv_cache[0], '_preallocated')
+            #     and kv_cache[0]._preallocated
+            # )
 
         # Get rot_mats for optimized decode path
         rot_mats = None
@@ -475,37 +473,29 @@ class TextGenerator:
             do_sample: Whether to sample
             use_optimized: Use optimized path with pre-allocated caches
         """
-        input_batch_size, seq_len = input_ids.shape
-
-        # Expand input to batch_size=32 for HEIGHT_SHARDED optimization
-        if input_batch_size == 1 and self.batch_size == 32:
-            # Replicate input across all 32 batch slots
-            input_ids_expanded = np.tile(input_ids, (32, 1))
-        else:
-            input_ids_expanded = input_ids
-
-        generated = input_ids.copy()  # Keep original for output
+        batch_size, seq_len = input_ids.shape
+        generated = input_ids.copy()
 
         # Reset trace for new generation
         self.reset_trace()
 
-        # Phase 1: Prefill - process all prompt tokens with pre-allocated cache
-        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=False)
+        # Phase 1: Prefill - process all prompt tokens
+        # Note: Pre-allocated cache with in-place update requires ttnn APIs
+        # not available in current version. Using dynamic allocation for now.
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
 
-        # Sample first token (use first batch element only)
+        # Sample first token
         next_token = self._sample_next_token(
             logits, temperature, top_k, do_sample
         )
         ttnn.deallocate(logits)
 
-        # Use only first batch element for output
-        next_token_single = next_token[0:1] if len(next_token.shape) > 0 else next_token
         generated = np.concatenate(
-            [generated, next_token_single.reshape(input_batch_size, 1)], axis=1
+            [generated, next_token.reshape(batch_size, 1)], axis=1
         )
 
         # Check EOS
-        if self._is_eos(next_token_single[0]):
+        if self._is_eos(next_token[0]):
             return generated
 
         # Phase 2: Decode - generate remaining tokens
@@ -514,46 +504,38 @@ class TextGenerator:
         for step in range(max_new_tokens - 1):
             current_pos += 1
 
-            # Expand last token to batch_size=32 for decode
-            last_token = generated[:, -1:]
-            if input_batch_size == 1 and self.batch_size == 32:
-                last_token_expanded = np.tile(last_token, (32, 1))
-            else:
-                last_token_expanded = last_token
-
             # Decode forward with trace capture if enabled
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
                     self._trace_id, self._trace_output, self._trace_inputs = \
                         self._capture_decode_trace(
-                            last_token_expanded,
+                            generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
-                    logits = self._execute_decode_trace(last_token_expanded, current_pos)
+                    logits = self._execute_decode_trace(generated[:, -1:], current_pos)
             else:
                 logits, kv_cache = self.decode_forward(
-                    last_token_expanded,
+                    generated[:, -1:],
                     current_pos,
                     kv_cache,
                 )
 
-            # Sample next token (use first batch element only)
+            # Sample next token
             next_token = self._sample_next_token(
                 logits, temperature, top_k, do_sample
             )
             ttnn.deallocate(logits)
 
-            next_token_single = next_token[0:1] if len(next_token.shape) > 0 else next_token
             generated = np.concatenate(
-                [generated, next_token_single.reshape(input_batch_size, 1)], axis=1
+                [generated, next_token.reshape(batch_size, 1)], axis=1
             )
 
-            if self._is_eos(next_token_single[0]):
+            if self._is_eos(next_token[0]):
                 break
 
         return generated
@@ -663,34 +645,27 @@ class TextGenerator:
 
         inputs = self.tokenizer(prompt, return_tensors="np")
         input_ids: NDArray[np.int64] = inputs["input_ids"]
-        input_batch_size, seq_len = input_ids.shape
-
-        # Expand input to batch_size=32 for HEIGHT_SHARDED optimization
-        if input_batch_size == 1 and self.batch_size == 32:
-            input_ids_expanded = np.tile(input_ids, (32, 1))
-        else:
-            input_ids_expanded = input_ids
+        batch_size, seq_len = input_ids.shape
 
         stats = GenerationStats(prompt_tokens=seq_len)
-        generated = input_ids.copy()  # Keep original for output
+        generated = input_ids.copy()
         prev_text_len = len(self.tokenizer.decode(generated[0], skip_special_tokens=True))
 
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill with pre-allocated cache
+        # Phase 1: Prefill - using dynamic allocation (in-place update not available)
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
-        # Sample first token (use first batch element only)
+        # Sample first token
         next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
         ttnn.deallocate(logits)
 
-        next_token_single = next_token[0:1] if len(next_token.shape) > 0 else next_token
         generated = np.concatenate(
-            [generated, next_token_single.reshape(input_batch_size, 1)], axis=1
+            [generated, next_token.reshape(batch_size, 1)], axis=1
         )
         stats.generated_tokens += 1
 
@@ -700,7 +675,7 @@ class TextGenerator:
         prev_text_len = len(current_text)
         yield new_text, stats
 
-        if self._is_eos(next_token_single[0]):
+        if self._is_eos(next_token[0]):
             return
 
         # Phase 2: Decode loop
@@ -710,30 +685,23 @@ class TextGenerator:
             token_start = time.perf_counter()
             current_pos += 1
 
-            # Expand last token to batch_size=32 for decode
-            last_token = generated[:, -1:]
-            if input_batch_size == 1 and self.batch_size == 32:
-                last_token_expanded = np.tile(last_token, (32, 1))
-            else:
-                last_token_expanded = last_token
-
             # Decode forward with trace capture if enabled
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
                     self._trace_id, self._trace_output, self._trace_inputs = \
                         self._capture_decode_trace(
-                            last_token_expanded,
+                            generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
-                    logits = self._execute_decode_trace(last_token_expanded, current_pos)
+                    logits = self._execute_decode_trace(generated[:, -1:], current_pos)
             else:
                 logits, kv_cache = self.decode_forward(
-                    last_token_expanded,
+                    generated[:, -1:],
                     current_pos,
                     kv_cache,
                 )
@@ -746,9 +714,8 @@ class TextGenerator:
             next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
             ttnn.deallocate(logits)
 
-            next_token_single = next_token[0:1] if len(next_token.shape) > 0 else next_token
             generated = np.concatenate(
-                [generated, next_token_single.reshape(input_batch_size, 1)], axis=1
+                [generated, next_token.reshape(batch_size, 1)], axis=1
             )
             stats.generated_tokens += 1
 
@@ -758,7 +725,7 @@ class TextGenerator:
             prev_text_len = len(current_text)
             yield new_text, stats
 
-            if self._is_eos(next_token_single[0]):
+            if self._is_eos(next_token[0]):
                 break
 
     def chat(

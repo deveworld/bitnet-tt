@@ -488,9 +488,6 @@ class MultiHeadAttention:
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
 
-        # HEIGHT_SHARDED memory configs for optimized decode (batch_size=32)
-        self._decode_mem_configs: dict | None = None  # Lazy init when batch_size known
-
         # Projections (weights pre-transposed in Linear.load_weights)
         self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device)
         self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
@@ -608,19 +605,17 @@ class MultiHeadAttention:
                 hidden_states, past_key_value, batch_size, seq_len
             )
 
-        # NOTE: Optimized decode path with rotary_embedding_llama requires num_heads
-        # to be compatible with shard config (typically powers of 2 like 32).
-        # BitNet has num_heads=20 which is incompatible. Using _forward_simple instead.
-        # TODO: Implement custom RoPE that works with num_heads=20
-        # if (mode == "decode" and rot_mats is not None and transformation_mat is not None
-        #         and self.qkv_fused_weight is not None
-        #         and past_key_value is not None and past_key_value._preallocated):
-        #     xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-        #     return self._forward_decode_optimized(
-        #         xqkv_fused, past_key_value, current_pos,
-        #         rot_mats, transformation_mat, batch_size,
-        #         current_pos_tensor=current_pos_tensor,
-        #     )
+        # Use optimized decode path when rot_mats are provided and cache is pre-allocated
+        if (mode == "decode" and rot_mats is not None and transformation_mat is not None
+                and self.qkv_fused_weight is not None
+                and past_key_value is not None and past_key_value._preallocated):
+            # Fused QKV projection
+            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+            return self._forward_decode_optimized(
+                xqkv_fused, past_key_value, current_pos,
+                rot_mats, transformation_mat, batch_size,
+                current_pos_tensor=current_pos_tensor,
+            )
 
         # Standard path: separate QKV projections
         query = self.q_proj(hidden_states)
@@ -960,49 +955,18 @@ class MultiHeadAttention:
         # Input: [batch, 1, (n_heads + 2*n_kv_heads) * head_dim]
         # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
 
-        # Lazy init HEIGHT_SHARDED memory configs for batch_size=32
-        # Debug: print batch_size on first call
-        if self._decode_mem_configs is None:
-            print(f"[DEBUG] Layer {self.layer_idx}: batch_size={batch_size}, initializing decode configs")
-            if batch_size == 32:
-                from bitnet_tt.config import get_decode_memory_configs
-                self._decode_mem_configs = get_decode_memory_configs(
-                    head_dim=self.head_dim,
-                    batch_size=batch_size,
-                )
-                print(f"[DEBUG] Layer {self.layer_idx}: HEIGHT_SHARDED configs initialized")
-            else:
-                print(f"[DEBUG] Layer {self.layer_idx}: batch_size != 32, skipping HEIGHT_SHARDED")
-
-        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, 1, batch, qkv_dim]
+        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, batch, 1, qkv_dim]
         # xqkv_fused is [batch, 1, qkv_dim]
-        # API requires input_shape[1] == 1
-        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, 1, batch_size, self._qkv_dim))
+        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, batch_size, 1, self._qkv_dim))
         ttnn.deallocate(xqkv_fused)
-
-        # Use HEIGHT_SHARDED for batch_size=32, L1 for smaller batches
-        qkv_mem_config = (
-            self._decode_mem_configs["CREATE_QKV_DECODE_SHARD"]
-            if self._decode_mem_configs is not None
-            else ttnn.L1_MEMORY_CONFIG
-        )
 
         q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=qkv_mem_config,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         ttnn.deallocate(xqkv_fused_4d)
-
-        # Explicitly convert to HEIGHT_SHARDED for rotary_embedding_llama
-        if self._decode_mem_configs is not None:
-            height_sharded_config = self._decode_mem_configs["CREATE_QKV_DECODE_SHARD"]
-            print(f"[DEBUG] Before to_memory_config: q shape={q_heads_1bqd.shape}, mem={q_heads_1bqd.memory_config()}")
-            q_heads_1bqd = ttnn.to_memory_config(q_heads_1bqd, height_sharded_config)
-            k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, height_sharded_config)
-            v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, height_sharded_config)
-            print(f"[DEBUG] After to_memory_config: q shape={q_heads_1bqd.shape}, mem={q_heads_1bqd.memory_config()}")
 
         # 2. Apply RoPE using fused rotary_embedding_llama
         q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
