@@ -191,3 +191,49 @@ def get_config(model_name: str = "mini") -> BitNetConfig:
         raise ValueError(f"Unknown model: {model_name}. Choose from {list(configs.keys())}")
 
     return configs[model_name]()
+
+
+# =============================================================================
+# Performance Optimization: Compute Kernel Configuration
+# =============================================================================
+
+def get_compute_kernel_config(fidelity: str = "hifi2") -> "ttnn.WormholeComputeKernelConfig":
+    """
+    Get compute kernel configuration for matmul operations.
+
+    Args:
+        fidelity: One of "hifi4" (BF16, accurate), "hifi2" (BFP8, fast), "lofi" (BFP4, fastest)
+
+    Returns:
+        ttnn.WormholeComputeKernelConfig
+
+    Note:
+        - HiFi4: ~1x speed, best accuracy (BF16)
+        - HiFi2: ~2x speed, good accuracy (BFP8) - recommended for decode
+        - LoFi: ~3.6x speed, lower accuracy (BFP4) - for MLP if accuracy allows
+    """
+    import ttnn
+
+    if fidelity == "hifi4":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+    elif fidelity == "hifi2":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+    elif fidelity == "lofi":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_approx_mode=True,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+    else:
+        raise ValueError(f"Unknown fidelity: {fidelity}. Choose from hifi4, hifi2, lofi")
