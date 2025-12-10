@@ -191,27 +191,3 @@ def get_config(model_name: str = "mini") -> BitNetConfig:
         raise ValueError(f"Unknown model: {model_name}. Choose from {list(configs.keys())}")
 
     return configs[model_name]()
-
-
-def get_create_qkv_decode_shard(head_dim: int = 128, num_heads: int = 20) -> "ttnn.MemoryConfig":
-    """
-    Create HEIGHT_SHARDED memory config for decode QKV heads.
-
-    For batch_size=1:
-    - Q: [1, 1, num_heads, head_dim] = [1, 1, 20, 128]
-    - K/V: [1, 1, num_kv_heads, head_dim] = [1, 1, 5, 128]
-
-    HEIGHT_SHARDED requires shard_shape to match tensor dimensions.
-    Using single core (y=1, x=1) for batch_size=1 compatibility.
-    """
-    import ttnn
-
-    # Single core for batch_size=1 - preserves HEIGHT_SHARDED layout
-    # without requiring tensor size to be divisible by core count
-    return ttnn.create_sharded_memory_config(
-        shape=(32, head_dim),  # TILE_SIZE x head_dim
-        core_grid=ttnn.CoreGrid(y=1, x=1),  # Single core for batch=1
-        strategy=ttnn.ShardStrategy.HEIGHT,
-        orientation=ttnn.ShardOrientation.ROW_MAJOR,
-        use_height_and_width_as_shard_shape=True,
-    )
