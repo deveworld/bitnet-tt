@@ -133,7 +133,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = True,  # Enabled with in-place cache update
+        enable_trace: bool = False,  # Disabled: concat-based cache incompatible with Trace
         batch_size: int = 1,
     ) -> None:
         """
@@ -420,7 +420,7 @@ class TextGenerator:
         temperature: float = 1.0,
         top_k: int | None = 50,
         do_sample: bool = True,
-        use_optimized: bool = True,
+        use_optimized: bool = False,
     ) -> str:
         """
         Generate text from a prompt.
@@ -431,7 +431,8 @@ class TextGenerator:
             temperature: Sampling temperature
             top_k: Top-k filtering
             do_sample: Whether to sample
-            use_optimized: Use optimized path with pre-allocated caches (default: True)
+            use_optimized: Use optimized path with pre-allocated caches (default: False)
+                           Note: Currently disabled as paged_update_cache requires HEIGHT_SHARDED
 
         Returns:
             Generated text including the prompt
@@ -460,7 +461,7 @@ class TextGenerator:
         temperature: float,
         top_k: int | None,
         do_sample: bool,
-        use_optimized: bool = True,
+        use_optimized: bool = False,
     ) -> NDArray[np.int64]:
         """
         Generate tokens with optimized prefill/decode split.
@@ -471,7 +472,7 @@ class TextGenerator:
             temperature: Sampling temperature
             top_k: Top-k filtering
             do_sample: Whether to sample
-            use_optimized: Use optimized path with pre-allocated caches
+            use_optimized: Use optimized path (default: False, currently disabled)
         """
         batch_size, seq_len = input_ids.shape
         generated = input_ids.copy()
@@ -623,7 +624,7 @@ class TextGenerator:
         top_k: int | None = 50,
         do_sample: bool = True,
         use_cache: bool = True,  # Always True in optimized version
-        use_optimized: bool = True,  # Use optimized path with pre-allocated caches
+        use_optimized: bool = False,  # Disabled: paged_update_cache requires HEIGHT_SHARDED
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """
         Generate text with streaming output.
@@ -637,7 +638,7 @@ class TextGenerator:
             top_k: Top-k filtering
             do_sample: Whether to sample
             use_cache: Always True (kept for API compatibility)
-            use_optimized: Use optimized path with pre-allocated caches (default: True)
+            use_optimized: Use optimized path (default: False, currently disabled)
         """
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded.")
@@ -756,7 +757,7 @@ class TextGenerator:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         use_cache: bool = True,  # Always True in optimized version
-        use_optimized: bool = True,  # Use optimized path with pre-allocated caches
+        use_optimized: bool = False,  # Disabled: paged_update_cache requires HEIGHT_SHARDED
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """Generate a chat response with streaming output."""
         if self.tokenizer is None:

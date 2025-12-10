@@ -122,9 +122,6 @@ class KVCache:
         Key optimization: Store KV already expanded for GQA to avoid
         expanding all cached positions every decode step.
 
-        If cache is pre-allocated, copies prefill data to cache directly.
-        This enables in-place decode updates (Trace compatible).
-
         Args:
             key_states: [batch, kv_heads, seq, head_dim]
             value_states: [batch, kv_heads, seq, head_dim]
@@ -147,65 +144,13 @@ class KVCache:
             key_expanded = key_states
             value_expanded = value_states
 
-        # If pre-allocated, copy prefill data to cache using paged_update_cache
-        if self._preallocated and self.key_cache is not None:
-            try:
-                # Use paged_update_cache to copy prefill data position by position
-                # This is more expensive than needed, but ensures Trace compatibility
-                # Alternative: For prefill, we can just replace the cache and rely on
-                # the decode path to use in-place updates
+        # Store in temporary variables for decode initialization
+        self._prefill_key = key_expanded
+        self._prefill_value = value_expanded
 
-                # For efficiency, we replace the cache directly with the prefill data
-                # The decode path will use in-place updates on this cache
-                # Cache shape should already match (GQA expanded)
-
-                # Deallocate old pre-allocated cache
-                if self.key_cache is not None:
-                    ttnn.deallocate(self.key_cache)
-                if self.value_cache is not None:
-                    ttnn.deallocate(self.value_cache)
-
-                # Create new cache with prefill data padded to max_seq_len
-                if seq_len < self.max_seq_len:
-                    # Pad to max_seq_len for future in-place updates
-                    pad_len = self.max_seq_len - seq_len
-                    batch_size = key_expanded.shape[0]
-                    num_heads = key_expanded.shape[1]
-                    head_dim = key_expanded.shape[3]
-
-                    pad_shape = (batch_size, num_heads, pad_len, head_dim)
-                    zeros = torch.zeros(pad_shape, dtype=torch.bfloat16)
-                    zeros_ttnn = ttnn.from_torch(
-                        zeros,
-                        device=self.device,
-                        layout=ttnn.TILE_LAYOUT,
-                        dtype=ttnn.bfloat16,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    )
-
-                    self.key_cache = ttnn.concat([key_expanded, zeros_ttnn], dim=2)
-                    self.value_cache = ttnn.concat([value_expanded, zeros_ttnn], dim=2)
-                    ttnn.deallocate(zeros_ttnn)
-                else:
-                    # seq_len == max_seq_len, use directly
-                    self.key_cache = key_expanded
-                    self.value_cache = value_expanded
-
-                # Keep pre-allocated status for decode
-                self._preallocated = True
-
-            except Exception:
-                # Fallback: store in temporary variables
-                self._prefill_key = key_expanded
-                self._prefill_value = value_expanded
-                self._preallocated = False
-        else:
-            # Non-preallocated: store in temporary variables
-            self._prefill_key = key_expanded
-            self._prefill_value = value_expanded
-            # Also set as cache for concat-based decode
-            self.key_cache = key_expanded
-            self.value_cache = value_expanded
+        # Also set as cache for concat-based decode
+        self.key_cache = key_expanded
+        self.value_cache = value_expanded
 
         return key_expanded, value_expanded
 
@@ -217,16 +162,18 @@ class KVCache:
         num_kv_groups: int = 1,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
-        Update pre-expanded cache for decode.
+        Update pre-expanded cache for decode using concat.
 
         Key optimization: Expand only the NEW token's KV (1 position).
-        If cache is pre-allocated, uses in-place update (Trace compatible).
-        Otherwise falls back to concat (Trace incompatible).
+
+        Note: In-place update via paged_update_cache requires HEIGHT_SHARDED input
+        which is not yet properly configured. Using concat-based approach for now.
+        This means Trace capture is not compatible with the current implementation.
 
         Args:
             key_states: [batch, kv_heads, 1, head_dim] - single new token
             value_states: [batch, kv_heads, 1, head_dim] - single new token
-            current_pos: Current sequence position (required for in-place update)
+            current_pos: Current sequence position (unused, kept for API compatibility)
             num_kv_groups: Number of query heads per KV head
 
         Returns:
@@ -240,51 +187,7 @@ class KVCache:
             key_expanded = key_states
             value_expanded = value_states
 
-        # Try in-place update if cache is pre-allocated and current_pos is provided
-        if self._preallocated and self.key_cache is not None and current_pos is not None:
-            try:
-                # Position tensor for paged_update_cache
-                cur_pos_tensor = ttnn.from_torch(
-                    torch.tensor([current_pos], dtype=torch.int32),
-                    dtype=ttnn.int32,
-                    layout=ttnn.ROW_MAJOR_LAYOUT,
-                    device=self.device,
-                )
-
-                # BKSD → 1BKD format (paged_update_cache requirement)
-                # [batch, heads, 1, head_dim] → [1, batch, heads, head_dim]
-                key_1bkd = ttnn.permute(key_expanded, (2, 0, 1, 3))
-                value_1bkd = ttnn.permute(value_expanded, (2, 0, 1, 3))
-
-                # In-place update (no memory reallocation - Trace compatible!)
-                ttnn.experimental.paged_update_cache(
-                    self.key_cache, key_1bkd,
-                    update_idxs_tensor=cur_pos_tensor
-                )
-                ttnn.experimental.paged_update_cache(
-                    self.value_cache, value_1bkd,
-                    update_idxs_tensor=cur_pos_tensor
-                )
-
-                # Cleanup temporary tensors
-                ttnn.deallocate(cur_pos_tensor)
-                ttnn.deallocate(key_1bkd)
-                ttnn.deallocate(value_1bkd)
-                ttnn.deallocate(key_expanded)
-                ttnn.deallocate(value_expanded)
-
-                self.seq_len_cached = current_pos + 1
-
-                # Return sliced cache for SDPA (only valid portion)
-                return (
-                    self.key_cache[:, :, :self.seq_len_cached, :],
-                    self.value_cache[:, :, :self.seq_len_cached, :]
-                )
-            except Exception:
-                # Fall through to concat if in-place update fails
-                pass
-
-        # Fallback: Concat-based update (Trace incompatible)
+        # Concat-based update
         if self.key_cache is None:
             self.key_cache = key_expanded
             self.value_cache = value_expanded
