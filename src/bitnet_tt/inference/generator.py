@@ -469,8 +469,11 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens
-        # Use pre-allocated caches for optimized decode
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
+        # NOTE: Disable pre-allocated caches for now - they are not GQA-expanded
+        # and incompatible with update_decode_expanded() which expects expanded cache.
+        # Pre-allocated caches have shape [batch, num_kv_heads, max_seq, head_dim]
+        # but update_decode_expanded needs [batch, num_heads, seq, head_dim]
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -628,9 +631,10 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill (use pre-allocated caches for optimized decode)
+        # Phase 1: Prefill
+        # NOTE: Disable pre-allocated caches - incompatible with update_decode_expanded()
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
