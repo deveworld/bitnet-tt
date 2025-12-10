@@ -81,6 +81,14 @@ class BitNetModel:
         # Language model head weight (will be loaded)
         self.lm_head_weight: ttnn.Tensor | None = None
 
+        # Compute kernel config for LM head (HiFi2 for faster matmul)
+        self._lm_head_compute_config = None
+        try:
+            from bitnet_tt.config import get_compute_kernel_config
+            self._lm_head_compute_config = get_compute_kernel_config("hifi2")
+        except Exception:
+            pass
+
     def load_embedding_weights(self, weight: NDArray[np.floating]) -> None:
         """
         Load embedding weights.
@@ -210,7 +218,32 @@ class BitNetModel:
         if self.lm_head_weight is None:
             raise RuntimeError("LM head weights not loaded.")
 
-        logits = ttnn.matmul(hidden_states, self.lm_head_weight)
+        # LM Head optimization for prefill: only compute logits for last token
+        # vocab_size=128256 is large, so this saves significant compute
+        if mode == "prefill":
+            # Get sequence length from hidden_states shape
+            # hidden_states shape: [1, 1, seq_len, hidden_size]
+            shape = hidden_states.shape
+            if len(shape) >= 3:
+                seq_len = shape[-2]
+                if seq_len > 1:
+                    # Slice to get only last token: [1, 1, 1, hidden_size]
+                    # ttnn.slice uses [start, end) ranges
+                    hidden_states = ttnn.slice(
+                        hidden_states,
+                        starts=[0, 0, seq_len - 1, 0],
+                        ends=[shape[0], shape[1], seq_len, shape[-1]],
+                    )
+
+        # Apply LM head with optimized compute kernel
+        if self._lm_head_compute_config is not None:
+            logits = ttnn.matmul(
+                hidden_states,
+                self.lm_head_weight,
+                compute_kernel_config=self._lm_head_compute_config,
+            )
+        else:
+            logits = ttnn.matmul(hidden_states, self.lm_head_weight)
 
         return logits, updated_caches if use_cache else None
 

@@ -2921,3 +2921,56 @@ ttnn.synchronize_device(device)
 # 복사
 ttnn.copy_host_to_device_tensor(host_tensor, device_tensor)
 ```
+
+---
+
+## 36. 최적화 시도 기록 (2025-12-10)
+
+### 36.1 시도 결과 요약
+
+| 시도 | 커밋 | 결과 | 속도 |
+|------|------|------|------|
+| Alpha baseline | `cd995ba` | ✅ 성공 | **8.68 t/s** |
+| HEIGHT_SHARDED (batch=1) | `105f828` | ❌ 실패 | - |
+| L1_HEIGHT_SHARDED_MEMORY_CONFIG | `de8494a` | ❌ 실패 | - |
+| to_memory_config() 변환 | `3776f79` | ❌ 실패 | - |
+| 단일 코어 CoreGrid(1,1) | `4302980` | ❌ 실패 | - |
+| batch_size=32 HEIGHT_SHARDED | `7c4f765`~`72e5044` | ❌ 실패 | - |
+| batch_size=32 _forward_simple | `fd7a1d2` | ✅ 작동 | **0.80 t/s** (10x 느림) |
+| **Alpha로 롤백** | `82f238c` | ✅ 현재 | **8.68 t/s** |
+
+### 36.2 HEIGHT_SHARDED 실패 원인 분석
+
+**근본 원인**: tt_transformers의 `rotary_embedding_llama`는 특정 shard geometry를 요구함
+
+```
+BitNet: num_heads=20, batch_size=32
+→ Q tensor shape: [1, 32, 20, 128]
+→ Shard height: 1 × 32 × 20 = 640
+
+tt_transformers 기대값 (Llama):
+→ CoreGrid(y=4, x=8) = 32 cores
+→ Shard height per core: 32 (TILE_SIZE)
+→ Total expected: 32 × 32 = 1024
+
+Mismatch: 640 ≠ 1024
+```
+
+**결론**: BitNet의 `num_heads=20`이 32코어 그리드와 호환되지 않음. Llama는 `num_heads=32, 64, 128...` (2의 거듭제곱)을 사용하여 문제없음.
+
+### 36.3 시도하지 않은 최적화 목록
+
+| 최적화 | 섹션 | HEIGHT_SHARDED 의존 | 비고 |
+|--------|------|---------------------|------|
+| DRAM-Sharded Matmul | 31 | ❌ 독립적 | ~26% 향상 예상 |
+| Compute Kernel Config | 33 | ❌ 독립적 | HiFi2/LoFi로 2-3x |
+| LM Head 최적화 | 24.6 | ❌ 독립적 | 마지막 토큰만 계산 |
+| Fused Projections | 28.3 | ❌ 독립적 | QKV, gate+up 통합 |
+| Multi-CQ 파이프라인 | 28.3 | ⚠️ Trace 필요 | 보류 |
+
+### 36.4 다음 시도 계획
+
+1. **DRAM-Sharded Matmul**: decode 시 weight를 DRAM 12개 bank에 분산
+2. **Compute Kernel Config**: HiFi2 또는 LoFi 적용으로 matmul 가속
+3. **LM Head 최적화**: prefill 시 마지막 토큰만 계산
+4. **Fused QKV**: Q, K, V projection을 단일 matmul로 통합
