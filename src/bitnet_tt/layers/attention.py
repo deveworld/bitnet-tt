@@ -996,9 +996,11 @@ class MultiHeadAttention:
         # Explicitly convert to HEIGHT_SHARDED for rotary_embedding_llama
         if self._decode_mem_configs is not None:
             height_sharded_config = self._decode_mem_configs["CREATE_QKV_DECODE_SHARD"]
+            print(f"[DEBUG] Before to_memory_config: q shape={q_heads_1bqd.shape}, mem={q_heads_1bqd.memory_config()}")
             q_heads_1bqd = ttnn.to_memory_config(q_heads_1bqd, height_sharded_config)
             k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, height_sharded_config)
             v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, height_sharded_config)
+            print(f"[DEBUG] After to_memory_config: q shape={q_heads_1bqd.shape}, mem={q_heads_1bqd.memory_config()}")
 
         # 2. Apply RoPE using fused rotary_embedding_llama
         q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
