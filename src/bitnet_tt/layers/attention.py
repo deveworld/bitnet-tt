@@ -966,9 +966,10 @@ class MultiHeadAttention:
                 batch_size=batch_size,
             )
 
-        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, batch, 1, qkv_dim]
+        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, 1, batch, qkv_dim]
         # xqkv_fused is [batch, 1, qkv_dim]
-        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, batch_size, 1, self._qkv_dim))
+        # API requires input_shape[1] == 1
+        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, 1, batch_size, self._qkv_dim))
         ttnn.deallocate(xqkv_fused)
 
         # Use HEIGHT_SHARDED for batch_size=32, L1 for smaller batches
