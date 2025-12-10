@@ -958,3 +958,1180 @@ Applying these optimizations to BitNet-TT:
 - **With paged KV cache**: ~1.5x improvement (eliminate allocations)
 - **With SDPA decode**: ~1.2x improvement (optimized attention kernel)
 - **Combined target**: **30-50+ tokens/s** (matching bitnet.cpp)
+
+---
+
+## 12. Implementation Guide
+
+### 12.1 Optimization Priority & Impact Summary
+
+| Phase | Optimization | Speedup | KV Memory | Effort | Priority |
+|-------|--------------|---------|-----------|--------|----------|
+| 1 | Trace Capture | 2-3x | - | 4h | Critical |
+| 2 | Paged Attention | - | 8.5GB → 64MB | 8h | Critical |
+| 3 | Memory Configs | 5-10% | - | 4h | High |
+| 4 | RoPE Pre-upload | 5% | - | 2h | Medium |
+| 5 | Split Sampling | 5% (33x I/O) | - | 3h | Medium |
+
+**Total Expected**: 2.6-3.1x cumulative speedup + 135x KV reduction
+
+### 12.2 Paged Attention Implementation
+
+Block-based KV cache allocation (reduces 8.5GB → 64MB):
+
+```python
+@dataclass
+class PagedKVCache:
+    """Block-based KV cache for memory efficiency."""
+    block_size: int = 128  # Tokens per block
+    max_num_blocks: int = 256  # For ~32K max length
+    key_cache: ttnn.Tensor | None = None
+    value_cache: ttnn.Tensor | None = None
+    page_table: ttnn.Tensor | None = None
+
+    def preallocate(self, batch_size, num_kv_heads, head_dim, device):
+        """Allocate block-based cache."""
+        # Shape: [max_blocks, kv_heads, block_size, head_dim]
+        # = 256 * 8 * 128 * 128 * 2 bytes = 64 MB (vs 8.5 GB full allocation!)
+        cache_shape = (self.max_num_blocks, num_kv_heads, self.block_size, head_dim)
+        zeros = torch.zeros(cache_shape, dtype=torch.bfloat16)
+
+        self.key_cache = ttnn.from_torch(
+            zeros, device=device, layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self.value_cache = ttnn.from_torch(
+            zeros, device=device, layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def update_decode(self, key_states, value_states, seq_position):
+        """In-place block update using paged_update_cache."""
+        ttnn.experimental.paged_update_cache(
+            self.key_cache, key_states,
+            update_idxs_tensor=ttnn.from_torch(
+                torch.tensor([seq_position]), device=self.key_cache.device
+            ),
+            page_table=self.page_table,
+        )
+        ttnn.experimental.paged_update_cache(
+            self.value_cache, value_states,
+            update_idxs_tensor=ttnn.from_torch(
+                torch.tensor([seq_position]), device=self.value_cache.device
+            ),
+            page_table=self.page_table,
+        )
+        return self.key_cache, self.value_cache
+```
+
+### 12.3 Memory Config Decision Tree
+
+```
+Output size < 1 MB?           → L1_WIDTH_SHARDED
+Output reused immediately?    → L1_WIDTH_SHARDED
+Output is reduction/SDPA?     → DRAM_MEMORY_CONFIG
+Large intermediate (FFN1)?    → DRAM_MEMORY_CONFIG
+```
+
+**Practical pattern:**
+```python
+class BitNetAttention:
+    def __init__(self, ...):
+        # QKV output goes to L1 (reused immediately)
+        self.xqkv_memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+
+        # SDPA output goes to DRAM (large reduction)
+        self.sdpa_memory_config = ttnn.DRAM_MEMORY_CONFIG
+
+        # Concat heads output back to L1
+        self.concat_heads_memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+
+class BitNetMLP:
+    def __init__(self, ...):
+        # FFN1 output to DRAM (large intermediate)
+        self.ff1_memory_config = ttnn.DRAM_MEMORY_CONFIG
+
+        # FFN2 output back to L1 if possible
+        self.ff2_memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+```
+
+### 12.4 Common Pitfalls & Solutions
+
+#### Pitfall 1: Trace compilation hangs
+**Symptom**: Program stuck on `ttnn.begin_trace_capture()`
+**Cause**: Weights not on device, undefined shapes
+**Solution**:
+```python
+# Before capturing trace, ensure:
+assert self.wqkv.device == self.device
+assert self.kv_cache.key_cache.device == self.device
+# Run forward once without trace first
+_ = self.model.ttnn_decode_forward(dummy_input)
+ttnn.synchronize_device(self.device)
+```
+
+#### Pitfall 2: Page table index out of bounds
+**Symptom**: Segfault in `paged_update_cache()`
+**Cause**: Block indices exceed `max_num_blocks`
+**Solution**:
+```python
+def update_decode(self, k, v, seq_position):
+    block_idx = seq_position // self.block_size
+    if block_idx >= self.max_num_blocks:
+        raise ValueError(f"Sequence too long: {seq_position} exceeds "
+                        f"{self.max_num_blocks * self.block_size}")
+```
+
+#### Pitfall 3: L1 memory overflow
+**Symptom**: `ttnn.linear()` fails with "out of L1 memory"
+**Cause**: Too many WIDTH_SHARDED configs
+**Solution**:
+```python
+# Don't shard outputs that aren't immediately reused
+qkv = ttnn.linear(x, self.wqkv, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+# Then shard on-demand if needed
+qkv_l1 = ttnn.to_memory_config(qkv, ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG)
+```
+
+#### Pitfall 4: Embedding lookup shape mismatch
+**Symptom**: RoPE `embedding()` returns wrong shape
+**Cause**: Input indices not properly formatted
+**Solution**:
+```python
+# Embedding expects [batch, seq_len] for 2D lookup
+position_idxs = torch.tensor([seq_position], dtype=torch.uint32)
+position_idxs = position_idxs.reshape(1, 1)  # [1, 1] for single position
+cos = ttnn.embedding(position_idxs, self.cos_matrix)
+assert cos.shape[-1] == self.head_dim  # Verify!
+```
+
+### 12.5 Validation Script
+
+```python
+def validate_optimizations(model, generator, test_prompt, num_tokens=10):
+    """Validate all optimizations work correctly."""
+
+    # 1. Test trace capture
+    assert generator.enable_trace
+    output = generator.generate(test_prompt, max_tokens=num_tokens)
+    assert generator._trace_captured
+    print("✓ Trace capture working")
+
+    # 2. Test paged attention
+    assert isinstance(generator.model.kv_cache, PagedKVCache)
+    assert generator.model.kv_cache.max_num_blocks == 256
+    print("✓ Paged attention working")
+
+    # 3. Test memory configs (verify via ttnn.Device memory usage)
+    initial_dram = measure_dram_usage(generator.device)
+    output = generator.generate(test_prompt, max_tokens=1)
+    final_dram = measure_dram_usage(generator.device)
+    assert final_dram - initial_dram < 100_000_000  # < 100 MB per token
+    print(f"✓ Memory configs working (DRAM delta: {(final_dram - initial_dram) / 1e6:.1f} MB)")
+
+    # 4. Test RoPE pre-upload
+    assert hasattr(generator.model.attention, 'rope')
+    cos, sin = generator.model.attention.rope.get_rot_mats(torch.tensor([0]))
+    assert cos.shape[-1] == generator.model.head_dim
+    print("✓ RoPE pre-upload working")
+
+    print("\nAll validations passed!")
+```
+
+### 12.6 Performance Metrics Reference (Llama 3.1 8B on p150)
+
+**33 t/s/u breakdown:**
+- Trace overhead: Amortized to <1% per token
+- SDPA decode: ~10ms (bottleneck)
+- QKV linear: ~5ms (width-sharded)
+- All-reduce: ~2ms (ring topology)
+- **Total decode loop: ~30ms = 33 t/s**
+
+**KV Cache footprint comparison:**
+| Mode | Per-layer | Total (32 layers) |
+|------|-----------|-------------------|
+| Full pre-allocated | 8.5 GB | 272 GB |
+| Paged attention | 64 MB | 2 GB |
+| **Reduction** | **135x** | **135x** |
+
+---
+
+## 13. Metal Trace 심화 가이드
+
+TT-Metal의 Metal Trace는 모델 성능 최적화에 **가장 중요한** 기능입니다.
+
+### 13.1 개요
+
+Metal Trace는 호스트의 연산 디스패칭 오버헤드를 제거합니다:
+- **문제**: 호스트가 각 연산을 구성하고 디스패치하는 시간이 디바이스 연산 시간보다 길면 디바이스가 대기 상태
+- **해결**: 연산 디스패치 명령을 DRAM 버퍼에 기록 → 이후 재실행 시 즉시 실행
+
+```
+호스트 바운드 (트레이스 없음):
+[Host: op1 디스패치] → [Device: op1 대기...실행] → [Host: op2 디스패치] → [Device: op2 대기...실행]
+                        ^^^^^^^^ 긴 대기 ^^^^^^^^
+
+트레이스 사용:
+[Host: 트레이스 실행] → [Device: op1→op2→op3→...] (거의 대기 없음)
+```
+
+### 13.2 핵심 API
+
+```python
+# 1. 디바이스 생성 시 trace_region_size 지정
+device = ttnn.open_device(device_id=0, trace_region_size=800768)
+
+# 2. 트레이스 캡처 시작
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+
+# 3. 연산 실행 (캡처됨)
+output = model.forward(input)
+
+# 4. 트레이스 캡처 종료
+ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 5. 트레이스 실행 (빠름!)
+ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+```
+
+### 13.3 영구 DRAM 입력 패턴 (권장)
+
+```python
+# 1. 영구 입력 텐서 할당
+input_dram_tensor = ttnn.allocate_tensor_on_device(
+    tensor_spec, device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+)
+
+# 2. 컴파일 런
+ttnn.copy_host_to_device_tensor(host_tensor, input_dram_tensor, cq_id=0)
+input_l1_tensor = ttnn.to_memory_config(input_dram_tensor, L1_MEMCFG)
+output_tensor = model.forward(input_l1_tensor)
+
+# 3. 트레이스 캡처
+ttnn.copy_host_to_device_tensor(host_tensor, input_dram_tensor, cq_id=0)
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+input_l1_tensor = ttnn.to_memory_config(input_dram_tensor, L1_MEMCFG)
+output_tensor = model.forward(input_l1_tensor)  # 이 output 참조 유지 필수!
+ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 4. 트레이스 실행 (반복)
+for _ in range(iterations):
+    ttnn.copy_host_to_device_tensor(host_tensor, input_dram_tensor, cq_id=0)
+    ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+    host_output = output_tensor.cpu(blocking=False)
+ttnn.synchronize_device(device)
+```
+
+### 13.4 비영구 L1 입력 패턴 (고급)
+
+모델이 L1에 입력 텐서를 영구 보관할 메모리가 없을 때:
+
+```python
+# 컴파일 런
+input_l1 = host_tensor.to(device, L1_MEMCFG)
+output = model.forward(input_l1)
+
+# 트레이스 캡처 시 주소 기록
+input_l1 = host_tensor.to(device, L1_MEMCFG)
+input_trace_addr = input_l1.buffer_address()  # 주소 기록
+spec = input_l1.spec
+
+output.deallocate(force=True)  # 이전 출력 해제로 같은 주소 확보
+
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+output = model.forward(input_l1)
+
+# 트레이스 종료 전 같은 주소에 입력 할당
+input_l1 = ttnn.allocate_tensor_on_device(spec, device)
+assert input_trace_addr == input_l1.buffer_address()  # 주소 검증!
+
+ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 실행
+ttnn.copy_host_to_device_tensor(host_tensor, input_l1, cq_id=0)
+ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+```
+
+### 13.5 트레이스 제한사항
+
+1. **정적 형태만 지원**: 입출력 텐서 크기/주소가 캡처 시점에 고정
+2. **이벤트 캡처 불가**: `record_event`, `wait_for_event`는 트레이스 외부에서
+3. **I/O 캡처 불가**: `copy_host_to_device`, `cpu()` 등은 트레이스 외부에서
+4. **프로그램 캐시 필수**: 트레이스 전에 컴파일 런 필요
+
+---
+
+## 14. 다중 커맨드 큐 (Multiple CQs)
+
+### 14.1 개요
+
+2개의 독립적인 커맨드 큐로 I/O와 연산을 병렬화:
+- **CQ 0**: 연산 디스패치 + 출력 읽기
+- **CQ 1**: 입력 쓰기
+
+```
+단일 CQ (I/O 바운드):
+[Write] → [Ops...] → [Read] → [Write] → [Ops...] → [Read]
+          ^^^^^^^^ 모델 대기 ^^^^^^^^
+
+다중 CQ (오버랩):
+CQ 0: [Ops...] → [Ops...] → [Ops...]
+CQ 1: [Write] → [Write] → [Write]
+```
+
+### 14.2 핵심 API
+
+```python
+# 디바이스 생성 시 2개 CQ 요청
+device = ttnn.open_device(device_id=0, num_command_queues=2)
+
+# 이벤트 기록 (해당 CQ의 현재 명령 완료 후 기록)
+event = ttnn.record_event(device, cq_id=0)
+
+# 이벤트 대기 (해당 CQ가 이벤트 발생까지 대기)
+ttnn.wait_for_event(cq_id=1, event=event)
+```
+
+### 14.3 연산 + 출력: CQ0, 입력 쓰기: CQ1 패턴
+
+```python
+# 영구 입력 텐서 할당
+input_dram = ttnn.allocate_tensor_on_device(spec, device, DRAM_MEMCFG)
+
+# 초기 더미 이벤트 (루프 시작용)
+op_event = ttnn.record_event(device, 0)
+
+outputs = []
+for _ in range(iterations):
+    # CQ1: 이전 연산 완료 대기 후 입력 쓰기
+    ttnn.wait_for_event(1, op_event)
+    ttnn.copy_host_to_device_tensor(host_tensor, input_dram, cq_id=1)
+    write_event = ttnn.record_event(device, 1)
+
+    # CQ0: 쓰기 완료 대기 후 연산
+    ttnn.wait_for_event(0, write_event)
+    input_l1 = ttnn.to_memory_config(input_dram, L1_MEMCFG)
+    op_event = ttnn.record_event(device, 0)  # 입력 소비 완료 신호
+
+    output = model.forward(input_l1)
+    outputs.append(output.cpu(blocking=False))
+
+ttnn.synchronize_device(device)
+```
+
+### 14.4 4-이벤트 패턴 (CQ1에서 읽기+쓰기)
+
+```python
+# 이벤트: first_op (입력 소비), write (쓰기 완료), last_op (출력 생성), read (읽기 완료)
+
+input_dram = ttnn.allocate_tensor_on_device(input_spec, device, DRAM_MEMCFG)
+output_dram = ttnn.allocate_tensor_on_device(output_spec, device, DRAM_MEMCFG)
+
+first_op_event = ttnn.record_event(device, 0)
+read_event = ttnn.record_event(device, 1)
+
+# 첫 입력 미리 쓰기
+ttnn.wait_for_event(1, first_op_event)
+ttnn.copy_host_to_device_tensor(host_tensor, input_dram, cq_id=1)
+write_event = ttnn.record_event(device, 1)
+
+for _ in range(iterations):
+    # CQ0: 쓰기 완료 대기 → 연산
+    ttnn.wait_for_event(0, write_event)
+    input_l1 = ttnn.to_memory_config(input_dram, L1_MEMCFG)
+    first_op_event = ttnn.record_event(device, 0)
+
+    output = model.forward(input_l1)
+
+    ttnn.wait_for_event(0, read_event)
+    output_dram = ttnn.reshard(output, OUTPUT_DRAM_MEMCFG, output_dram)
+    last_op_event = ttnn.record_event(device, 0)
+
+    # CQ1: 다음 입력 쓰기 + 이전 출력 읽기
+    ttnn.wait_for_event(1, first_op_event)
+    ttnn.copy_host_to_device_tensor(next_host_tensor, input_dram, cq_id=1)
+    write_event = ttnn.record_event(device, 1)
+
+    ttnn.wait_for_event(1, last_op_event)
+    outputs.append(output_dram.cpu(blocking=False, cq_id=1))
+    read_event = ttnn.record_event(device, 1)
+```
+
+---
+
+## 15. Trace + Multi-CQ 결합 패턴 (최고 성능)
+
+### 15.1 개요
+
+두 최적화를 결합하면:
+- 호스트가 디바이스보다 **훨씬 앞서** 명령 전송
+- 디바이스는 연산 간 **거의 대기 없이** 연속 실행
+
+### 15.2 결합 패턴 구현
+
+```python
+# 설정
+device = ttnn.open_device(
+    device_id=0,
+    trace_region_size=800768,
+    num_command_queues=2,
+)
+input_dram = ttnn.allocate_tensor_on_device(spec, device, DRAM_MEMCFG)
+
+op_event = ttnn.record_event(device, 0)
+
+# 컴파일 런 (트레이스 없이)
+ttnn.wait_for_event(1, op_event)
+ttnn.copy_host_to_device_tensor(host_tensor, input_dram, cq_id=1)
+write_event = ttnn.record_event(device, 1)
+ttnn.wait_for_event(0, write_event)
+input_l1 = ttnn.to_memory_config(input_dram, L1_MEMCFG)
+op_event = ttnn.record_event(device, 0)
+output = model.forward(input_l1)
+
+# 트레이스 캡처 (중요: 이벤트는 캡처 외부)
+ttnn.wait_for_event(1, op_event)
+ttnn.copy_host_to_device_tensor(host_tensor, input_dram, cq_id=1)
+write_event = ttnn.record_event(device, 1)
+ttnn.wait_for_event(0, write_event)
+input_l1 = ttnn.to_memory_config(input_dram, L1_MEMCFG)
+op_event = ttnn.record_event(device, 0)
+
+# 트레이스 입력 주소 기록
+input_trace_addr = input_l1.buffer_address()
+spec = input_l1.spec
+output.deallocate(force=True)
+
+# 트레이스 시작 (연산만 캡처)
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+output = model.forward(input_l1)
+
+# 같은 주소에 입력 재할당
+input_l1 = ttnn.allocate_tensor_on_device(spec, device)
+assert input_trace_addr == input_l1.buffer_address()
+ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 트레이스 실행 루프
+outputs = []
+for _ in range(iterations):
+    ttnn.wait_for_event(1, op_event)
+    ttnn.copy_host_to_device_tensor(host_tensor, input_dram, cq_id=1)
+    write_event = ttnn.record_event(device, 1)
+
+    ttnn.wait_for_event(0, write_event)
+    input_l1 = ttnn.reshard(input_dram, L1_MEMCFG, input_l1)  # 제자리 리샤드
+    op_event = ttnn.record_event(device, 0)
+
+    ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+    outputs.append(output.cpu(blocking=False))
+
+ttnn.synchronize_device(device)
+```
+
+### 15.3 핵심 주의사항
+
+1. **이벤트는 트레이스 외부**: `record_event`, `wait_for_event`는 캡처 대상 아님
+2. **입력 소비자 연산 분리**: 트레이스 입력의 첫 연산 후 바로 이벤트 기록
+3. **주소 일관성 검증**: 트레이스 종료 전 입력 텐서 주소 확인
+4. **리샤드로 제자리 업데이트**: `ttnn.reshard(src, config, dst)`로 기존 텐서에 쓰기
+
+---
+
+## 16. TT-NN LLM 구현 패턴 (llms.md 요약)
+
+### 16.1 RoPE 구현 (공식 패턴)
+
+```python
+class TtLlamaRotarySetup:
+    def __init__(self, device, head_dim, max_seq_len, rope_theta):
+        # 1. cos/sin 행렬 사전 계산
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2) / head_dim))
+        t = torch.arange(max_seq_len)
+        freqs = torch.outer(t, inv_freq)
+        cos_cache = torch.cos(freqs)
+        sin_cache = torch.sin(freqs)
+
+        # 2. 디바이스에 업로드 (한 번만!)
+        self.cos_matrix = ttnn.from_torch(
+            cos_cache, device=device, layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        self.sin_matrix = ttnn.from_torch(
+            sin_cache, device=device, layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+
+    def get_rot_mats(self, position_idxs: torch.Tensor):
+        """위치 인덱스로 cos/sin 조회 (ttnn.embedding 사용!)"""
+        pos_tensor = ttnn.from_torch(
+            position_idxs.to(torch.int32),
+            device=self.device, dtype=ttnn.uint32
+        )
+        # 임베딩 룩업으로 빠른 인덱싱
+        cos = ttnn.embedding(pos_tensor, self.cos_matrix, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(pos_tensor, self.sin_matrix, layout=ttnn.TILE_LAYOUT)
+        return cos, sin
+```
+
+### 16.2 Attention 구현 (Prefill vs Decode)
+
+```python
+class TtLlamaAttention:
+    def forward(self, x, current_pos, rot_mats, kv_cache, mode="decode"):
+        # QKV 프로젝션
+        xq = ttnn.linear(x, self.wq, memory_config=L1_MEMCFG)
+        xk = ttnn.linear(x, self.wk, memory_config=L1_MEMCFG)
+        xv = ttnn.linear(x, self.wv, memory_config=L1_MEMCFG)
+
+        if mode == "decode":
+            # 1. 헤드 생성 (디코드 최적화)
+            xq = ttnn.experimental.nlp_create_qkv_heads_decode(
+                xq, num_heads=self.n_heads,
+                num_kv_heads=self.n_kv_heads, head_dim=self.head_dim
+            )
+            # ... xk, xv도 동일
+
+            # 2. RoPE 적용 (융합 연산)
+            xq = ttnn.experimental.rotary_embedding_llama(
+                xq, rot_mats[0], rot_mats[1], self.trans_mat
+            )
+            xk = ttnn.experimental.rotary_embedding_llama(
+                xk, rot_mats[0], rot_mats[1], self.trans_mat
+            )
+
+            # 3. KV 캐시 업데이트 (페이지드, 제자리)
+            ttnn.experimental.paged_update_cache(
+                kv_cache[0], xk, update_idxs=current_pos, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                kv_cache[1], xv, update_idxs=current_pos, page_table=page_table
+            )
+
+            # 4. SDPA (디코드 최적화)
+            attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
+                xq, kv_cache[0], kv_cache[1], cur_pos=current_pos
+            )
+
+            # 5. 헤드 결합
+            attn_output = ttnn.experimental.nlp_concat_heads_decode(
+                attn_output, num_heads=self.n_heads
+            )
+
+        else:  # prefill
+            xq, xk, xv = ttnn.experimental.nlp_create_qkv_heads(
+                xq, xk, xv, num_heads=self.n_heads, num_kv_heads=self.n_kv_heads
+            )
+            # RoPE (프리필용)
+            xq = ttnn.experimental.rotary_embedding(xq, rot_mats[0], rot_mats[1])
+            xk = ttnn.experimental.rotary_embedding(xk, rot_mats[0], rot_mats[1])
+
+            # KV 캐시 채우기
+            ttnn.experimental.paged_fill_cache(kv_cache[0], xk, page_table)
+            ttnn.experimental.paged_fill_cache(kv_cache[1], xv, page_table)
+
+            # SDPA (프리필)
+            attn_output = ttnn.transformer.scaled_dot_product_attention(
+                xq, kv_cache[0], kv_cache[1], is_causal=True
+            )
+
+            # 헤드 결합
+            attn_output = ttnn.experimental.nlp_concat_heads(attn_output)
+
+        return ttnn.linear(attn_output, self.wo, memory_config=L1_MEMCFG)
+```
+
+### 16.3 MLP 구현 (DRAM-Sharded Matmul)
+
+대형 FFN (intermediate_size > 8K)은 DRAM 샤딩 필요:
+
+```python
+class TtLlamaMLP:
+    def __init__(self, args, device):
+        # 가중치를 DRAM에 샤딩
+        self.w1 = ttnn.as_tensor(
+            w1, device=device, dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG  # 큰 가중치는 DRAM
+        )
+
+    def forward(self, x):
+        # gate와 up을 별도 연산 (또는 fused w13)
+        ff1 = ttnn.linear(
+            x, self.w1,
+            activation="silu",  # 융합 활성화!
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,  # 큰 출력은 DRAM
+            dtype=ttnn.bfloat8_b,
+        )
+        ff3 = ttnn.linear(x, self.w3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+        # 게이팅
+        hidden = ttnn.mul(ff1, ff3, memory_config=L1_MEMCFG)
+
+        # 다운 프로젝션
+        return ttnn.linear(hidden, self.w2, memory_config=L1_MEMCFG)
+```
+
+### 16.4 프로그램 설정 (Program Configs)
+
+최적 코어 활용을 위한 설정:
+
+```python
+# 디코드 모드: 시퀀스 길이 1이므로 배치 축으로 병렬화
+DECODE_MATMUL_CONFIG = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    compute_with_storage_grid_size=(8, 8),  # 8x8 코어 그리드
+    in0_block_w=4,   # 입력 블록 너비
+    out_subblock_h=1,
+    out_subblock_w=4,
+    per_core_M=1,    # 디코드: 배치당 1 타일
+    per_core_N=4,    # 출력 차원 분할
+)
+
+# 프리필 모드: 시퀀스 길이가 길어서 시퀀스 축으로도 병렬화
+PREFILL_MATMUL_CONFIG = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    compute_with_storage_grid_size=(8, 8),
+    in0_block_w=2,
+    out_subblock_h=4,
+    out_subblock_w=2,
+    per_core_M=seq_len // 32 // 8,  # 시퀀스 분할
+    per_core_N=hidden_dim // 32 // 8,
+)
+```
+
+### 16.5 메모리 설정 결정 트리 (상세)
+
+```python
+def get_memory_config(tensor_role, tensor_size_mb, mode):
+    """텐서 역할과 크기에 따른 메모리 설정 결정."""
+
+    if mode == "prefill":
+        # 프리필은 큰 텐서 → DRAM
+        return ttnn.DRAM_MEMORY_CONFIG
+
+    # 디코드 모드
+    if tensor_role in ["qkv_output", "attn_scores"]:
+        # 즉시 재사용 → L1 샤딩
+        if tensor_size_mb < 1.0:
+            return ttnn.create_sharded_memory_config(
+                shape=(32, hidden_size // num_cores),
+                core_grid=ttnn.CoreGrid(y=batch_size, x=num_cores),
+                strategy=ttnn.ShardStrategy.WIDTH,
+            )
+        else:
+            return ttnn.L1_MEMORY_CONFIG
+
+    elif tensor_role == "ffn_intermediate":
+        # 큰 중간 결과 → DRAM
+        return ttnn.DRAM_MEMORY_CONFIG
+
+    elif tensor_role == "residual":
+        # 레이어 간 전달 → L1 샤딩
+        return ttnn.create_sharded_memory_config(...)
+
+    else:
+        # 기본: L1
+        return ttnn.L1_MEMORY_CONFIG
+```
+
+---
+
+## 17. 성능 벤치마크 (TT-Metal 공식)
+
+### 17.1 LLM 성능 (2025년 11월 기준)
+
+| Model | Device | Batch | t/s/u | t/s | TTFT |
+|-------|--------|-------|-------|-----|------|
+| **Llama 3.1 8B** | p150 (Blackhole) | 32 | **33.1** | **1059.2** | 57ms |
+| Llama 3.1 8B | p100 (Blackhole) | 32 | 29.0 | 928.0 | 61ms |
+| Llama 3.1 8B | n150 (Wormhole) | 32 | 26.0 | 832.0 | 104ms |
+| Llama 3.2 3B | n150 | 32 | 46.6 | 1491.2 | 52ms |
+| Llama 3.2 1B | n150 | 32 | 80.5 | 2576.0 | 23ms |
+| Llama 3.1 70B | QuietBox 8x WH | 32 | 15.9 | 508.8 | 159ms |
+
+### 17.2 BitNet-TT 목표 성능
+
+| Metric | Current | Target | Gap |
+|--------|---------|--------|-----|
+| Decode (t/s/u) | ~7.8 | 30+ | 4x |
+| Prefill (t/s) | ~4.6 | 15+ | 3x |
+| TTFT | ~217ms | <100ms | 2x |
+| Memory/token | 8.5GB | 64MB | 135x |
+
+### 17.3 최적화 영향 추정
+
+| 최적화 | 속도 향상 | 메모리 절감 | 복잡도 |
+|--------|----------|------------|--------|
+| Trace Capture | 2-3x | - | 중 |
+| Paged Attention | 1.5x | 135x | 상 |
+| Optimized Decode Ops | 1.5x | - | 중 |
+| RoPE Pre-upload | 1.2x | - | 하 |
+| Memory Sharding | 1.1x | 2x | 중 |
+| Multi-CQ | 1.2x | - | 상 |
+| **총 누적** | **5-8x** | **270x** | |
+
+---
+
+## 18. BitNet INT8×INT2 커널 참조 (공식 GPU 구현)
+
+### 18.1 양자화 전략
+
+```python
+# 가중치: 삼진 {-1, 0, +1} → INT2 (4개/바이트)
+def pack_ternary_weights(weight):
+    scale = weight.abs().mean()
+    quant = (weight / scale).round().clamp(-1, 1)  # {-1, 0, +1}
+    # 인코딩: -1→0, 0→1, +1→2
+    encoded = (quant + 1).to(torch.uint8)
+    # 4개씩 묶어 1바이트로 패킹
+    packed = (encoded[..., 0::4] |
+              (encoded[..., 1::4] << 2) |
+              (encoded[..., 2::4] << 4) |
+              (encoded[..., 3::4] << 6))
+    return packed, scale
+
+# 활성화: INT8 (per-token absmax)
+def quant_activation(x):
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+    x_int8 = (x * scale).round().clamp(-128, 127).to(torch.int8)
+    return x_int8, scale
+```
+
+### 18.2 CUDA 커널 구조
+
+```cpp
+// bitnet_kernels.cu - 특화된 GEMM 커널
+template<int M, int N, int K, int BLOCKS, int WARP_Y, int WARP_X>
+__global__ void ladder_int8xint2_kernel(
+    int8_t* __restrict__ activations,  // [M, K] INT8
+    int8_t* __restrict__ weights,       // [N, K/4] packed INT2
+    __nv_bfloat16* __restrict__ output, // [M, N] BF16
+    __nv_bfloat16* __restrict__ act_scale,   // Per-token
+    __nv_bfloat16* __restrict__ weight_scale // Per-layer
+);
+
+// 특화 커널 디스패치 (크기별)
+void bitlinear_int8xint2(int8_t* a, int8_t* w, bf16* out, ...) {
+    if (M == 1 && N == 3840 && K == 2560) {
+        // QKV 프로젝션 (2560 → 3840)
+        ladder_int8xint2_kernel<1, 3840, 2560, 3, 8, 16><<<...>>>;
+    }
+    else if (M == 1 && N == 2560 && K == 2560) {
+        // O 프로젝션 (2560 → 2560)
+        ladder_int8xint2_kernel<1, 2560, 2560, 1, 8, 16><<<...>>>;
+    }
+    // ... 다른 크기들
+}
+```
+
+### 18.3 TT-NN에서의 BitLinear 구현 (BF16 시뮬레이션)
+
+현재 TT-NN은 INT8×INT2 커널이 없으므로 BF16으로 시뮬레이션:
+
+```python
+class TTBitLinear:
+    def __init__(self, in_features, out_features, device):
+        # 가중치: 삼진 양자화 후 BF16으로 저장
+        weight_quant = ternary_quantize(weight)  # {-s, 0, +s}
+        self.weight = ttnn.from_torch(
+            weight_quant.T,  # 미리 전치!
+            device=device, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT
+        )
+
+    def forward(self, x):
+        # 활성화: per-token absmax 양자화 (BF16에서 시뮬레이션)
+        scale = 127.0 / ttnn.max(ttnn.abs(x), dim=-1, keepdim=True)
+        x_quant = ttnn.round(x * scale)
+        x_quant = ttnn.clip(x_quant, -128, 127) / scale
+
+        # 선형 연산 (가중치 이미 전치됨)
+        return ttnn.linear(x_quant, self.weight, transpose_b=False)
+```
+
+### 18.4 향후 최적화 가능성
+
+TT-NN에서 INT 커널 지원 시:
+1. **INT8 활성화**: `ttnn.experimental.int8_matmul` (있다면)
+2. **패킹된 가중치**: 2-bit 가중치 직접 지원
+3. **융합 양자화**: absmax + linear 융합
+
+---
+
+## 19. BitNet-TT 구현 체크리스트
+
+### Phase 1: 기본 최적화 (현재)
+- [x] 가중치 미리 전치 (`transpose_b` 불필요)
+- [x] RoPE cos/sin 디바이스 캐시
+- [x] KV 캐시 사전 할당
+- [x] Paged Attention 구현
+- [ ] Trace Capture 적용
+
+### Phase 2: 고급 최적화
+- [ ] `nlp_create_qkv_heads_decode` 사용
+- [ ] `rotary_embedding_llama` 사용
+- [ ] `nlp_concat_heads_decode` 사용
+- [ ] Multi-CQ 도입
+
+### Phase 3: 메모리 최적화
+- [ ] L1 샤딩 설정
+- [ ] BFP8 가중치 (정확도 검증 후)
+- [ ] 중간 결과 DRAM/L1 분리
+
+### Phase 4: 검증
+- [ ] HuggingFace 대비 Logits 일치 (correlation > 0.99)
+- [ ] Top-1 토큰 일치율 100%
+- [ ] 30+ t/s/u 달성
+
+---
+
+## 20. TT-Metal 공식 Attention 구현 상세 (tt_transformers/attention.py)
+
+### 20.1 핵심 구조
+
+공식 Llama 구현에서의 Attention 클래스 구조:
+
+```python
+class Attention(LightweightModule):
+    def __init__(self, ...):
+        # 1. Fused QKV 가중치 (모든 Q, K, V를 하나로)
+        qkv_list = []
+        for i in range(num_devices):
+            wq = state_dict[f"layer.{l}.wq.weight"].chunk(num_devices)[i].T
+            wk = state_dict[f"layer.{l}.wk.weight"].chunk(num_devices)[i].T
+            wv = state_dict[f"layer.{l}.wv.weight"].chunk(num_devices)[i].T
+            qkv_list.append(torch.cat([wq, wk, wv], dim=-1))
+
+        # 디바이스에 샤딩
+        self.wqkv = ttnn.as_tensor(
+            torch.cat(qkv_list, dim=-1),
+            dtype=self.wqkv_dtype,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            memory_config=wqkv_mem_config,  # DRAM 샤딩
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=(3, 2)),
+        )
+
+        # 2. KV 캐시 (Paged Attention)
+        if paged_attention_config:
+            cache_shape = (max_num_blocks, n_kv_heads, block_size, head_dim)
+        else:
+            cache_shape = (batch_size, n_kv_heads, max_seq_len, head_dim)
+
+        self.layer_past = [
+            ttnn.as_tensor(torch.zeros(cache_shape), device=mesh_device, ...)
+            for _ in [cache_k, cache_v]
+        ]
+```
+
+### 20.2 Decode Forward 상세
+
+```python
+def forward_decode(self, x, current_pos, rot_mats, page_table, kv_cache):
+    # 1. QKV Matmul (DRAM 샤딩)
+    xqkv_fused_sharded = ttnn.linear(
+        x, self.wqkv,
+        memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+        program_config=self.model_config["XQKV_DECODE_PROGCFG"],
+        compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+        dtype=ttnn.bfloat16,
+    )
+
+    # 2. All Reduce (멀티 디바이스)
+    xqkv_fused = tt_all_reduce(
+        xqkv_fused_sharded, mesh_device, cluster_axis=1,
+        memory_config=self.model_config["QKV_OUT_GATHERED_MEMCFG"],
+    )
+
+    # 3. 헤드 분리 (최적화된 연산)
+    q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+        xqkv_fused,
+        num_heads=self.n_local_heads,
+        num_kv_heads=self.n_local_kv_heads,
+        memory_config=self.model_config["CREATE_QKV_DECODE_SHARD"],
+    )
+
+    # 4. RoPE (융합 연산)
+    q = ttnn.experimental.rotary_embedding_llama(
+        q, rot_mats[0], rot_mats[1],
+        self.transformation_mats["decode"],
+        is_decode_mode=True
+    )
+    k = ttnn.experimental.rotary_embedding_llama(
+        k, rot_mats[0], rot_mats[1],
+        self.transformation_mats["decode"],
+        is_decode_mode=True
+    )
+
+    # 5. KV 캐시 업데이트 (페이지드, 제자리)
+    ttnn.experimental.paged_update_cache(
+        keys, k, update_idxs_tensor=current_pos, page_table=page_table
+    )
+    ttnn.experimental.paged_update_cache(
+        values, v, update_idxs_tensor=current_pos, page_table=page_table
+    )
+
+    # 6. SDPA (디코드 최적화 또는 페이지드)
+    if page_table:
+        attn_output = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            q, keys, values,
+            cur_pos_tensor=current_pos,
+            page_table_tensor=page_table,
+            scale=self.scale,
+            program_config=self.model_config["SDPA_DECODE_PROGCFG"],
+        )
+    else:
+        attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
+            q, keys, values,
+            cur_pos_tensor=current_pos,
+            scale=self.scale,
+            program_config=self.model_config["SDPA_DECODE_PROGCFG"],
+        )
+
+    # 7. 헤드 결합 (최적화된 연산)
+    attn_output = ttnn.experimental.nlp_concat_heads_decode(
+        attn_output, num_heads=self.n_local_heads
+    )
+
+    # 8. Output projection + All Reduce
+    if self.use_fused_all_gather_matmul:
+        _, dense_out = ttnn.experimental.all_gather_matmul_async(
+            attn_output, self.wo, dim=3, ...
+        )
+    else:
+        dense_out = ttnn.linear(attn_output, self.wo, ...)
+        dense_out = tt_all_reduce(dense_out, ...)
+
+    return dense_out
+```
+
+### 20.3 Prefill Forward 상세
+
+```python
+def forward_prefill(self, x, rot_mats, user_id, page_table, kv_cache):
+    seq_len = x.shape[-2]
+
+    # 1. 긴 시퀀스 리쉐이프 (메모리 제한)
+    if seq_len > self.MAX_QKV_MM_SEQ_LEN:
+        x = ttnn.reshape(x, [1, seq_len // MAX_QKV_MM_SEQ_LEN, MAX_QKV_MM_SEQ_LEN, -1])
+
+    # 2. QKV Matmul (DRAM)
+    xqkv = ttnn.linear(
+        x, self.wqkv,
+        dtype=ttnn.bfloat16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        program_config=self.model_config["XQKV_PREFILL_PROGCFG"](seq_len),
+    )
+
+    # 3. All Reduce
+    xqkv = tt_all_reduce(xqkv, ...)
+
+    # 4. 헤드 분리 (프리필용)
+    q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+        xqkv,
+        num_heads=self.n_local_heads,
+        num_kv_heads=self.n_local_kv_heads,
+        transpose_k_heads=False,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    # 5. RoPE (프리필용)
+    q = ttnn.experimental.rotary_embedding_llama(
+        q, rot_mats[0], rot_mats[1],
+        self.transformation_mats["prefill"],
+        is_decode_mode=False,
+    )
+    k = ttnn.experimental.rotary_embedding_llama(k, ...)
+
+    # 6. KV 캐시 채우기
+    if page_table:
+        ttnn.experimental.paged_fill_cache(keys, k, page_table, batch_idx=user_id)
+        ttnn.experimental.paged_fill_cache(values, v, page_table, batch_idx=user_id)
+    else:
+        ttnn.fill_cache(keys, k, user_id)
+        ttnn.fill_cache(values, v, user_id)
+
+    # 7. SDPA (프리필)
+    attn_output = ttnn.transformer.scaled_dot_product_attention(
+        q, k, v,
+        is_causal=True,
+        scale=self.scale,
+        program_config=self.model_config["SDPA_PROGCFG"](seq_len),
+    )
+
+    # 8. 헤드 결합
+    attn_output = ttnn.experimental.nlp_concat_heads(attn_output, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    # 9. Output projection
+    output = ttnn.linear(attn_output, self.wo, ...)
+
+    # 10. All Reduce (멀티 디바이스)
+    output = tt_all_reduce(output, ...)
+
+    return output
+```
+
+### 20.4 핵심 최적화 연산 정리
+
+| 연산 | Decode | Prefill | 설명 |
+|------|--------|---------|------|
+| QKV 헤드 생성 | `nlp_create_qkv_heads_decode` | `nlp_create_qkv_heads` | 융합 Q/K/V 분리 + 헤드 리쉐이프 |
+| RoPE | `rotary_embedding_llama` | `rotary_embedding_llama` | cos/sin 캐시 + transformation_mat |
+| KV 캐시 | `paged_update_cache` | `paged_fill_cache` / `fill_cache` | 제자리 업데이트 |
+| SDPA | `paged_scaled_dot_product_attention_decode` | `scaled_dot_product_attention` | 디코드용 최적화 |
+| 헤드 결합 | `nlp_concat_heads_decode` | `nlp_concat_heads` | 융합 헤드 결합 |
+
+---
+
+## 21. TT-NN Matmul 설정 상세 (llms.md 기반)
+
+### 21.1 Matmul 종류
+
+1. **Matmul 2D** (`MatmulMultiCoreReuseMultiCastProgramConfig`)
+   - M, N 차원으로 2D 병렬화
+   - 프리필 모드에 적합 (M, N >= 256)
+   - DRAM interleaved 입출력
+
+2. **DRAM-Sharded Matmul**
+   - 디코드 모드에 최적 (작은 활성화, 큰 가중치)
+   - 가중치를 DRAM 뱅크에 샤딩
+   - ~240 GB/s 대역폭 (vs interleaved ~190 GB/s)
+
+3. **Matmul 1D** (`MatmulMultiCoreReuseMultiCast1DProgramConfig`)
+   - N 차원으로만 병렬화
+   - 활성화/출력 L1 width-sharded
+   - 가중치 DRAM interleaved
+
+### 21.2 Program Config 예시
+
+```python
+# Matmul 2D (Prefill)
+PREFILL_PROGCFG = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    compute_with_storage_grid_size=(8, 8),  # 코어 그리드
+    in0_block_w=1,      # K 타일 블록 (높을수록 좋음, L1 제한)
+    out_subblock_h=1,   # M 타일 서브블록
+    out_subblock_w=1,   # N 타일 서브블록 (h*w <= DST 크기)
+    per_core_M=seq_len // 32 // 8,  # 코어당 M 타일
+    per_core_N=hidden_dim // 32 // 8,  # 코어당 N 타일
+    transpose_mcast=False,
+    fused_activation=None,
+    fuse_batch=False,  # DRAM 입력 시 False
+)
+
+# DRAM-Sharded (Decode)
+DECODE_PROGCFG = dram_matmul_config(
+    m=batch_size,
+    k=hidden_dim,
+    n=output_dim,
+    num_cores=core_grid.num_cores,
+)
+```
+
+### 21.3 Memory Config 예시
+
+```python
+# DRAM-Sharded 가중치 메모리 설정
+weights_mem_config = create_dram_sharded_mem_config(k=hidden_dim, n=output_dim)
+
+# L1 Width-Sharded 활성화 메모리 설정
+input_memcfg = ttnn.create_sharded_memory_config(
+    shape=(batch_size, hidden_dim // core_grid.num_cores),
+    core_grid=core_grid,
+    strategy=ttnn.ShardStrategy.WIDTH,
+    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    use_height_and_width_as_shard_shape=True,
+)
+```
+
+### 21.4 Compute Kernel Config
+
+```python
+# HiFi2 (BFP8 가중치용, 권장)
+compute_kernel_hifi2 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,  # 2x 빠름 vs HiFi4
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=True,
+)
+
+# HiFi4 (BF16 가중치용, 정확도 중요 시)
+compute_kernel_hifi4 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,  # 더 정확
+    packer_l1_acc=True,
+)
+
+# LoFi (BFP4 가중치용, 3.6x 빠름)
+compute_kernel_lofi = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.LoFi,
+    math_approx_mode=True,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=True,
+)
+```
+
+---
+
+## 22. 공식 BitNet GPU 커널 상세 (~/BitNet/gpu/)
+
+### 22.1 W2A8 GEMV 최적화
+
+| 최적화 | 설명 |
+|--------|------|
+| **Weight Permutation** | 16×32 블록으로 메모리 접근 패턴 최적화 |
+| **Fast Decoding** | 16개 2-bit 값을 특수 인터리빙으로 32-bit에 패킹 |
+| **dp4a Instruction** | 4개 INT8 값의 dot product 가속 |
+
+### 22.2 인터리빙 패턴
+
+```
+[0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]
+```
+
+이 패턴으로 4개 값을 한 번에 INT8로 추출 가능.
+
+### 22.3 커널 성능 (A100)
+
+| Shape (N×K) | W2A8 (us) | BF16 (us) | Speedup |
+|-------------|-----------|-----------|---------|
+| 2560×2560 | 13.32 | 18.32 | 1.38x |
+| 13824×2560 | 18.75 | 59.51 | **3.17x** |
+| 2560×6912 | 14.49 | 37.78 | **2.61x** |
+
+### 22.4 E2E 생성 성능
+
+| Input | Output | BF16 (ms) | W2A8 (ms) | Speedup |
+|-------|--------|-----------|-----------|---------|
+| 64 | 64 | 683.23 | 221.08 | **3.09x** |
+| 512 | 64 | 709.65 | 231.82 | **3.06x** |
+
+---
+
+## 23. BitNet-TT 최종 성능 목표
+
+### 23.1 단계별 목표
+
+| Phase | Target t/s/u | 핵심 최적화 |
+|-------|--------------|-------------|
+| 현재 | ~7.8 | 기본 구현 |
+| Phase 1 | 15-20 | Trace Capture |
+| Phase 2 | 25-30 | Optimized Decode Ops |
+| Phase 3 | 30+ | Multi-CQ + Memory Sharding |
+
+### 23.2 참조 성능 비교
+
+| 구현 | Hardware | t/s/u | 비고 |
+|------|----------|-------|------|
+| bitnet.cpp | CPU (ARM) | ~50 | 공식 최적화 |
+| BitNet GPU | A100 | ~45 (추정) | W2A8 커널 |
+| Llama 3.1 8B | p150a | 33.1 | TT-Metal 공식 |
+| **BitNet-TT Target** | **p150a** | **30+** | **목표** |
+
+### 23.3 BitNet vs Llama 크기 비교
+
+| Model | Params | Hidden | Layers | Heads | KV Heads |
+|-------|--------|--------|--------|-------|----------|
+| BitNet 2B-4T | 2B | 2560 | 30 | 20 | 5 |
+| Llama 3.1 8B | 8B | 4096 | 32 | 32 | 8 |
+| **Ratio** | **4x 작음** | **1.6x 작음** | 유사 | 유사 | 유사 |
+
+BitNet이 4배 작으므로, 최적화 시 Llama 8B 대비 더 높은 t/s/u 달성 가능.
