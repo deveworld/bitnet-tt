@@ -2135,3 +2135,281 @@ compute_kernel_lofi = ttnn.WormholeComputeKernelConfig(
 | **Ratio** | **4x 작음** | **1.6x 작음** | 유사 | 유사 | 유사 |
 
 BitNet이 4배 작으므로, 최적화 시 Llama 8B 대비 더 높은 t/s/u 달성 가능.
+
+---
+
+## 24. TT-NN LLM 최적화 핵심 패턴 (llms.md 기반)
+
+### 24.1 Prefill vs Decode 메모리 전략
+
+| 모드 | Activation 위치 | Weight 위치 | Bottleneck |
+|------|----------------|-------------|------------|
+| Prefill | DRAM interleaved | DRAM | Compute-bound |
+| Decode | L1 sharded | DRAM sharded | DRAM-bandwidth-bound |
+
+**핵심**: Prefill은 큰 seq_len으로 compute-bound, Decode는 batch 병렬화로 DRAM-bound.
+
+### 24.2 Attention Decode 최적화 흐름
+
+```python
+# 1. QKV Projection (DRAM-sharded matmul)
+xqkv_fused = ttnn.linear(x, wqkv,
+    program_config=DRAM_SHARDED_PROGCFG,
+    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG)
+
+# 2. Split QKV heads (HEIGHT_SHARDED 필수!)
+Q, K, V = ttnn.experimental.nlp_create_qkv_heads_decode(
+    xqkv_fused,
+    num_heads=n_q_heads,
+    num_kv_heads=n_kv_heads,
+    memory_config=ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1
+    )
+)
+
+# 3. RoPE (HEIGHT_SHARDED 입력 필요)
+Q = ttnn.experimental.rotary_embedding_llama(Q, cos, sin, trans_mat)
+K = ttnn.experimental.rotary_embedding_llama(K, cos, sin, trans_mat)
+
+# 4. KV Cache Update (paged)
+ttnn.experimental.paged_update_cache(keys, K,
+    update_idxs_tensor=cur_pos, page_table=page_table)
+
+# 5. SDPA Decode
+attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+    Q, keys, values,
+    cur_pos_tensor=cur_pos,
+    page_table_tensor=page_table,
+    scale=scale)
+
+# 6. Concat heads
+output = ttnn.experimental.nlp_concat_heads_decode(attn_out, num_heads=n_q_heads)
+
+# 7. Output projection
+output = ttnn.linear(output, wo)
+```
+
+### 24.3 DRAM-Sharded Matmul 설정
+
+Decode 모드의 모든 matmul에 사용 (DRAM bandwidth 최적화):
+
+```python
+# Weight memory config
+weights_memory_config = create_dram_sharded_mem_config(k=K, n=N)
+
+# Program config
+pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+    in0_block_w=math.ceil(k / (tile_size * num_cores)),
+    per_core_M=math.ceil(m / tile_size),
+    per_core_N=math.ceil(n / (tile_size * num_cores)),
+    fused_activation=None,
+)
+```
+
+**성능**: Interleaved ~190 GB/s → DRAM-Sharded ~240 GB/s (**26% 향상**)
+
+### 24.4 Matmul 2D (Prefill용)
+
+```python
+pc = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    compute_with_storage_grid_size=(cores_x, cores_y),
+    in0_block_w=1,  # K 차원 분할
+    out_subblock_h=1,
+    out_subblock_w=1,
+    per_core_M=math.ceil(M / 32 / cores_y),
+    per_core_N=math.ceil(N / 32 / cores_x),
+    transpose_mcast=False,
+)
+```
+
+### 24.5 트레이싱 필수 조건
+
+```python
+# ✅ 트레이싱 가능: 정적 shape, cur_pos를 텐서로 전달
+cur_pos_tensor = ttnn.from_torch(...)  # Device tensor
+ttnn.experimental.paged_update_cache(..., update_idxs_tensor=cur_pos_tensor)
+
+# ❌ 트레이싱 불가: 동적 shape, cur_pos를 리스트로 전달
+ttnn.experimental.paged_update_cache(..., update_idxs=cur_pos_list)
+```
+
+### 24.6 LM Head 최적화
+
+vocab_size가 크므로 weight 분할 필요:
+
+```python
+# Prefill: 마지막 토큰만 계산
+if mode == "prefill":
+    x = ttnn.slice(x, (0, 0, last_token, 0), (1, 1, last_token + 32, dim))
+
+# Weight splitting (vocab_size=128256 → 여러 조각)
+for weight_chunk, pc in zip(output_weights, program_configs):
+    out = ttnn.linear(x, weight_chunk, program_config=pc)
+    outputs.append(out)
+output = ttnn.concat(outputs, dim=-1)
+```
+
+---
+
+## 25. tt_transformers Attention 구현 상세
+
+### 25.1 Decode Forward 핵심 코드
+
+```python
+# QKV projection + All-Reduce (multi-device)
+xqkv_fused_sharded = ttnn.linear(x, self.wqkv,
+    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+    program_config=self.model_config["XQKV_DECODE_PROGCFG"])
+
+xqkv_fused = tt_all_reduce(xqkv_fused_sharded, ...)
+
+# Create QKV heads - HEIGHT_SHARDED 메모리 설정 중요!
+Q, K, V = ttnn.experimental.nlp_create_qkv_heads_decode(
+    xqkv_fused,
+    num_heads=self.n_local_heads,
+    num_kv_heads=self.n_local_kv_heads,
+    memory_config=self.model_config["CREATE_QKV_DECODE_SHARD"]  # HEIGHT_SHARDED
+)
+
+# RoPE with transformation matrices
+Q = ttnn.experimental.rotary_embedding_llama(
+    Q, rot_mats[0], rot_mats[1],
+    self.transformation_mats["decode"],
+    is_decode_mode=True)
+```
+
+### 25.2 CREATE_QKV_DECODE_SHARD 설정
+
+**BitNet-TT 현재 문제점**: L1_MEMORY_CONFIG 사용 → HEIGHT_SHARDED 필요
+
+```python
+# 올바른 설정 (tt_transformers 참조)
+CREATE_QKV_DECODE_SHARD = ttnn.MemoryConfig(
+    ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+    ttnn.BufferType.L1
+)
+
+# 잘못된 설정 (BitNet-TT 현재)
+memory_config=ttnn.L1_MEMORY_CONFIG  # ❌ rotary_embedding_llama 실패
+```
+
+### 25.3 Fused All-Gather Matmul
+
+Output projection에서 AllGather와 Matmul을 융합:
+
+```python
+_, dense_out_sharded = ttnn.experimental.all_gather_matmul_async(
+    attn_output_cat,
+    self.wo,
+    dim=3,
+    all_gather_core_grid_offset=(0, 4),
+    num_links=1,
+    memory_config_mm=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+    program_config=all_gather_matmul_progcfg,
+)
+```
+
+---
+
+## 26. 공식 모델 성능 벤치마크 (2025.11)
+
+### 26.1 Blackhole p150 성능
+
+| Model | Batch | ttft (ms) | t/s/u | t/s |
+|-------|-------|-----------|-------|-----|
+| Llama 3.1 8B | 32 | 57 | **33.1** | 1059.2 |
+| Llama 3.1 70B (TP=4) | 32 | 188 | 14.9 | 476.5 |
+| Whisper distil-large-v3 | 1 | 113 | 101.5 | 101.5 |
+
+### 26.2 Wormhole n150 성능
+
+| Model | Batch | ttft (ms) | t/s/u | t/s |
+|-------|-------|-----------|-------|-----|
+| Llama 3.1 8B | 32 | 104 | 26.0 | 832.0 |
+| Llama 3.2 1B | 32 | 23 | 80.5 | 2576.0 |
+| Llama 3.2 3B | 32 | 52 | 46.6 | 1491.2 |
+| Mistral 7B | 32 | 99 | 28.7 | 918.4 |
+
+### 26.3 BitNet-TT 목표 재설정
+
+**Llama 3.2 3B (46.6 t/s/u)를 참조 모델로**:
+- BitNet 2B-4T는 Llama 3.2 3B보다 작음
+- 목표: **50+ t/s/u** (최적화 완료 시)
+
+---
+
+## 27. 메모리 관리 Best Practices
+
+### 27.1 텐서 해제 패턴
+
+```python
+def forward_decode(self, x, ...):
+    xqkv = ttnn.linear(x, self.wqkv, ...)
+    ttnn.deallocate(x)  # 즉시 해제
+
+    Q, K, V = ttnn.experimental.nlp_create_qkv_heads_decode(xqkv, ...)
+    ttnn.deallocate(xqkv)
+
+    Q_rot = ttnn.experimental.rotary_embedding_llama(Q, ...)
+    ttnn.deallocate(Q)  # pre-rot 해제
+
+    # ... 계속
+```
+
+### 27.2 L1 vs DRAM 선택 기준
+
+| 조건 | 메모리 | 이유 |
+|------|--------|------|
+| seq_len > 2048 | DRAM | L1에 안 맞음 |
+| Decode activation | L1 sharded | 빠른 접근 |
+| Weights (항상) | DRAM sharded | 크기가 큼 |
+| KV Cache | DRAM | 긴 시퀀스 지원 |
+
+### 27.3 Sharding 불일치 방지
+
+```python
+# ❌ 피해야 할 패턴: 불필요한 변환
+x = ttnn.sharded_to_interleaved(x_sharded, ...)
+x = ttnn.interleaved_to_sharded(x, ...)
+
+# ✅ 권장: 연속 op에서 동일한 sharding 유지
+output = ttnn.linear(x_sharded, w,
+    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG)
+```
+
+---
+
+## 28. BitNet-TT 수정 우선순위
+
+### 28.1 즉시 수정 필요
+
+1. **HEIGHT_SHARDED 메모리 설정**
+   - 위치: `attention.py:844-849`
+   - 변경: `L1_MEMORY_CONFIG` → `HEIGHT_SHARDED`
+
+2. **Pre-allocated KV Cache GQA 확장**
+   - 현재: `[batch, num_kv_heads, max_seq, head_dim]`
+   - 필요: `[batch, num_heads, max_seq, head_dim]`
+
+### 28.2 성능 최적화 (Phase 1)
+
+1. **트레이싱 활성화**
+   - `cur_pos`를 텐서로 변환
+   - `_capture_decode_trace()` 활성화
+
+2. **DRAM-Sharded Matmul**
+   - 모든 decode matmul에 적용
+   - weight 메모리 설정 변경
+
+### 28.3 고급 최적화 (Phase 2-3)
+
+1. **Fused Projections**
+   - wqkv fused (Q+K+V projection 통합)
+   - w13 fused (gate+up projection 통합)
+
+2. **Multi-CQ 파이프라인**
+   - 입력 전송과 계산 오버랩
+
+3. **BFP8 Weight Quantization**
+   - 메모리 50% 절약, 미미한 정확도 손실
