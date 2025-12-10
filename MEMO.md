@@ -2413,3 +2413,511 @@ output = ttnn.linear(x_sharded, w,
 
 3. **BFP8 Weight Quantization**
    - 메모리 50% 절약, 미미한 정확도 손실
+
+---
+
+## 29. tt_transformers 핵심 API 상세
+
+### 29.1 nlp_create_qkv_heads_decode (Decode용 QKV 분리)
+
+**목적**: Fused QKV 텐서를 Q, K, V heads로 분리 (decode용)
+
+```python
+q_heads_1BQD, k_heads_1BKD, v_heads_1BKD = ttnn.experimental.nlp_create_qkv_heads_decode(
+    xqkv_fused,  # [1, 1, batch, qkv_dim]
+    num_heads=n_local_heads,       # Q heads 수
+    num_kv_heads=n_local_kv_heads, # KV heads 수 (GQA)
+    memory_config=CREATE_QKV_DECODE_SHARD,  # ⚠️ HEIGHT_SHARDED 필수!
+)
+```
+
+**출력 형식**: `1BKD` = `[1, batch, heads, head_dim]`
+
+**⚠️ 중요**: `rotary_embedding_llama`가 HEIGHT_SHARDED 입력을 요구하므로 `memory_config`는 반드시 HEIGHT_SHARDED이어야 함.
+
+### 29.2 nlp_create_qkv_heads (Prefill용 QKV 분리)
+
+```python
+q_heads_1QSD, k_heads_1KSD, v_heads_1VSD = ttnn.experimental.nlp_create_qkv_heads(
+    xqkv_fused,  # [1, 1, seq_len, qkv_dim]
+    num_heads=n_local_heads,
+    num_kv_heads=n_local_kv_heads,
+    transpose_k_heads=False,  # K 전치 여부
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,  # Prefill은 DRAM 사용
+)
+```
+
+**출력 형식**: `1QSD` = `[1, num_heads, seq_len, head_dim]`
+
+### 29.3 rotary_embedding_llama (RoPE 적용)
+
+```python
+q_rotated = ttnn.experimental.rotary_embedding_llama(
+    q_heads_pre_rot,      # HEIGHT_SHARDED 텐서
+    rot_cos,              # cos 행렬 [1, 1, max_seq, head_dim]
+    rot_sin,              # sin 행렬 [1, 1, max_seq, head_dim]
+    transformation_mat,   # decode 또는 prefill용
+    is_decode_mode=True,  # True: decode, False: prefill
+)
+```
+
+**⚠️ 핵심 요구사항**:
+- `TT_FATAL: Sharded inputs for RoPE must be HEIGHT_SHARDED`
+- 입력 텐서가 HEIGHT_SHARDED가 아니면 에러 발생
+
+### 29.4 paged_update_cache (Decode KV 캐시 업데이트)
+
+```python
+ttnn.experimental.paged_update_cache(
+    cache_tensor,         # [max_blocks, kv_heads, block_size, head_dim] 또는 [batch, kv_heads, max_seq, head_dim]
+    new_kv_tensor,        # [1, batch, kv_heads, head_dim] - 1BKD 형식!
+    update_idxs_tensor=current_pos,  # 위치 텐서
+    page_table=page_table,           # 페이지 테이블 (옵션)
+)
+```
+
+**⚠️ 핵심 요구사항**:
+- `TT_FATAL: Expect input_tensor to be sharded`
+- `new_kv_tensor`가 반드시 **HEIGHT_SHARDED**이어야 함
+- Interleaved 텐서를 전달하면 에러 발생
+
+**1BKD 형식 변환**:
+```python
+# BKSD [batch, heads, seq=1, dim] → 1BKD [1, batch, heads, dim]
+k_heads_1BKD = ttnn.permute(k_heads_BKSD, (2, 0, 1, 3))  # 이것만으론 부족!
+k_heads_1BKD = ttnn.to_memory_config(k_heads_1BKD, HEIGHT_SHARDED_CONFIG)  # sharding 필수
+```
+
+### 29.5 paged_fill_cache (Prefill KV 캐시 채우기)
+
+```python
+ttnn.experimental.paged_fill_cache(
+    cache_tensor,         # [max_blocks, kv_heads, block_size, head_dim]
+    kv_tensor,            # [1, kv_heads, seq_len, head_dim]
+    page_table,           # 페이지 테이블
+    batch_idx=user_id,    # 사용자 ID
+)
+```
+
+### 29.6 scaled_dot_product_attention_decode
+
+```python
+attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
+    q_heads,              # [1, batch, n_heads, head_dim]
+    keys_cache,           # [batch, kv_heads, max_seq, head_dim]
+    values_cache,         # [batch, kv_heads, max_seq, head_dim]
+    cur_pos_tensor=current_pos,
+    scale=1.0 / math.sqrt(head_dim),
+    program_config=sdpa_decode_progcfg,
+    compute_kernel_config=compute_cfg,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+)
+```
+
+### 29.7 nlp_concat_heads_decode
+
+```python
+attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
+    attn_output_1G4D,     # [1, 1, batch, n_heads * head_dim]
+    num_heads=n_local_heads,
+)
+```
+
+---
+
+## 30. HEIGHT_SHARDED 메모리 설정
+
+### 30.1 CREATE_QKV_DECODE_SHARD 정의 (tt_transformers 방식)
+
+```python
+# Blackhole용
+CREATE_QKV_DECODE_SHARD = ttnn.create_sharded_memory_config(
+    shape=(ttnn.TILE_SIZE, head_dim),  # (32, 128) for head_dim=128
+    core_grid=ttnn.CoreGrid(y=4, x=8),  # 32 cores
+    strategy=ttnn.ShardStrategy.HEIGHT,
+    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    use_height_and_width_as_shard_shape=True,
+)
+
+# Wormhole용
+CREATE_QKV_DECODE_SHARD = ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+```
+
+### 30.2 Interleaved → Sharded 변환
+
+```python
+# ❌ 잘못된 방법: permute 후 바로 사용
+k_heads = ttnn.permute(k_heads_pre, (2, 0, 1, 3))  # 여전히 interleaved
+
+# ✅ 올바른 방법: memory config 변환 필요
+k_heads_sharded = ttnn.to_memory_config(
+    k_heads,
+    memory_config=CREATE_QKV_DECODE_SHARD,  # HEIGHT_SHARDED로 변환
+)
+```
+
+### 30.3 batch 크기에 따른 동적 설정
+
+```python
+def get_scores_memcfg(batch_size, n_heads, head_dim):
+    return ttnn.create_sharded_memory_config(
+        shape=(math.ceil(n_heads / 32) * 32, head_dim),
+        core_grid=ttnn.CoreRangeSet({num_to_corerange(batch_size)}),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+```
+
+---
+
+## 31. DRAM-Sharded Matmul 설정
+
+### 31.1 DRAM Sharded 메모리 설정 생성
+
+```python
+def create_dram_sharded_mem_config(k_dim, n_dim):
+    """DRAM에서 weight를 12개 bank에 분산"""
+    # 12는 DRAM bank 수
+    shard_spec = ttnn.ShardSpec(
+        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(11, 0))}),
+        [k_dim, n_dim // 12],  # 각 bank당 shard 크기
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    return ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.DRAM,
+        shard_spec,
+    )
+```
+
+### 31.2 DRAM-Sharded Matmul Program Config
+
+```python
+def dram_matmul_config(m, k, n, num_cores):
+    """DRAM-sharded weight와의 matmul 설정"""
+    return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=k // 32 // num_cores,  # K를 core 수로 나눔
+        per_core_M=m // 32,
+        per_core_N=n // 32 // num_cores,
+        fused_activation=None,
+    )
+```
+
+### 31.3 사용 예시 (attention QKV)
+
+```python
+# Weight 메모리 설정
+wqkv_mem_config = create_dram_sharded_mem_config(dim, qkv_size // num_devices)
+
+# Weight 로드
+self.wqkv = ttnn.as_tensor(
+    qkv_weight,
+    dtype=ttnn.bfloat8_b,
+    layout=ttnn.TILE_LAYOUT,
+    device=device,
+    memory_config=wqkv_mem_config,  # DRAM-sharded
+)
+
+# Matmul 실행
+xqkv = ttnn.linear(
+    x,  # [1, 1, batch, dim]
+    self.wqkv,
+    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,  # 출력은 L1 sharded
+    program_config=dram_matmul_config(batch, dim, qkv_size, num_cores),
+    compute_kernel_config=hifi2_config,
+)
+```
+
+---
+
+## 32. Trace Capture 패턴 (tt_transformers 방식)
+
+### 32.1 기본 Trace 캡처
+
+```python
+class Generator:
+    def __init__(self, ...):
+        self.trace_id = None
+        self.trace_inputs = None
+        self.trace_output = None
+
+    def _capture_decode_trace(self, input_tokens, current_pos, kv_cache):
+        # 1. 먼저 한 번 실행하여 컴파일
+        host_inputs = self.prepare_inputs(input_tokens, current_pos)
+        device_inputs = copy_host_to_device(host_inputs, self.device)
+        output = self.model.forward_decode(*device_inputs, kv_cache=kv_cache)
+        ttnn.synchronize_device(self.device)
+
+        # 2. Trace 캡처 시작
+        device_inputs = copy_host_to_device(host_inputs, self.device)
+        trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
+
+        output = self.model.forward_decode(*device_inputs, kv_cache=kv_cache)
+
+        ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
+        ttnn.synchronize_device(self.device)
+
+        return trace_id, output, device_inputs
+```
+
+### 32.2 Trace 실행
+
+```python
+def _execute_decode_trace(self, input_tokens, current_pos):
+    # Host에서 새 입력 준비
+    host_inputs = self.prepare_inputs(input_tokens, current_pos)
+
+    # Device 텐서에 새 값 복사 (메모리 주소 유지!)
+    copy_host_to_device(
+        host_inputs,
+        device_tensors=self.trace_inputs,  # 기존 디바이스 텐서 재사용
+        mesh_device=self.device,
+    )
+
+    # Trace 실행 (blocking=False로 비동기)
+    ttnn.execute_trace(self.device, self.trace_id, cq_id=0, blocking=False)
+
+    return self.trace_output  # 미리 캡처된 출력 텐서
+```
+
+### 32.3 copy_host_to_device 패턴
+
+```python
+def copy_host_to_device(host_tensors, device_tensors=None, mesh_device=None):
+    """Host 텐서를 device로 복사. device_tensors 제공 시 기존 메모리에 덮어씀"""
+    if device_tensors is None:
+        # 새 device 텐서 생성
+        return tuple(
+            ttnn.from_torch(t, device=mesh_device, ...)
+            for t in host_tensors
+        )
+    else:
+        # 기존 device 텐서에 복사 (trace용 - 메모리 주소 유지)
+        for host_t, device_t in zip(host_tensors, device_tensors):
+            ttnn.copy_host_to_device_tensor(host_t, device_t)
+        return device_tensors
+```
+
+### 32.4 Prefill Trace 지원
+
+```python
+def _easy_trace_prefill(self, prefill_ids, page_table, kv_cache, prefill_seq_len, model_id):
+    trace_key = f"{prefill_seq_len}_{model_id}"
+
+    if self.trace_id_prefill[trace_key] is None:
+        # 첫 호출: trace 캡처
+        trace_id, output, *inputs = self._capture_trace_prefill(
+            prefill_ids, page_table, kv_cache, model_id
+        )
+        self.trace_id_prefill[trace_key] = trace_id
+        self.trace_inputs_prefill[trace_key] = inputs
+        self.trace_output_prefill[trace_key] = output
+
+    # Trace 실행
+    return self._prefill_forward_trace(
+        self.trace_id_prefill[trace_key],
+        self.trace_inputs_prefill[trace_key],
+        self.trace_output_prefill[trace_key],
+        prefill_ids,
+        page_table,
+        model_id,
+    )
+```
+
+---
+
+## 33. Compute Kernel Configuration
+
+### 33.1 Math Fidelity 설정
+
+```python
+# HiFi4: 최고 정확도 (BF16)
+compute_kernel_hifi4 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=True,
+)
+
+# HiFi2: 빠른 연산 (BFP8)
+compute_kernel_hifi2 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=False,
+)
+
+# LoFi: 최고 속도 (BFP4)
+compute_kernel_lofi = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.LoFi,
+    math_approx_mode=True,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=False,
+)
+```
+
+### 33.2 모델별 권장 설정
+
+| 연산 | 권장 Fidelity | dtype | 이유 |
+|------|---------------|-------|------|
+| QKV Decode | HiFi2 | BFP8 | DRAM-bound, 정확도 덜 민감 |
+| SDPA Decode | HiFi2 | BFP8 | 속도 최적화 |
+| QKV Prefill | HiFi4 | BF16 | 정확도 중요 |
+| SDPA Prefill | HiFi4 | BF16 | 정확도 중요 |
+| MLP FF1/FF3 | LoFi | BFP4 | 속도 최우선 |
+| MLP FF2 | HiFi2 | BFP8 | 균형 |
+
+---
+
+## 34. BitNet-TT 최적화 적용 가이드
+
+### 34.1 현재 문제점 요약
+
+| 문제 | 파일:라인 | 원인 | 해결책 |
+|------|-----------|------|--------|
+| rotary_embedding 실패 | attention.py | nlp_create_qkv_heads_decode가 L1_MEMORY_CONFIG 사용 | HEIGHT_SHARDED 메모리 설정 |
+| paged_update_cache 실패 | attention.py | interleaved 입력 전달 | to_memory_config로 sharded 변환 |
+| Trace 비활성화 | generator.py | 현재 구현 미완성 | tt_transformers 패턴 적용 |
+
+### 34.2 수정 순서
+
+**1단계: HEIGHT_SHARDED 설정 추가**
+
+```python
+# config.py에 추가
+def get_create_qkv_decode_shard(head_dim=128, batch_size=32):
+    return ttnn.create_sharded_memory_config(
+        shape=(32, head_dim),  # TILE_SIZE, head_dim
+        core_grid=ttnn.CoreGrid(y=4, x=8),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+```
+
+**2단계: nlp_create_qkv_heads_decode 수정**
+
+```python
+# attention.py의 _forward_decode_optimized 수정
+Q, K, V = ttnn.experimental.nlp_create_qkv_heads_decode(
+    xqkv,
+    num_heads=self.num_heads,
+    num_kv_heads=self.num_kv_heads,
+    memory_config=self.create_qkv_decode_shard,  # ✅ HEIGHT_SHARDED
+)
+```
+
+**3단계: paged_update_cache 입력 변환**
+
+```python
+# K, V를 sharded로 변환 후 캐시 업데이트
+k_sharded = ttnn.to_memory_config(k_heads, self.create_qkv_decode_shard)
+ttnn.experimental.paged_update_cache(
+    self.key_cache,
+    k_sharded,
+    update_idxs_tensor=current_pos,
+    page_table=page_table,
+)
+```
+
+**4단계: Trace 캡처 활성화**
+
+```python
+# generator.py
+def _generate_tokens(self, ...):
+    if self.enable_trace and self._trace_id is None:
+        # 첫 토큰: trace 캡처
+        self._trace_id, self._trace_output, self._trace_inputs = \
+            self._capture_decode_trace(token, pos, kv_cache)
+
+    if self._trace_id:
+        # trace 실행
+        logits = self._execute_decode_trace(token, pos)
+    else:
+        # 일반 실행
+        logits = self.decode_forward(token, pos, kv_cache)
+```
+
+### 34.3 검증 순서
+
+1. `python main.py --test` - 기본 동작 확인
+2. `python main.py --full` - 전체 모델 추론 (optimized path 테스트)
+3. `python main.py --chat` - 연속 생성 (trace 동작 확인)
+
+### 34.4 예상 성능 향상
+
+| 최적화 | 현재 | 적용 후 | 향상 |
+|--------|------|---------|------|
+| HEIGHT_SHARDED | 8.68 t/s | 9-10 t/s | ~15% |
+| + Trace | - | 18-26 t/s | 2-3x |
+| + DRAM-Sharded | - | 25-35 t/s | +20% |
+| 최종 목표 | - | 50+ t/s | 5-6x |
+
+---
+
+## 35. ttnn 핵심 함수 빠른 참조
+
+### 35.1 메모리 설정 함수
+
+```python
+# Interleaved (기본)
+ttnn.DRAM_MEMORY_CONFIG
+ttnn.L1_MEMORY_CONFIG
+
+# Sharded
+ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+
+# 커스텀 sharded
+ttnn.create_sharded_memory_config(
+    shape=(height, width),
+    core_grid=ttnn.CoreGrid(y=rows, x=cols),
+    strategy=ttnn.ShardStrategy.HEIGHT,  # or WIDTH, BLOCK
+    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    use_height_and_width_as_shard_shape=True,
+)
+```
+
+### 35.2 메모리 변환
+
+```python
+# Layout 변환
+ttnn.to_layout(tensor, ttnn.TILE_LAYOUT)
+ttnn.to_layout(tensor, ttnn.ROW_MAJOR_LAYOUT)
+
+# Memory config 변환
+ttnn.to_memory_config(tensor, new_memory_config)
+
+# Sharding 변환
+ttnn.interleaved_to_sharded(tensor, sharded_memory_config)
+ttnn.sharded_to_interleaved(tensor, interleaved_memory_config)
+```
+
+### 35.3 Trace 관련
+
+```python
+# 캡처
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+# ... 연산들 ...
+ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 실행
+ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+
+# 해제
+ttnn.release_trace(device, trace_id)
+```
+
+### 35.4 텐서 관리
+
+```python
+# 해제 (L1 메모리 확보)
+ttnn.deallocate(tensor)
+
+# 동기화
+ttnn.synchronize_device(device)
+
+# 복사
+ttnn.copy_host_to_device_tensor(host_tensor, device_tensor)
+```
