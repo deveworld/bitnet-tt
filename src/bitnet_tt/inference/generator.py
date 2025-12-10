@@ -302,19 +302,15 @@ class TextGenerator:
         input_tensor = numpy_int_to_ttnn(token, self.device)
 
         # Auto-detect whether to use optimized path based on cache state
-        # NOTE: Optimized path with rotary_embedding_llama requires HEIGHT_SHARDED inputs
-        # which is not yet properly configured. Using basic decode path for now.
+        # Optimized path uses rotary_embedding_llama which requires HEIGHT_SHARDED
         if use_optimized is None:
-            # Disable optimized path until HEIGHT_SHARDED memory config is fixed
-            use_optimized = False
-            # Original logic (requires HEIGHT_SHARDED fix):
-            # use_optimized = (
-            #     kv_cache is not None
-            #     and len(kv_cache) > 0
-            #     and kv_cache[0] is not None
-            #     and hasattr(kv_cache[0], '_preallocated')
-            #     and kv_cache[0]._preallocated
-            # )
+            use_optimized = (
+                kv_cache is not None
+                and len(kv_cache) > 0
+                and kv_cache[0] is not None
+                and hasattr(kv_cache[0], '_preallocated')
+                and kv_cache[0]._preallocated
+            )
 
         # Get rot_mats for optimized decode path
         rot_mats = None
@@ -479,10 +475,8 @@ class TextGenerator:
         # Reset trace for new generation
         self.reset_trace()
 
-        # Phase 1: Prefill - process all prompt tokens
-        # Note: Pre-allocated cache with in-place update requires ttnn APIs
-        # not available in current version. Using dynamic allocation for now.
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        # Phase 1: Prefill - process all prompt tokens with pre-allocated cache
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=True)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -654,9 +648,9 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill - using dynamic allocation (in-place update not available)
+        # Phase 1: Prefill with pre-allocated cache
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=True)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
