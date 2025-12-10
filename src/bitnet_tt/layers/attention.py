@@ -971,9 +971,14 @@ class MultiHeadAttention:
             xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=self.create_qkv_decode_shard,  # HEIGHT_SHARDED for Blackhole
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # Output to L1 first
         )
         ttnn.deallocate(xqkv_fused_4d)
+
+        # Convert to HEIGHT_SHARDED for rotary_embedding_llama
+        q_heads_1bqd = ttnn.to_memory_config(q_heads_1bqd, self.create_qkv_decode_shard)
+        k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, self.create_qkv_decode_shard)
+        v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, self.create_qkv_decode_shard)
 
         # 2. Apply RoPE using fused rotary_embedding_llama
         q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
