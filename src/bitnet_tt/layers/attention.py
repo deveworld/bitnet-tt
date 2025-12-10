@@ -498,14 +498,6 @@ class MultiHeadAttention:
         self.qkv_fused_weight: ttnn.Tensor | None = None
         self._qkv_dim = (num_attention_heads + 2 * num_key_value_heads) * self.head_dim
 
-        # Compute kernel config for fused QKV matmul (HiFi2 for faster matmul)
-        self._qkv_compute_kernel_config = None
-        try:
-            from bitnet_tt.config import get_compute_kernel_config
-            self._qkv_compute_kernel_config = get_compute_kernel_config("hifi2")
-        except Exception:
-            pass
-
         # Sub-norm applied after attention, before o_proj (BitNet-specific)
         self.attn_sub_norm = RMSNorm(hidden_size, device, eps)
 
@@ -625,46 +617,10 @@ class MultiHeadAttention:
                 current_pos_tensor=current_pos_tensor,
             )
 
-        # Optimized path: use fused QKV projection (1 matmul instead of 3)
-        if self.qkv_fused_weight is not None:
-            # Fused QKV projection: [batch, seq, hidden] -> [batch, seq, qkv_dim]
-            if self._qkv_compute_kernel_config is not None:
-                xqkv = ttnn.matmul(
-                    hidden_states,
-                    self.qkv_fused_weight,
-                    compute_kernel_config=self._qkv_compute_kernel_config,
-                )
-            else:
-                xqkv = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-
-            # Split QKV: qkv_dim = (num_heads + 2*num_kv_heads) * head_dim
-            # Q: [0, num_heads * head_dim)
-            # K: [num_heads * head_dim, (num_heads + num_kv_heads) * head_dim)
-            # V: [(num_heads + num_kv_heads) * head_dim, qkv_dim)
-            q_dim = self.num_heads * self.head_dim
-            k_dim = self.num_kv_heads * self.head_dim
-
-            # Use ttnn.slice to separate Q, K, V
-            # Shape: [batch, seq, qkv_dim] or [1, 1, seq, qkv_dim]
-            shape = xqkv.shape
-            ndim = len(shape)
-            if ndim == 4:
-                # [1, 1, seq, qkv_dim]
-                query = ttnn.slice(xqkv, slice_start=[0, 0, 0, 0], slice_end=[shape[0], shape[1], shape[2], q_dim])
-                key = ttnn.slice(xqkv, slice_start=[0, 0, 0, q_dim], slice_end=[shape[0], shape[1], shape[2], q_dim + k_dim])
-                value = ttnn.slice(xqkv, slice_start=[0, 0, 0, q_dim + k_dim], slice_end=[shape[0], shape[1], shape[2], self._qkv_dim])
-            else:
-                # [batch, seq, qkv_dim] - 3D
-                query = ttnn.slice(xqkv, slice_start=[0, 0, 0], slice_end=[shape[0], shape[1], q_dim])
-                key = ttnn.slice(xqkv, slice_start=[0, 0, q_dim], slice_end=[shape[0], shape[1], q_dim + k_dim])
-                value = ttnn.slice(xqkv, slice_start=[0, 0, q_dim + k_dim], slice_end=[shape[0], shape[1], self._qkv_dim])
-
-            ttnn.deallocate(xqkv)
-        else:
-            # Fallback: separate QKV projections
-            query = self.q_proj(hidden_states)
-            key = self.k_proj(hidden_states)
-            value = self.v_proj(hidden_states)
+        # Standard path: separate QKV projections
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
 
         # Use BKSD format for both prefill and decode
         # Note: 1BKD format + paged ops requires sharding, SDPA decode requires seq%32==0

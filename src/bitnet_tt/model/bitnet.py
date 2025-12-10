@@ -81,14 +81,6 @@ class BitNetModel:
         # Language model head weight (will be loaded)
         self.lm_head_weight: ttnn.Tensor | None = None
 
-        # Compute kernel config for LM head (HiFi2 for faster matmul)
-        self._lm_head_compute_config = None
-        try:
-            from bitnet_tt.config import get_compute_kernel_config
-            self._lm_head_compute_config = get_compute_kernel_config("hifi2")
-        except Exception:
-            pass
-
     def load_embedding_weights(self, weight: NDArray[np.floating]) -> None:
         """
         Load embedding weights.
@@ -218,41 +210,7 @@ class BitNetModel:
         if self.lm_head_weight is None:
             raise RuntimeError("LM head weights not loaded.")
 
-        # LM Head optimization for prefill: only compute logits for last token
-        # vocab_size=128256 is large, so this saves significant compute
-        if mode == "prefill":
-            # Get sequence length from hidden_states shape
-            # hidden_states can be [batch, seq_len, hidden_size] (3D) or [1, 1, seq_len, hidden_size] (4D)
-            shape = hidden_states.shape
-            ndim = len(shape)
-            if ndim == 3:
-                # Shape: [batch, seq_len, hidden_size]
-                seq_len = shape[1]
-                if seq_len > 1:
-                    hidden_states = ttnn.slice(
-                        hidden_states,
-                        slice_start=[0, seq_len - 1, 0],
-                        slice_end=[shape[0], seq_len, shape[2]],
-                    )
-            elif ndim == 4:
-                # Shape: [1, 1, seq_len, hidden_size]
-                seq_len = shape[2]
-                if seq_len > 1:
-                    hidden_states = ttnn.slice(
-                        hidden_states,
-                        slice_start=[0, 0, seq_len - 1, 0],
-                        slice_end=[shape[0], shape[1], seq_len, shape[3]],
-                    )
-
-        # Apply LM head with optimized compute kernel
-        if self._lm_head_compute_config is not None:
-            logits = ttnn.matmul(
-                hidden_states,
-                self.lm_head_weight,
-                compute_kernel_config=self._lm_head_compute_config,
-            )
-        else:
-            logits = ttnn.matmul(hidden_states, self.lm_head_weight)
+        logits = ttnn.matmul(hidden_states, self.lm_head_weight)
 
         return logits, updated_caches if use_cache else None
 
