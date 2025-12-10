@@ -157,6 +157,8 @@ class KVCache:
             self.key_cache = key_expanded
             self.value_cache = value_expanded
         else:
+            # Debug: print shapes before concat
+            print(f"[DEBUG] key_cache.shape: {self.key_cache.shape}, key_expanded.shape: {key_expanded.shape}")
             new_key = ttnn.concat([self.key_cache, key_expanded], dim=2)
             new_value = ttnn.concat([self.value_cache, value_expanded], dim=2)
             ttnn.deallocate(self.key_cache)
