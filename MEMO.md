@@ -145,4 +145,321 @@
 
 ---
 
+## 11. 커스텀 커널 개발 참고사항
+
+### 11.1 Blackhole p150a 하드웨어 특성
+
+| 항목 | Wormhole N150 | Blackhole p150a |
+|------|---------------|-----------------|
+| Tensix 코어 | 8x10 (8x8 compute) | 14x10 (**13x10 compute = 130 cores**) |
+| L1 (per core) | 1464 KB | 1464 KB + **Data Cache** (4×16B) |
+| DRAM | 12 banks × 1GB | **8 banks × ~4GB = ~32GB** |
+| NoC Alignment | R:32B, W:16B | R:**64B**, W:16B |
+| Multicast | Rectangular | Rectangular + **Strided + L-shaped** |
+
+**L1 Data Cache (BH only)**:
+```cpp
+// 커널에서 활성화/비활성화
+set_l1_data_cache<true>();   // 활성화
+invalidate_l1_cache();       // 명시적 무효화 (권장)
+set_l1_data_cache<false>();  // 커널 종료 전 비활성화
+```
+
+### 11.2 TT-Metal 커널 구조
+
+```
+Program (하나의 Op)
+├── Reader Kernel (RISC0) - DRAM/L1에서 데이터 읽기
+├── Writer Kernel (RISC1) - L1/DRAM에 데이터 쓰기
+└── Compute Kernel (RISC2,3,4) - Tile 기반 연산
+
+각 Tensix 코어에서 병렬 실행, Circular Buffer로 동기화
+```
+
+**Circular Buffer & Double Buffering**:
+```cpp
+// Reader: 데이터 읽고 CB에 push
+cb_reserve_back(cb_id, num_tiles);
+// ... noc_async_read ...
+noc_async_read_barrier();
+cb_push_back(cb_id, num_tiles);
+
+// Compute: CB에서 pop하고 연산
+cb_wait_front(cb_id, num_tiles);
+// ... compute ...
+cb_pop_front(cb_id, num_tiles);
+```
+
+### 11.3 BitNet INT8×INT2 커널 패턴 (공식 GPU 구현)
+
+**핵심 연산**:
+```
+Output = (INT8_activation × INT2_weight) × scale_activation × scale_weight
+```
+
+**Weight Packing (2-bit → INT8)**:
+```python
+# 4개 2-bit 값을 1개 int8에 저장
+# weight: [-1, 0, 1] → [1, 2, 3] (offset by 2)
+# 압축: N×K → N×(K/4)
+packed = w0 | (w1 << 2) | (w2 << 4) | (w3 << 6)
+```
+
+**GPU 커널 구조** (ladder_int8xint2_kernel):
+```cpp
+// 1. Weight decode: INT2 → INT8 (per thread)
+decode_i2s_to_i8s(B_reshape_local, B_decode_local, 16);
+// LUT 기반 변환: {1,2,3} → {-1,0,1}
+
+// 2. Dot product accumulation
+for (int k = 0; k < 4; k++) {
+    acc = __dp4a(A_local[k*4], B_decode_local[k*4], acc);
+}
+
+// 3. Warp reduction
+for (int offset = K_block/2; offset > 0; offset /= 2) {
+    acc += __shfl_down_sync(mask, acc, offset);
+}
+
+// 4. Scale and output
+output[idx] = (bf16)((float)acc / scale_act * scale_weight);
+```
+
+### 11.4 TT-Metal 최적화 기법
+
+**DRAM-Sharded Matmul** (decode용, ~26% 대역폭 향상):
+```python
+# Weight를 DRAM bank에 sharding
+memory_config = create_dram_sharded_mem_config(k=K, n=N)
+program_config = dram_matmul_config(m=M, k=K, n=N, num_cores=cores)
+
+output = ttnn.linear(
+    activation, weights,
+    compute_kernel_config=kernel_hifi2,
+    program_config=program_config,
+    memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+)
+```
+
+**Math Fidelity**:
+| Fidelity | Precision | Speed | 용도 |
+|----------|-----------|-------|------|
+| HiFi4 | BF16 | 1x | Prefill, 정확도 중요 |
+| HiFi2 | BFP8 | **2x** | Decode 기본 |
+| LoFi | BFP4 | **3.6x** | MLP (정확도 허용 시) |
+
+### 11.5 FlashDecode 패턴 (SDPA Decode)
+
+```python
+# Query shape 변환: heads를 y dimension에 배치
+# [bsz, num_q_heads, 1, head_dim] → [1, bsz, num_q_heads, head_dim]
+query = query.view(1, bsz, num_q_heads, head_dim)
+
+# bsz * n_kv_heads를 코어에 분산
+# n_qh_per_kvh (= num_q_heads // num_kv_heads)는 코어 내에서 처리
+attn_out = ttnn.transformer.scaled_dot_product_attention_decode(
+    query, keys, values,
+    cur_pos_tensor=current_pos,  # causal masking (explicit mask 불필요)
+)
+```
+
+**성능**: Wormhole에서 최대 180 GB/s 메모리 대역폭 (DRAM 288 GB/s의 ~70%)
+
+### 11.6 BitNet-TT 커스텀 커널 설계 방향
+
+**문제**: `num_heads=20`이 HEIGHT_SHARDED (32 cores) 요구사항과 불일치
+
+**해결 방안**:
+
+1. **Ternary Matmul 커널** (INT8×TERNARY):
+   - Weight를 2-bit packed로 저장 (메모리 8x 절감: FP32 → 2bit)
+   - Activation은 INT8 quantized
+   - DRAM bandwidth 병목 완화
+
+2. **커스텀 QKV Heads Decode**:
+   - `num_heads=20`에 맞는 shard geometry
+   - CoreGrid: 20 cores (4x5 or 5x4) 또는 padding하여 32 사용
+
+3. **Fused Ops**:
+   - QKV projection + split heads 융합
+   - RMSNorm + Linear 융합 (sub_norm 패턴)
+
+### 11.7 Trace Capture 패턴 (2-3x 속도 향상)
+
+```python
+# 1. Compile run (첫 실행)
+output = model_forward(input_tensor, pos_tensor)
+
+# 2. Trace capture
+ttnn.synchronize_device(device)
+trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+output = model_forward(input_tensor, pos_tensor)  # 같은 shape
+trace_id = ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+# 3. Execute trace (반복)
+ttnn.copy_host_to_device_tensor(new_input_host, input_tensor)
+ttnn.copy_host_to_device_tensor(new_pos_host, pos_tensor)
+ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+```
+
+**제약사항**:
+- Trace 중 텐서 할당/해제 불가 → **in-place KV cache 필수**
+- 동일 shape만 가능 → decode에만 적용 (prefill 불가)
+
+### 11.8 참고 자료 경로
+
+| 자료 | 경로 |
+|------|------|
+| LLM 최적화 가이드 | `~/tt-metal/tech_reports/LLMs/llms.md` |
+| FlashDecode | `~/tt-metal/tech_reports/FlashAttention/FlashDecode.md` |
+| FlashAttention | `~/tt-metal/tech_reports/FlashAttention/FlashAttention.md` |
+| Blackhole 가이드 | `~/tt-metal/tech_reports/Blackhole/BlackholeBringUpProgrammingGuide.md` |
+| BitNet GPU 커널 | `~/BitNet/gpu/bitnet_kernels/` |
+| tt_transformers | `~/tt-metal/models/tt_transformers/` |
+| SDPA Decode 소스 | `~/tt-metal/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/` |
+
+---
+
+## 12. 커스텀 커널 개발 계획
+
+### 12.1 현황 분석
+
+| 항목 | 현재 | 목표 | 병목 |
+|------|------|------|------|
+| 속도 | 8.5 t/s | **30+ t/s** | DRAM bandwidth, kernel dispatch |
+| 최적화 경로 | `_forward_simple` (concat) | Trace + In-place | concat이 trace 차단 |
+| HEIGHT_SHARDED | ❌ (num_heads=20) | 커스텀 geometry | 32-core 가정 |
+| Weight format | BF16 (fp16) | **2-bit packed** | 메모리 대역폭 |
+
+### 12.2 개발 우선순위
+
+#### Phase 1: In-place KV Cache (Trace 활성화) - **가장 효과적**
+**목표**: concat → index 기반 업데이트로 Trace 활성화 (2-3x 속도 향상)
+
+**변경 사항**:
+```python
+# 현재 (concat 기반 - Trace 불가)
+new_key = ttnn.concat([self.key_cache, key], dim=2)  # 새 메모리 할당
+
+# 목표 (index 기반 - Trace 가능)
+# Pre-allocated cache에 직접 write
+ttnn.fill_cache(self.key_cache, key, update_idx=current_pos)
+```
+
+**구현 방법**:
+1. `paged_update_cache` 대신 간단한 `fill_cache` 사용 (HEIGHT_SHARDED 불필요)
+2. KVCache를 max_seq_len 크기로 pre-allocate
+3. `current_pos` tensor로 write 위치 지정
+
+**예상 효과**: **8.5 → 17-25 t/s** (2-3x)
+
+#### Phase 2: Ternary Matmul 커널 - **메모리 대역폭 개선**
+**목표**: 2-bit weight matmul로 DRAM 읽기 8x 감소
+
+**핵심 아이디어**:
+```
+현재: BF16 weight (16 bit/param) → DRAM read = 2.4B params × 2 bytes = 4.8 GB
+목표: 2-bit weight (2 bit/param) → DRAM read = 2.4B params × 0.25 bytes = 0.6 GB
+```
+
+**TT-Metal 커널 구조**:
+```
+ttnn/cpp/ttnn/operations/matmul/ternary_matmul/
+├── ternary_matmul.hpp/.cpp          # Python API binding
+├── device/
+│   ├── ternary_matmul_device_op.hpp/.cpp
+│   ├── ternary_matmul_program_factory.hpp/.cpp
+│   └── kernels/
+│       ├── dataflow/reader_ternary.cpp  # 2-bit unpack
+│       ├── dataflow/writer_ternary.cpp
+│       └── compute/ternary_matmul.cpp   # INT8 × {-1,0,1}
+```
+
+**연산 흐름**:
+1. Reader: DRAM에서 packed 2-bit weight 읽기
+2. Reader: 4개 2-bit → 4개 INT8 unpack (lookup table)
+3. Compute: INT8 activation × INT8 weight (ternary) accumulate
+4. Compute: Scale 적용 (activation_scale × weight_scale)
+5. Writer: BF16 output 쓰기
+
+**예상 효과**: decode matmul 50-70% 속도 향상
+
+#### Phase 3: 커스텀 QKV Decode (num_heads=20 지원)
+**목표**: HEIGHT_SHARDED 최적화 경로 활성화
+
+**방법 A: Padding (간단)**
+```python
+# num_heads=20 → 32 (12 dummy heads 추가)
+# CoreGrid(y=4, x=8) = 32 cores
+padded_heads = 32
+# padding overhead: 32/20 = 1.6x 연산량 증가
+```
+
+**방법 B: 커스텀 Shard Geometry (최적)**
+```python
+# num_heads=20에 맞는 CoreGrid
+# 옵션 1: 20 cores (4x5 or 5x4)
+# 옵션 2: 40 cores (2 heads/core) - 5x8
+# rotary_embedding_llama, sdpa_decode 수정 필요
+```
+
+**예상 효과**: Phase 1+2 이후 추가 30-50% 향상
+
+### 12.3 구현 로드맵
+
+```
+Week 1: Phase 1 - In-place KV Cache
+├── Day 1-2: fill_cache/update_cache 구현 (Python level)
+├── Day 3-4: Trace capture 통합
+└── Day 5: 테스트 및 벤치마크
+
+Week 2-3: Phase 2 - Ternary Matmul 커널
+├── Day 1-3: 2-bit weight packing/unpacking 구현
+├── Day 4-7: TT-Metal 커널 작성 (reader/compute/writer)
+├── Day 8-10: Python binding 및 ttnn op 등록
+└── Day 11-14: BitNet-TT 통합 및 테스트
+
+Week 4: Phase 3 - 커스텀 QKV Decode (선택적)
+├── Option A: Padding 방식 (1-2일)
+└── Option B: 커스텀 geometry (1주)
+```
+
+### 12.4 예상 성능
+
+| Phase | 구현 | 속도 | 대비 현재 |
+|-------|------|------|----------|
+| 현재 | concat + BF16 | 8.5 t/s | 1x |
+| Phase 1 | In-place + Trace | 17-25 t/s | **2-3x** |
+| Phase 2 | + Ternary Matmul | 25-35 t/s | **3-4x** |
+| Phase 3 | + Custom QKV | 30-45 t/s | **4-5x** |
+
+### 12.5 리스크 및 대안
+
+| 리스크 | 확률 | 대안 |
+|--------|------|------|
+| fill_cache가 없음 | 중 | concat → slice로 우회 또는 직접 구현 |
+| Ternary 커널 정확도 | 낮 | HiFi2 math fidelity 유지 |
+| QKV geometry 충돌 | 높 | Padding 방식으로 fallback |
+| Trace 불안정 | 중 | Non-trace 최적화만 적용 |
+
+### 12.6 즉시 시작 가능한 작업
+
+1. **ttnn.fill_cache / ttnn.update_cache API 조사**
+   ```bash
+   grep -r "fill_cache\|update_cache" ~/tt-metal/ttnn/
+   ```
+
+2. **기존 ternary matmul 존재 여부 확인**
+   ```bash
+   grep -r "ternary\|int2\|2bit" ~/tt-metal/ttnn/cpp/
+   ```
+
+3. **Simple index-based cache update 테스트**
+   ```python
+   # ttnn.copy 또는 slice-based update 테스트
+   cache[:, :, pos:pos+1, :] = new_kv
+   ```
+
+---
+
 이 문서는 중복/실패 로그를 제거한 핵심 요약본이다. 새로운 실험 추가 시 성공 설정은 상세 기록, 실패는 원인 한 줄만 남길 것.
