@@ -2974,3 +2974,28 @@ Mismatch: 640 ≠ 1024
 2. **Compute Kernel Config**: HiFi2 또는 LoFi 적용으로 matmul 가속
 3. **LM Head 최적화**: prefill 시 마지막 토큰만 계산
 4. **Fused QKV**: Q, K, V projection을 단일 matmul로 통합
+
+### 36.5 추가 시도 결과 (2025-12-10 오후)
+
+| 시도 | 커밋 | 결과 | 속도 | 비고 |
+|------|------|------|------|------|
+| HiFi2 + Fused QKV + LM Head slice | `0e97f48` | ❌ 출력 손상 | 1.80 t/s | ttnn.slice API 호출 오류 |
+| **HiFi2만 적용** | `4b50353` | ✅ 성공 | **8.02-9.69 t/s** | baseline과 유사/약간 빠름 |
+
+**분석**:
+- HiFi2 compute kernel: ✅ 정상 작동, 품질 손상 없음
+- Fused QKV (ttnn.slice): ❌ 3D/4D 텐서 slice 문제로 출력 손상
+- LM Head slice: ❌ 같은 문제
+
+**ttnn.slice 문제점**:
+```python
+# 에러: 3D 텐서에 4D 인덱스 사용
+ttnn.slice(tensor_3d, starts=[0,0,7,0], ends=[1,8,8,2560])  # ❌
+
+# API 요구사항: slice_start, slice_end 키워드 인수 필요
+ttnn.slice(tensor, slice_start=[...], slice_end=[...])  # ✅
+```
+
+**현재 상태**:
+- Alpha baseline + HiFi2: **~8.5 t/s** (안정적)
+- Fused QKV, LM Head slice: 추가 디버깅 필요
