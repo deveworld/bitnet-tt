@@ -130,9 +130,10 @@ class KVCache:
         Returns:
             Expanded key and value for attention
         """
-        seq_len = key_states.shape[2]
+        self.seq_len_cached = key_states.shape[2]
         self.num_kv_heads = key_states.shape[1]
         self.num_heads = self.num_kv_heads * num_kv_groups
+        self._gqa_expanded = (num_kv_groups > 1)
 
         # Expand KV for GQA now (during prefill, not every decode step)
         if num_kv_groups > 1:
@@ -142,42 +143,9 @@ class KVCache:
             key_expanded = key_states
             value_expanded = value_states
 
-        # If pre-allocated with GQA expansion, store directly in cache buffer
-        if self._preallocated and self._gqa_expanded:
-            # In-place write to pre-allocated buffer
-            try:
-                ttnn.experimental.tensor.write_tensor_to_existing(
-                    key_expanded,
-                    self.key_cache,
-                    slice_start=(0, 0, 0, 0),
-                )
-                ttnn.experimental.tensor.write_tensor_to_existing(
-                    value_expanded,
-                    self.value_cache,
-                    slice_start=(0, 0, 0, 0),
-                )
-            except (AttributeError, RuntimeError):
-                # Fallback: try paged_fill_cache
-                try:
-                    # Reshape to 1BKD format for paged_fill_cache
-                    key_1bsd = ttnn.permute(key_expanded, (2, 0, 1, 3))  # [seq, batch, heads, dim]
-                    value_1bsd = ttnn.permute(value_expanded, (2, 0, 1, 3))
-                    ttnn.experimental.paged_fill_cache(
-                        self.key_cache, key_1bsd, batch_idx=0
-                    )
-                    ttnn.experimental.paged_fill_cache(
-                        self.value_cache, value_1bsd, batch_idx=0
-                    )
-                except Exception:
-                    # Final fallback: just store in key_cache/value_cache (trace may break)
-                    pass
-            self.seq_len_cached = seq_len
-        else:
-            # Dynamic cache: store for later copy
-            self._prefill_key = key_expanded
-            self._prefill_value = value_expanded
-            self._gqa_expanded = (num_kv_groups > 1)
-            self.seq_len_cached = seq_len
+        # Store EXPANDED KV for decode (this is the key optimization!)
+        self._prefill_key = key_expanded
+        self._prefill_value = value_expanded
 
         return key_expanded, value_expanded
 
@@ -718,14 +686,11 @@ class MultiHeadAttention:
                 key_expanded, value_expanded = past_key_value.update_prefill(
                     key, value, self.num_kv_groups
                 )
-            elif (past_key_value._preallocated and past_key_value._gqa_expanded):
-                # Decode with pre-allocated GQA-expanded cache: use in-place update
-                # This is required for trace compatibility
-                key_expanded, value_expanded = past_key_value.update_decode_preallocated(
-                    key, value, current_pos, self.num_kv_groups
-                )
             else:
-                # Decode with dynamic cache: concat-based update
+                # Decode: expand only new token, concat to expanded cache
+                # Note: In-place update (update_decode_preallocated) requires
+                # ttnn APIs that are not available in current version.
+                # Using concat-based update for now.
                 key_expanded, value_expanded = past_key_value.update_decode_expanded(
                     key, value, self.num_kv_groups
                 )

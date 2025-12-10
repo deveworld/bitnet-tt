@@ -270,10 +270,6 @@ class TextGenerator:
         # Key optimization: Cache stores already-expanded heads, so decode
         # only needs to expand the single new token (not all cached positions)
         for cache in kv_cache:
-            # Skip if pre-allocated + GQA-expanded (already stored in buffer)
-            if cache._preallocated and cache._gqa_expanded:
-                continue
-            # Copy prefill results to cache for dynamic allocation mode
             if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
                 # _prefill_key/value are already GQA-expanded!
                 cache.key_cache = cache._prefill_key
@@ -484,9 +480,9 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens
-        # Use pre-allocated GQA-expanded caches for trace compatibility
-        # Cache shape: [batch, num_heads, max_seq, head_dim] (already expanded)
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
+        # Note: Pre-allocated cache with in-place update requires ttnn APIs
+        # not available in current version. Using dynamic allocation for now.
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -658,9 +654,9 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill - use pre-allocated GQA-expanded caches
+        # Phase 1: Prefill - using dynamic allocation (in-place update not available)
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
