@@ -191,24 +191,3 @@ def get_config(model_name: str = "mini") -> BitNetConfig:
         raise ValueError(f"Unknown model: {model_name}. Choose from {list(configs.keys())}")
 
     return configs[model_name]()
-
-
-def get_create_qkv_decode_shard(head_dim: int = 128) -> "ttnn.MemoryConfig":
-    """
-    Create HEIGHT_SHARDED memory config for decode QKV heads.
-
-    This is required for Blackhole p150a to use:
-    - ttnn.experimental.rotary_embedding_llama (requires HEIGHT_SHARDED input)
-    - ttnn.experimental.paged_update_cache (requires HEIGHT_SHARDED input)
-
-    Args:
-        head_dim: Head dimension (default: 128 for BitNet 2B4T)
-
-    Returns:
-        HEIGHT_SHARDED memory config for nlp_create_qkv_heads_decode output
-    """
-    import ttnn
-
-    # Use standard L1_HEIGHT_SHARDED for compatibility
-    # Custom CoreGrid may not work on all devices
-    return ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG

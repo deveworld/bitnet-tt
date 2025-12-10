@@ -488,13 +488,6 @@ class MultiHeadAttention:
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
 
-        # HEIGHT_SHARDED memory config for optimized decode path
-        # Required for rotary_embedding_llama and paged_update_cache
-        from bitnet_tt.config import get_create_qkv_decode_shard
-        self.create_qkv_decode_shard = get_create_qkv_decode_shard(
-            head_dim=hidden_size // num_attention_heads
-        )
-
         # Projections (weights pre-transposed in Linear.load_weights)
         self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device)
         self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
@@ -971,14 +964,9 @@ class MultiHeadAttention:
             xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=ttnn.L1_MEMORY_CONFIG,  # Output to L1 first
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         ttnn.deallocate(xqkv_fused_4d)
-
-        # Convert to HEIGHT_SHARDED for rotary_embedding_llama
-        q_heads_1bqd = ttnn.to_memory_config(q_heads_1bqd, self.create_qkv_decode_shard)
-        k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, self.create_qkv_decode_shard)
-        v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, self.create_qkv_decode_shard)
 
         # 2. Apply RoPE using fused rotary_embedding_llama
         q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
