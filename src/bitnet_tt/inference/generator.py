@@ -490,7 +490,7 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens with pre-allocated cache
-        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=True)
+        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=False)
 
         # Sample first token (use first batch element only)
         next_token = self._sample_next_token(
@@ -680,7 +680,7 @@ class TextGenerator:
 
         # Phase 1: Prefill with pre-allocated cache
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=True)
+        logits, kv_cache = self.prefill_forward(input_ids_expanded, use_preallocated=False)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
