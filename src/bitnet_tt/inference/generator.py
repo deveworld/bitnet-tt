@@ -133,7 +133,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled until in-place cache update is verified
+        enable_trace: bool = True,  # Enable trace capture for decode optimization
         batch_size: int = 1,
     ) -> None:
         """
@@ -193,9 +193,10 @@ class TextGenerator:
         This is required for the optimized decode path using paged_update_cache.
         Cache format: [batch, num_heads, max_seq_len, head_dim] (GQA-expanded)
 
-        Key optimization: Pre-allocate in GQA-expanded form to avoid
-        per-token expansion during decode. Memory increases by num_kv_groups
-        (e.g., 4x for 20 heads / 5 kv_heads) but eliminates expansion cost.
+        Key optimization: Pre-allocate cache in non-expanded form for
+        paged_update_cache compatibility. GQA expansion happens at SDPA time.
+
+        Cache shape: [batch, num_kv_heads, max_seq, head_dim]
         """
         caches = []
         for layer_idx in range(self.config.num_layers):
@@ -203,7 +204,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
-                num_heads=self.config.num_attention_heads,  # For GQA expansion
+                num_heads=None,  # Non-expanded for paged_update_cache
                 head_dim=self.config.head_dim,
                 device=self.device,
             )
@@ -213,7 +214,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 head_dim=self.config.head_dim,
                 device=self.device,
-                num_heads=self.config.num_attention_heads,  # GQA-expanded cache
+                num_heads=None,  # Non-expanded for paged_update_cache
             )
             caches.append(cache)
         return caches
@@ -302,19 +303,19 @@ class TextGenerator:
         input_tensor = numpy_int_to_ttnn(token, self.device)
 
         # Auto-detect whether to use optimized path based on cache state
-        # NOTE: Optimized path with rotary_embedding_llama requires HEIGHT_SHARDED inputs
-        # which is not yet properly configured. Using basic decode path for now.
+        # Optimized path uses:
+        # - nlp_create_qkv_heads_decode with HEIGHT_SHARDED output
+        # - rotary_embedding_llama for fused RoPE
+        # - paged_update_cache for in-place cache update
+        # - scaled_dot_product_attention_decode for decode-optimized SDPA
         if use_optimized is None:
-            # Disable optimized path until HEIGHT_SHARDED memory config is fixed
-            use_optimized = False
-            # Original logic (requires HEIGHT_SHARDED fix):
-            # use_optimized = (
-            #     kv_cache is not None
-            #     and len(kv_cache) > 0
-            #     and kv_cache[0] is not None
-            #     and hasattr(kv_cache[0], '_preallocated')
-            #     and kv_cache[0]._preallocated
-            # )
+            use_optimized = (
+                kv_cache is not None
+                and len(kv_cache) > 0
+                and kv_cache[0] is not None
+                and hasattr(kv_cache[0], '_preallocated')
+                and kv_cache[0]._preallocated
+            )
 
         # Get rot_mats for optimized decode path
         rot_mats = None
@@ -340,26 +341,57 @@ class TextGenerator:
         token: NDArray[np.int64],
         current_pos: int,
         kv_cache: list[KVCache],
-    ) -> tuple[int, ttnn.Tensor, ttnn.Tensor]:
+    ) -> tuple[int, ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
         """
         Capture a trace for the decode forward pass.
 
         This compiles the decode graph once and reuses it for all subsequent
         decode steps, eliminating compilation overhead (2-3x speedup).
 
+        Important: This requires:
+        - Pre-allocated KV cache (no memory reallocation)
+        - paged_update_cache for in-place updates (no concat)
+        - HEIGHT_SHARDED memory config for QKV heads
+
         Returns:
-            (trace_id, output_tensor, input_tensor)
+            (trace_id, output_tensor, input_tensor, position_tensor)
         """
-        # Compile run (warm up)
+        # Create input tensors
         input_tensor = numpy_int_to_ttnn(token, self.device)
+
+        # Create position tensor for trace (will be updated each step)
+        position_tensor = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+
+        # Get rot_mats for optimized decode
+        rot_mats = self.get_rot_mats_decode(current_pos)
+        transformation_mat = self.get_transformation_mat()
+
+        # Compile run (warm up)
         _, _ = self.model(
             input_tensor,
             past_key_values=kv_cache,
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
+            rot_mats=rot_mats,
+            transformation_mat=transformation_mat,
+            current_pos_tensor=position_tensor,
         )
         ttnn.synchronize_device(self.device)
+
+        # Re-create tensors for trace capture (fresh addresses)
+        input_tensor = numpy_int_to_ttnn(token, self.device)
+        position_tensor = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
 
         # Capture trace
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
@@ -369,11 +401,14 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
+            rot_mats=rot_mats,
+            transformation_mat=transformation_mat,
+            current_pos_tensor=position_tensor,
         )
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
 
-        return trace_id, logits, input_tensor
+        return trace_id, logits, input_tensor, position_tensor
 
     def _execute_decode_trace(
         self,
@@ -390,14 +425,20 @@ class TextGenerator:
         Returns:
             Output logits tensor
         """
-        # Copy new token to the trace input tensor
+        # Update input tensor in-place
         new_input = numpy_int_to_ttnn(token, self.device)
-        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs)
+        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs[0])
+
+        # Update position tensor in-place
+        new_pos = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
 
         # Execute trace
-        # Note: current_pos is passed for future use when trace supports
-        # position tensor updates for KV cache. Currently the trace captures
-        # a fixed position which may cause issues with long sequences.
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
 
         return self._trace_output
@@ -482,7 +523,7 @@ class TextGenerator:
         # Phase 1: Prefill - process all prompt tokens
         # Note: Pre-allocated cache with in-place update requires ttnn APIs
         # not available in current version. Using dynamic allocation for now.
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=True)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -508,12 +549,13 @@ class TextGenerator:
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
-                    self._trace_id, self._trace_output, self._trace_inputs = \
+                    self._trace_id, self._trace_output, input_t, pos_t = \
                         self._capture_decode_trace(
                             generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
+                    self._trace_inputs = [input_t, pos_t]
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
@@ -656,7 +698,7 @@ class TextGenerator:
 
         # Phase 1: Prefill - using dynamic allocation (in-place update not available)
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=True)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
@@ -689,12 +731,13 @@ class TextGenerator:
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
-                    self._trace_id, self._trace_output, self._trace_inputs = \
+                    self._trace_id, self._trace_output, input_t, pos_t = \
                         self._capture_decode_trace(
                             generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
+                    self._trace_inputs = [input_t, pos_t]
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
