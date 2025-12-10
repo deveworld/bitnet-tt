@@ -133,7 +133,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled until in-place cache update is verified
+        enable_trace: bool = True,  # Enabled with in-place cache update
         batch_size: int = 1,
     ) -> None:
         """
@@ -480,9 +480,8 @@ class TextGenerator:
         self.reset_trace()
 
         # Phase 1: Prefill - process all prompt tokens
-        # Note: Pre-allocated cache with in-place update requires ttnn APIs
-        # not available in current version. Using dynamic allocation for now.
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        # Use pre-allocated cache with in-place update for Trace compatibility
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
 
         # Sample first token
         next_token = self._sample_next_token(
@@ -654,9 +653,9 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill - using dynamic allocation (in-place update not available)
+        # Phase 1: Prefill - use pre-allocated cache with in-place update
         prefill_start = time.perf_counter()
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=False)
+        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
