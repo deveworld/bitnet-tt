@@ -7,6 +7,7 @@ Tenstorrent Blackhole p150a에서 Microsoft의 **BitNet b1.58 2B-4T** 모델을 
 - **HuggingFace 호환**: `microsoft/bitnet-b1.58-2B-4T-bf16` 가중치 직접 로드
 - **TT-NN 네이티브**: Tenstorrent 하드웨어에 최적화된 구현
 - **KV-Cache 지원**: 효율적인 자기회귀 생성
+- **HiFi2 Compute Kernel**: BFP8 연산으로 matmul 가속
 - **높은 정확도**: HuggingFace 구현과 correlation 0.99+ 달성
 
 ## 빠른 시작
@@ -30,6 +31,34 @@ python main.py --full
 python main.py --chat
 ```
 
+## 성능
+
+Tenstorrent Blackhole p150a에서 측정:
+
+| 모드 | 속도 | 비고 |
+|------|------|------|
+| Chat (Streaming) | **8.0 - 9.7 t/s** | HiFi2 적용, batch_size=1 |
+| Full Demo | ~5.5 t/s | 30 tokens 생성 |
+
+### 최적화 현황
+
+| 최적화 | 상태 | 효과 |
+|--------|------|------|
+| HiFi2 Compute Kernel | ✅ 적용 | matmul ~2x 가속 (이론) |
+| KV-Cache | ✅ 적용 | concat 기반 |
+| Pre-transposed Weights | ✅ 적용 | transpose 오버헤드 제거 |
+| RoPE Pre-upload | ✅ 적용 | cos/sin 재계산 방지 |
+| HEIGHT_SHARDED Decode | ❌ 미적용 | num_heads=20 호환 문제 |
+| Trace Capture | ❌ 미적용 | concat 캐시와 비호환 |
+
+### 목표 성능
+
+| 참조 모델 | Hardware | 속도 |
+|-----------|----------|------|
+| Llama 3.1 8B | p150a | 33.1 t/s/u |
+| Llama 3.2 3B | n150 | 46.6 t/s/u |
+| **BitNet 2B (목표)** | p150a | **30+ t/s** |
+
 ## 검증 결과
 
 HuggingFace 공식 구현과의 비교:
@@ -46,40 +75,29 @@ python examples/debug_compare.py      # 레이어별 비교
 python examples/debug_full_compare.py  # 전체 모델 비교
 ```
 
-## 성능
-
-Tenstorrent Blackhole p150a에서 측정:
-
-| 모드 | 시간 | 속도 |
-|------|------|------|
-| Without KV-Cache | 6.53s / 30 tokens | ~217 ms/token |
-| With KV-Cache | 3.84s / 30 tokens | ~128 ms/token |
-
-**KV-Cache 속도 향상: 1.7x**
-
 ## 아키텍처
 
 ### 모델 구조
 
 ```
-BitNetModel
+BitNetModel (2.4B params)
 ├── Embedding (128256 vocab, 2560 dim)
 ├── TransformerBlock x 30
 │   ├── RMSNorm (input)
 │   ├── MultiHeadAttention
-│   │   ├── Q/K/V Projection (BitLinear)
+│   │   ├── Q/K/V Projection (Linear, ternary weights)
 │   │   ├── RoPE (θ=500000)
 │   │   ├── Grouped Query Attention (20 Q heads, 5 KV heads)
-│   │   ├── Attention Sub-Norm
-│   │   └── O Projection (BitLinear)
+│   │   ├── Attention Sub-Norm (BitNet 고유)
+│   │   └── O Projection (Linear)
 │   ├── RMSNorm (post-attention)
 │   └── FFN
-│       ├── Gate/Up Projection (BitLinear)
-│       ├── SiLU + Squared ReLU
-│       ├── FFN Sub-Norm
-│       └── Down Projection (BitLinear)
+│       ├── Gate/Up Projection (Linear)
+│       ├── Squared ReLU (relu2)
+│       ├── FFN Sub-Norm (BitNet 고유)
+│       └── Down Projection (Linear)
 ├── RMSNorm (final)
-└── LM Head (tie_word_embeddings=True)
+└── LM Head
 ```
 
 ### BitLinear 가중치 양자화
@@ -87,7 +105,7 @@ BitNetModel
 HuggingFace BitLinear와 동일한 양자화 적용:
 
 ```python
-# 가중치 양자화 공식
+# 가중치 양자화 공식 (로드 시 적용)
 s = 1.0 / weight.abs().mean()
 weight_quant = (weight * s).round().clamp(-1, 1) / s
 # 결과: {-scale, 0, +scale} 삼진 값
@@ -97,30 +115,33 @@ weight_quant = (weight * s).round().clamp(-1, 1) / s
 
 | 컴포넌트 | 파일 | 설명 |
 |----------|------|------|
+| Config | `config.py` | 모델 설정 + HiFi2 커널 설정 |
 | Embedding | `layers/embedding.py` | 토큰 임베딩 |
 | RMSNorm | `layers/bitlinear.py` | Root Mean Square Normalization |
-| Linear | `layers/bitlinear.py` | 삼진 가중치 양자화 Linear |
+| Linear | `layers/bitlinear.py` | 삼진 가중치 + HiFi2 matmul |
 | Attention | `layers/attention.py` | GQA + RoPE + KV-Cache |
-| FFN | `layers/ffn.py` | SwiGLU + Squared ReLU |
+| FFN | `layers/ffn.py` | Squared ReLU |
 | Transformer | `model/transformer.py` | 트랜스포머 블록 |
 | BitNetModel | `model/bitnet.py` | 전체 모델 |
+| Generator | `inference/generator.py` | 텍스트 생성 + 스트리밍 |
 
 ## 프로젝트 구조
 
 ```
 bitnet-tt/
 ├── src/bitnet_tt/
-│   ├── config.py              # 모델 설정
+│   ├── config.py              # 모델 설정 + compute kernel config
 │   ├── layers/
 │   │   ├── attention.py       # Multi-Head Attention + KV-Cache
-│   │   ├── bitlinear.py       # BitLinear, RMSNorm, Linear
+│   │   ├── bitlinear.py       # Linear (HiFi2), RMSNorm
 │   │   ├── embedding.py       # Embedding layer
-│   │   └── ffn.py             # Feed-Forward Network
+│   │   ├── ffn.py             # Feed-Forward Network
+│   │   └── rope_optimized.py  # RoPE pre-upload
 │   ├── model/
 │   │   ├── bitnet.py          # BitNetModel
 │   │   └── transformer.py     # TransformerBlock
 │   ├── inference/
-│   │   └── generator.py       # Text generation
+│   │   └── generator.py       # TextGenerator (streaming)
 │   └── utils/
 │       ├── device.py          # TT-NN device 관리
 │       ├── quantization.py    # 양자화 유틸리티
@@ -129,7 +150,8 @@ bitnet-tt/
 │   ├── demo.py                # 데모 스크립트
 │   ├── debug_compare.py       # 레이어별 비교
 │   └── debug_full_compare.py  # 전체 모델 비교
-└── main.py                    # CLI 엔트리포인트
+├── main.py                    # CLI 엔트리포인트
+└── MEMO.md                    # 기술 메모 (최적화 기록)
 ```
 
 ## API 사용법
@@ -154,27 +176,27 @@ with device_context() as device:
         "Hello, I am",
         max_new_tokens=50,
         temperature=0.7,
-        use_cache=True,
     )
     print(output)
 ```
 
-### KV-Cache 사용
+### 스트리밍 채팅
 
 ```python
-from bitnet_tt.layers.attention import KVCache
+from transformers import AutoTokenizer
 
-# 첫 번째 forward (프롬프트 처리)
-logits, past_key_values = model(input_ids, use_cache=True)
+tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16")
+generator = TextGenerator(model, tokenizer)
 
-# 후속 forward (토큰 생성)
-for _ in range(max_tokens):
-    next_token = sample(logits)
-    logits, past_key_values = model(
-        next_token,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
+# 스트리밍 출력
+for text, stats in generator.chat_streaming(
+    "Hello! How are you?",
+    max_new_tokens=100,
+    temperature=0.7,
+):
+    print(text, end="", flush=True)
+
+print(f"\n[Speed: {stats.tokens_per_second:.2f} t/s]")
 ```
 
 ## 하드웨어 요구사항
@@ -191,58 +213,58 @@ for _ in range(max_tokens):
 ### 소프트웨어 요구사항
 
 - Ubuntu 20.04/22.04 LTS
-- Python 3.10+
+- Python 3.10 (ttnn 호환)
 - TT-NN SDK
 - PyTorch 2.0+
 - Transformers 4.40+
 
 ## 구현 세부사항
 
+### Compute Kernel Configuration
+
+```python
+# HiFi2: BFP8 연산, ~2x 속도 향상 (정확도 유지)
+from bitnet_tt.config import get_compute_kernel_config
+
+kernel_config = get_compute_kernel_config("hifi2")
+# ttnn.matmul(..., compute_kernel_config=kernel_config)
+```
+
+| Fidelity | 정밀도 | 속도 | 용도 |
+|----------|--------|------|------|
+| HiFi4 | BF16 | 1x | Prefill, 정확도 중요 |
+| HiFi2 | BFP8 | ~2x | Decode (현재 사용) |
+| LoFi | BFP4 | ~3.6x | MLP (실험 필요) |
+
 ### TT-NN 텐서 레이아웃
 
 ```python
-# TILE_LAYOUT: 연산에 최적화 (기본값)
-# ROW_MAJOR_LAYOUT: reshape/permute 전에 변환 필요
+# TILE_LAYOUT: 연산에 최적화 (matmul 필수)
+# ROW_MAJOR_LAYOUT: reshape/embedding 입력
 
 # reshape/permute 전 레이아웃 변환
 x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
 x = ttnn.reshape(x, new_shape)
-x = ttnn.permute(x, dims)
 x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
 ```
 
-### 가중치 매핑
+## 알려진 제한사항
 
-HuggingFace → TT-NN 가중치 매핑:
-
-```python
-layer_mapping = {
-    "input_layernorm.weight": "input_layernorm.weight",
-    "self_attn.q_proj.weight": "self_attn.q_proj.weight",
-    "self_attn.k_proj.weight": "self_attn.k_proj.weight",
-    "self_attn.v_proj.weight": "self_attn.v_proj.weight",
-    "self_attn.o_proj.weight": "self_attn.o_proj.weight",
-    "self_attn.attn_sub_norm.weight": "self_attn.attn_sub_norm.weight",  # BitNet 전용
-    "mlp.gate_proj.weight": "mlp.gate_proj.weight",
-    "mlp.up_proj.weight": "mlp.up_proj.weight",
-    "mlp.down_proj.weight": "mlp.down_proj.weight",
-    "mlp.ffn_sub_norm.weight": "mlp.ffn_sub_norm.weight",  # BitNet 전용
-    "post_attention_layernorm.weight": "post_attention_layernorm.weight",
-}
-```
+1. **HEIGHT_SHARDED 미지원**: BitNet의 `num_heads=20`이 tt_transformers의 32-core grid와 호환되지 않음
+2. **Trace Capture 미적용**: concat 기반 KV-Cache가 trace와 비호환
+3. **batch_size=1 전용**: batch>1은 HEIGHT_SHARDED 없이 비효율적
 
 ## 참고 자료
 
 ### Tenstorrent
 - [공식 문서](https://docs.tenstorrent.com)
 - [TT-Metal GitHub](https://github.com/tenstorrent/tt-metal)
-- [Blackhole 사양](https://docs.tenstorrent.com/aibs/blackhole/)
+- [tt_transformers](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
 
 ### BitNet
 - [BitNet 논문 (arXiv:2310.11453)](https://arxiv.org/abs/2310.11453)
 - [BitNet b1.58 논문 (arXiv:2402.17764)](https://arxiv.org/abs/2402.17764)
 - [BitNet b1.58 2B4T (HuggingFace)](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-- [HuggingFace Transformers BitNet](https://github.com/huggingface/transformers/tree/main/src/transformers/models/bitnet)
 
 ## 라이선스
 
