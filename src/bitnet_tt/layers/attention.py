@@ -959,12 +959,18 @@ class MultiHeadAttention:
         # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
 
         # Lazy init HEIGHT_SHARDED memory configs for batch_size=32
-        if self._decode_mem_configs is None and batch_size == 32:
-            from bitnet_tt.config import get_decode_memory_configs
-            self._decode_mem_configs = get_decode_memory_configs(
-                head_dim=self.head_dim,
-                batch_size=batch_size,
-            )
+        # Debug: print batch_size on first call
+        if self._decode_mem_configs is None:
+            print(f"[DEBUG] Layer {self.layer_idx}: batch_size={batch_size}, initializing decode configs")
+            if batch_size == 32:
+                from bitnet_tt.config import get_decode_memory_configs
+                self._decode_mem_configs = get_decode_memory_configs(
+                    head_dim=self.head_dim,
+                    batch_size=batch_size,
+                )
+                print(f"[DEBUG] Layer {self.layer_idx}: HEIGHT_SHARDED configs initialized")
+            else:
+                print(f"[DEBUG] Layer {self.layer_idx}: batch_size != 32, skipping HEIGHT_SHARDED")
 
         # Reshape to 4D for nlp_create_qkv_heads_decode: [1, 1, batch, qkv_dim]
         # xqkv_fused is [batch, 1, qkv_dim]
