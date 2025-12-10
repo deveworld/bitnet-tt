@@ -197,10 +197,15 @@ class TextGenerator:
         per-token expansion during decode. Memory increases by num_kv_groups
         (e.g., 4x for 20 heads / 5 kv_heads) but eliminates expansion cost.
         """
+        # Limit max_seq_len for KV cache to fit in DRAM with batch_size=32
+        # Full 4096 × 32 batch × 30 layers × 2 (K,V) = ~40GB > 32GB DRAM
+        # Use 512 for ~5GB KV cache which fits comfortably
+        kv_cache_max_seq = min(512, self.config.max_position_embeddings)
+
         caches = []
         for layer_idx in range(self.config.num_layers):
             cache = KVCache(
-                max_seq_len=self.config.max_position_embeddings,
+                max_seq_len=kv_cache_max_seq,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
                 num_heads=self.config.num_attention_heads,  # For GQA expansion
@@ -210,7 +215,7 @@ class TextGenerator:
             cache.preallocate(
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
-                max_seq_len=self.config.max_position_embeddings,
+                max_seq_len=kv_cache_max_seq,
                 head_dim=self.config.head_dim,
                 device=self.device,
                 num_heads=self.config.num_attention_heads,  # GQA-expanded cache
