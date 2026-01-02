@@ -652,7 +652,7 @@ class MultiHeadAttention:
             device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,  # DRAM to avoid L1 clash
         )
 
         # Store core grid for dynamic sharding
