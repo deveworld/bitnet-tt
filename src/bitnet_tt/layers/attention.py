@@ -241,6 +241,11 @@ class KVCache:
         if not self._preallocated:
             raise RuntimeError("Cache must be preallocated for in-place update")
 
+        # Debug: print once to verify this path is being used
+        if not hasattr(self, "_inplace_debug_printed"):
+            print(f"[DEBUG] Using in-place KV cache update (layer cache, pos={current_pos})")
+            self._inplace_debug_printed = True
+
         # Expand new token's KV for GQA
         if num_kv_groups > 1:
             key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
