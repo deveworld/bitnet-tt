@@ -10,6 +10,7 @@ from contextlib import contextmanager
 # Try to import ttnn, fall back to mock for development
 try:
     import ttnn
+
     TTNN_AVAILABLE = True
 except ImportError:
     TTNN_AVAILABLE = False
@@ -35,12 +36,12 @@ def get_device(device_id: int = 0) -> "ttnn.Device":
     global _device
 
     if not TTNN_AVAILABLE:
-        raise RuntimeError(
-            "ttnn is not available. Please install the Tenstorrent SDK."
-        )
+        raise RuntimeError("ttnn is not available. Please install the Tenstorrent SDK.")
 
     if _device is None:
-        _device = ttnn.open_device(device_id=device_id)
+        # trace_region_size required for Metal Trace (Trace capture/execute)
+        # Error showed need for ~12.5MB, allocating 20MB to be safe
+        _device = ttnn.open_device(device_id=device_id, trace_region_size=20_000_000)
 
     return _device
 
@@ -91,6 +92,6 @@ def get_device_info() -> dict:
 
     return {
         "available": True,
-        "device_id": device.id() if hasattr(device, 'id') else 0,
+        "device_id": device.id() if hasattr(device, "id") else 0,
         # Add more device info as needed
     }
