@@ -888,12 +888,24 @@ class MultiHeadAttention:
                 if pos_created_locally:
                     ttnn.deallocate(pos_tensor_local)
 
-                # 6. Concat heads and reshape output
+                # 6. Convert to sharded for nlp_concat_heads_decode
+                # TT pattern: use HEIGHT_SHARDED memory config
+                concat_shard_config = ttnn.create_sharded_memory_config(
+                    shape=(32, self.head_dim),  # [num_heads padded to 32, head_dim]
+                    core_grid=ttnn.CoreGrid(y=1, x=1),
+                    strategy=ttnn.ShardStrategy.HEIGHT,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+                attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, concat_shard_config)
+                ttnn.deallocate(attn_output_1bkd)
+
+                # 7. Concat heads and reshape output
                 attn_output = ttnn.experimental.nlp_concat_heads_decode(
-                    attn_output_1bkd,
+                    attn_output_sharded,
                     num_heads=self.num_heads,
                 )
-                ttnn.deallocate(attn_output_1bkd)
+                ttnn.deallocate(attn_output_sharded)
 
                 # Apply sub-norm and output projection
                 attn_output = self.attn_sub_norm(attn_output)
