@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: pos_tensor buffer issue with external passing
+        enable_trace: bool = True,  # TT official two-step pattern applied for pos_tensor
         batch_size: int = 1,
     ) -> None:
         """
@@ -352,14 +352,16 @@ class TextGenerator:
         """
         # Compile run (warm up)
         input_tensor = numpy_int_to_ttnn(token, self.device)
-        # Create persistent pos_tensor for trace
-        pos_tensor = ttnn.from_torch(
+        # Create persistent pos_tensor for trace using TT official two-step pattern:
+        # Step 1: Create HOST tensor (device=None)
+        pos_tensor_host = ttnn.from_torch(
             torch.tensor([[current_pos]], dtype=torch.int32),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
+            device=None,  # HOST tensor
         )
-        ttnn.synchronize_device(self.device)  # Ensure buffer is allocated
+        # Step 2: Copy to DEVICE
+        pos_tensor = ttnn.to_device(pos_tensor_host, self.device)
 
         _, _ = self.model(
             input_tensor,
