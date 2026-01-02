@@ -245,39 +245,25 @@ class KVCache:
         if not self._preallocated:
             raise RuntimeError("Cache must be preallocated for in-place update")
 
-        # Convert BKSD [batch, kv_heads, 1, head_dim] to 1BKD [1, batch, kv_heads, head_dim]
-        # for paged_update_cache
-        key_1bkd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
-        key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))  # [1, batch, kv_heads, head_dim]
-        key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
+        # Convert BKSD [batch, kv_heads, 1, head_dim] to 1HBD [1, kv_heads, batch, head_dim]
+        # for ttnn.update_cache - NO GQA expansion, cache stores raw KV heads
+        key_1hbd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
+        key_1hbd = ttnn.permute(key_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
+        key_1hbd = ttnn.to_layout(key_1hbd, ttnn.TILE_LAYOUT)
 
-        value_1bkd = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
-        value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))  # [1, batch, kv_heads, head_dim]
-        value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
+        value_1hbd = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
+        value_1hbd = ttnn.permute(value_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
+        value_1hbd = ttnn.to_layout(value_1hbd, ttnn.TILE_LAYOUT)
 
-        # Create position tensor if not provided (backward compatibility)
-        pos_tensor_created_locally = current_pos_tensor is None
-        if current_pos_tensor is None:
-            current_pos_tensor = ttnn.from_torch(
-                torch.tensor([current_pos], dtype=torch.int32),
-                dtype=ttnn.int32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                device=self.device,
-            )
-
-        # In-place update using paged_update_cache (supports tensor position for Trace)
-        ttnn.experimental.paged_update_cache(
-            self.key_cache, key_1bkd, update_idxs_tensor=current_pos_tensor
-        )
-        ttnn.experimental.paged_update_cache(
-            self.value_cache, value_1bkd, update_idxs_tensor=current_pos_tensor
-        )
+        # In-place update using ttnn.update_cache (int position)
+        # Note: For Metal Trace, paged_update_cache with tensor position is needed
+        # but it requires sharded input which needs significant refactoring
+        self.key_cache = ttnn.update_cache(self.key_cache, key_1hbd, current_pos)
+        self.value_cache = ttnn.update_cache(self.value_cache, value_1hbd, current_pos)
 
         # Cleanup temporary tensors
-        ttnn.deallocate(key_1bkd)
-        ttnn.deallocate(value_1bkd)
-        if pos_tensor_created_locally:
-            ttnn.deallocate(current_pos_tensor)
+        ttnn.deallocate(key_1hbd)
+        ttnn.deallocate(value_1hbd)
 
         self.seq_len_cached = current_pos + 1
 
