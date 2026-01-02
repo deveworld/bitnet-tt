@@ -118,10 +118,10 @@ class KVCache:
         num_kv_groups: int = 1,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
-        Update cache for prefill (store EXPANDED KV, return for attention).
+        Update cache for prefill and return GQA-expanded KV for attention.
 
-        Key optimization: Store KV already expanded for GQA to avoid
-        expanding all cached positions every decode step.
+        For preallocated cache: stores NON-EXPANDED KV, expands when returning.
+        For concat-based cache: stores EXPANDED KV directly.
 
         Args:
             key_states: [batch, kv_heads, seq, head_dim]
@@ -129,41 +129,42 @@ class KVCache:
             num_kv_groups: Number of query heads per KV head (for GQA expansion)
 
         Returns:
-            Expanded key and value for attention
+            GQA-expanded key and value for attention
         """
         seq_len = key_states.shape[2]
         self.num_kv_heads = key_states.shape[1]
         self.num_heads = self.num_kv_heads * num_kv_groups
         self._gqa_expanded = num_kv_groups > 1
 
-        # Expand KV for GQA now (during prefill, not every decode step)
-        if num_kv_groups > 1:
-            key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
-            value_expanded = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
-        else:
-            key_expanded = key_states
-            value_expanded = value_states
-
-        # If preallocated, use fill_cache to write into the existing buffer
+        # If preallocated, store NON-EXPANDED KV, expand only when returning
         if self._preallocated and self.key_cache is not None:
-            # Use fill_cache to copy prefill results into preallocated cache
-            # fill_cache writes to cache[batch_idx, :, :seq_len, :]
-            for batch_idx in range(key_expanded.shape[0]):
-                k_batch = key_expanded[batch_idx : batch_idx + 1, :, :, :]
-                v_batch = value_expanded[batch_idx : batch_idx + 1, :, :, :]
+            # Use fill_cache with NON-EXPANDED key/value (5 heads)
+            for batch_idx in range(key_states.shape[0]):
+                k_batch = key_states[batch_idx : batch_idx + 1, :, :, :]
+                v_batch = value_states[batch_idx : batch_idx + 1, :, :, :]
                 self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
                 self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
 
             self.seq_len_cached = seq_len
-            # Return sliced view of preallocated cache for attention
+
+            # Return GQA-expanded view for attention
             key_for_attn = self.key_cache[:, :, :seq_len, :]
             value_for_attn = self.value_cache[:, :, :seq_len, :]
+            if num_kv_groups > 1:
+                key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
+                value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
             return key_for_attn, value_for_attn
         else:
-            # Not preallocated: store in temporary variables for decode initialization
+            # Not preallocated: expand and store for concat-based decode
+            if num_kv_groups > 1:
+                key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
+                value_expanded = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
+            else:
+                key_expanded = key_states
+                value_expanded = value_states
+
             self._prefill_key = key_expanded
             self._prefill_value = value_expanded
-            # Also set as cache for concat-based decode
             self.key_cache = key_expanded
             self.value_cache = value_expanded
             self.seq_len_cached = seq_len
@@ -228,15 +229,16 @@ class KVCache:
         Update pre-allocated cache using ttnn.update_cache for in-place updates.
 
         This method enables Metal Trace by avoiding memory reallocation (concat).
+        Cache stores NON-EXPANDED KV heads. GQA expansion happens when returning.
 
         Args:
-            key_states: [batch, kv_heads, 1, head_dim] - single new token
-            value_states: [batch, kv_heads, 1, head_dim] - single new token
+            key_states: [batch, kv_heads, 1, head_dim] - single new token (NON-EXPANDED)
+            value_states: [batch, kv_heads, 1, head_dim] - single new token (NON-EXPANDED)
             current_pos: Current sequence position (cache_idx)
-            num_kv_groups: Number of query heads per KV head (for GQA expansion)
+            num_kv_groups: Number of query heads per KV head (for GQA expansion when returning)
 
         Returns:
-            Full key and value caches up to current_pos+1 (sliced view)
+            GQA-expanded key and value for attention (sliced from cache)
         """
         if not self._preallocated:
             raise RuntimeError("Cache must be preallocated for in-place update")
@@ -246,42 +248,34 @@ class KVCache:
             print(f"[DEBUG] Using in-place KV cache update (layer cache, pos={current_pos})")
             self._inplace_debug_printed = True
 
-        # Expand new token's KV for GQA
-        if num_kv_groups > 1:
-            key_expanded = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
-            value_expanded = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
-        else:
-            key_expanded = key_states
-            value_expanded = value_states
-
-        # Convert BKSD [batch, heads, 1, head_dim] to 1HBD [1, heads, batch, head_dim]
-        # for ttnn.update_cache
-        key_1hbd = ttnn.to_layout(key_expanded, ttnn.ROW_MAJOR_LAYOUT)
-        key_1hbd = ttnn.permute(key_1hbd, (2, 1, 0, 3))  # [1, heads, batch, head_dim]
+        # Convert BKSD [batch, kv_heads, 1, head_dim] to 1HBD [1, kv_heads, batch, head_dim]
+        # for ttnn.update_cache - NO GQA expansion, cache stores raw KV heads
+        key_1hbd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
+        key_1hbd = ttnn.permute(key_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
         key_1hbd = ttnn.to_layout(key_1hbd, ttnn.TILE_LAYOUT)
 
-        value_1hbd = ttnn.to_layout(value_expanded, ttnn.ROW_MAJOR_LAYOUT)
-        value_1hbd = ttnn.permute(value_1hbd, (2, 1, 0, 3))  # [1, heads, batch, head_dim]
+        value_1hbd = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
+        value_1hbd = ttnn.permute(value_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
         value_1hbd = ttnn.to_layout(value_1hbd, ttnn.TILE_LAYOUT)
 
         # In-place update using ttnn.update_cache
-        # cache_idx is the position in the sequence to write to
         self.key_cache = ttnn.update_cache(self.key_cache, key_1hbd, current_pos)
         self.value_cache = ttnn.update_cache(self.value_cache, value_1hbd, current_pos)
 
         # Cleanup temporary tensors
         ttnn.deallocate(key_1hbd)
         ttnn.deallocate(value_1hbd)
-        if num_kv_groups > 1:
-            ttnn.deallocate(key_expanded)
-            ttnn.deallocate(value_expanded)
 
         self.seq_len_cached = current_pos + 1
 
-        # Return sliced view of cache for attention
-        # Note: ttnn.slice may create a copy, but this is still better than concat
+        # Slice cache up to current position
         key_for_attn = self.key_cache[:, :, : self.seq_len_cached, :]
         value_for_attn = self.value_cache[:, :, : self.seq_len_cached, :]
+
+        # Expand for GQA when returning (same as concat-based path)
+        if num_kv_groups > 1:
+            key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
+            value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
 
         return key_for_attn, value_for_attn
 

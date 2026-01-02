@@ -186,12 +186,11 @@ class TextGenerator:
         """
         Pre-allocate KV caches for all layers.
 
-        This is required for the optimized decode path using paged_update_cache.
-        Cache format: [batch, num_heads, max_seq_len, head_dim] (GQA-expanded)
+        This is required for the optimized decode path using update_cache.
+        Cache format: [batch, num_kv_heads, max_seq_len, head_dim] (NON-EXPANDED)
 
-        Key optimization: Pre-allocate in GQA-expanded form to avoid
-        per-token expansion during decode. Memory increases by num_kv_groups
-        (e.g., 4x for 20 heads / 5 kv_heads) but eliminates expansion cost.
+        Key insight: Cache stores raw KV heads (5). GQA expansion happens
+        when returning from cache for attention. This matches update_cache API.
         """
         caches = []
         for layer_idx in range(self.config.num_layers):
@@ -199,7 +198,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
-                num_heads=self.config.num_attention_heads,  # For GQA expansion
+                # num_heads NOT passed - cache stores non-expanded kv_heads
                 head_dim=self.config.head_dim,
                 device=self.device,
             )
@@ -209,7 +208,7 @@ class TextGenerator:
                 max_seq_len=self.config.max_position_embeddings,
                 head_dim=self.config.head_dim,
                 device=self.device,
-                num_heads=self.config.num_attention_heads,  # GQA-expanded cache
+                # num_heads=None -> cache with num_kv_heads shape for update_cache
             )
             caches.append(cache)
         return caches
