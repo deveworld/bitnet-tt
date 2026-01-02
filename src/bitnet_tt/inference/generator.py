@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = True,  # Sharded KV path with paged_update_cache enables Trace
+        enable_trace: bool = False,  # Disabled: sdpa_decode requires 1BKD format, our cache is BKSD
         batch_size: int = 1,
     ) -> None:
         """
