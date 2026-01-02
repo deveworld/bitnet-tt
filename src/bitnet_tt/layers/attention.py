@@ -934,6 +934,9 @@ class MultiHeadAttention:
             )
 
         # 5. Convert to sharded for paged_update_cache
+        # Note: k_heads after RoPE is interleaved, but v_heads is still sharded from nlp_create
+        v_heads_interleaved = ttnn.sharded_to_interleaved(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
+
         shard_config = ttnn.create_sharded_memory_config(
             shape=(32, self.head_dim),
             core_grid=ttnn.CoreGrid(y=1, x=1),
@@ -942,7 +945,8 @@ class MultiHeadAttention:
             use_height_and_width_as_shard_shape=True,
         )
         k_sharded = ttnn.interleaved_to_sharded(k_heads_1bkd, shard_config)
-        v_sharded = ttnn.interleaved_to_sharded(v_heads_1bkd, shard_config)
+        v_sharded = ttnn.interleaved_to_sharded(v_heads_interleaved, shard_config)
+        ttnn.deallocate(v_heads_interleaved)
 
         # 6. Update cache in-place with paged_update_cache
         ttnn.experimental.paged_update_cache(
