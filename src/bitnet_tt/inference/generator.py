@@ -406,15 +406,22 @@ class TextGenerator:
         Returns:
             Output logits tensor
         """
-        # 1. Update Input Token
-        new_input = numpy_int_to_ttnn(token, self.device)
+        # 1. Update Input Token - create HOST tensor (device=None) for copy_host_to_device
+        # Convert numpy to torch, then to HOST ttnn tensor
+        if token.dtype != np.int32:
+            token = token.astype(np.int32)
+        torch_token = torch.from_numpy(token)
+        new_input = ttnn.from_torch(
+            torch_token, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=None
+        )
         ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs[0])
 
-        # 2. Update Position Tensor
+        # 2. Update Position Tensor - HOST tensor (device=None)
         new_pos = ttnn.from_torch(
             torch.tensor([[current_pos]], dtype=torch.int32),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,  # HOST tensor for copy
         )
         ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
 
