@@ -1033,7 +1033,7 @@ class MultiHeadAttention:
         x: ttnn.Tensor,
         current_pos: int,
         seq_len: int,
-        pos_tensor: ttnn.Tensor | None,
+        _pos_tensor: ttnn.Tensor | None,  # Reserved for future Trace-safe RoPE
     ) -> ttnn.Tensor:
         """Apply RoPE to single BKSD tensor using precomputed cos/sin."""
         # Note: pos_tensor is available for Trace-compatible position-based indexing
