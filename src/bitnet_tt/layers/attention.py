@@ -679,6 +679,19 @@ class MultiHeadAttention:
             current_pos = 0
 
         # Use optimized prefill path when pre-allocated cache is provided
+        # Debug: trace prefill cache state
+        if mode == "prefill" and not hasattr(self, "_prefill_debug_printed"):
+            has_cache = past_key_value is not None
+            preallocated = (
+                has_cache
+                and hasattr(past_key_value, "_preallocated")
+                and past_key_value._preallocated
+            )
+            print(
+                f"[DEBUG PREFILL] layer={self.layer_idx}, has_cache={has_cache}, preallocated={preallocated}"
+            )
+            self._prefill_debug_printed = True
+
         if (
             mode == "prefill"
             and past_key_value is not None
