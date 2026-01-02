@@ -720,19 +720,9 @@ class MultiHeadAttention:
             cos = cos[:, :batch_size, :, :]
             sin = sin[:, :batch_size, :, :]
 
-        # Create sharded memory config with dynamic core grid
-        batch_grid = ttnn.num_cores_to_corerangeset(batch_size, self.core_grid, row_wise=True)
-        mem_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),  # TILE_SIZE x head_dim
-            core_grid=batch_grid,
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
-        )
-
-        # Convert to sharded
-        cos = ttnn.interleaved_to_sharded(cos, mem_config)
-        sin = ttnn.interleaved_to_sharded(sin, mem_config)
+        # Convert to sharded using L1_HEIGHT_SHARDED (TT pattern)
+        cos = ttnn.interleaved_to_sharded(cos, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG)
+        sin = ttnn.interleaved_to_sharded(sin, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG)
 
         ttnn.deallocate(rot_idxs)
         return cos, sin
@@ -1040,21 +1030,12 @@ class MultiHeadAttention:
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
         # 2. Create QKV heads - outputs 1BKD sharded tensors
-        # Use dynamic shard config based on batch size
-        batch_grid = ttnn.num_cores_to_corerangeset(batch_size, self.core_grid, row_wise=True)
-        create_qkv_shard = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),  # TILE_SIZE x head_dim
-            core_grid=batch_grid,
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
-        )
-
+        # TT pattern: use L1_HEIGHT_SHARDED_MEMORY_CONFIG for Wormhole (model_config.py Line 930)
         q_heads_1bkd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=create_qkv_shard,
+            memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
         )
         ttnn.deallocate(xqkv_fused)
 
@@ -1110,14 +1091,10 @@ class MultiHeadAttention:
             ttnn.deallocate(pos_tensor_local)
 
         # 7. Convert to sharded for nlp_concat_heads_decode
-        scores_shard_config = ttnn.create_sharded_memory_config(
-            shape=(math.ceil(self.num_heads / 32) * 32, self.head_dim),
-            core_grid=batch_grid,
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
+        # TT pattern: L1_HEIGHT_SHARDED_MEMORY_CONFIG
+        attn_output_sharded = ttnn.to_memory_config(
+            attn_output_1bkd, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
         )
-        attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, scores_shard_config)
         ttnn.deallocate(attn_output_1bkd)
 
         # 8. Concat heads
