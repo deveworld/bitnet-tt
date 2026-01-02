@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: 1BKD path requires major refactoring
+        enable_trace: bool = True,  # 1BKD path with nlp_create_qkv_heads_decode
         batch_size: int = 1,
     ) -> None:
         """

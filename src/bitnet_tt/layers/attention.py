@@ -738,8 +738,26 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Use BKSD format for all cases (prefill and decode)
-        # NOTE: 1BKD format requires major refactoring for Trace support
+        # Route decode with preallocated cache to 1BKD path (Trace-safe)
+        # Uses nlp_create_qkv_heads_decode for proper 1BKD format
+        if (
+            mode == "decode"
+            and past_key_value is not None
+            and past_key_value._preallocated
+            and self.qkv_fused_weight is not None
+        ):
+            # Use fused QKV for nlp_create_qkv_heads_decode
+            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+            return self._forward_decode_1bkd(
+                xqkv_fused,
+                past_key_value,
+                current_pos,
+                batch_size,
+                current_pos_tensor,
+                pos_tensor,
+            )
+
+        # Use BKSD format for prefill and non-preallocated decode
         return self._forward_simple(
             query,
             key,
@@ -861,9 +879,7 @@ class MultiHeadAttention:
 
     def _forward_decode_1bkd(
         self,
-        query: ttnn.Tensor,
-        key: ttnn.Tensor,
-        value: ttnn.Tensor,
+        xqkv_fused: ttnn.Tensor,
         past_key_value: KVCache,
         current_pos: int,
         batch_size: int,
@@ -873,54 +889,38 @@ class MultiHeadAttention:
         """
         Decode forward with 1BKD tensor format for Metal Trace compatibility.
 
-        Uses paged_update_cache with tensor position, sdpa_decode with cur_pos_tensor,
-        and nlp_concat_heads_decode - all operations use tensor positions instead of
-        frozen int values, enabling Trace.
+        Uses nlp_create_qkv_heads_decode for direct 1BKD QKV split, then
+        paged_update_cache + sdpa_decode + nlp_concat_heads_decode.
+        All operations use tensor positions, enabling Trace.
 
         Args:
-            query: Q projection output [batch, 1, q_dim]
-            key: K projection output [batch, 1, k_dim]
-            value: V projection output [batch, 1, v_dim]
+            xqkv_fused: Fused QKV output [batch, 1, qkv_dim] from matmul with qkv_fused_weight
             past_key_value: Pre-allocated KV cache
             current_pos: Current sequence position (int)
             batch_size: Batch size
             current_pos_tensor: Position as tensor (int32) for cache update
             pos_tensor: Position as tensor (uint32) for RoPE
         """
-        seq_len = 1  # Decode is always single token
+        # 1. Reshape fused QKV to [1, 1, batch, qkv_dim] for nlp_create_qkv_heads_decode
+        # Input is [batch, 1, qkv_dim], need [1, 1, batch, qkv_dim]
+        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
+        fqkv_shape = xqkv_fused.shape
+        xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, fqkv_shape[2]))
+        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
-        # 1. Reshape to BKSD: [batch, heads, 1, head_dim]
-        query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+        # 2. Create QKV heads using nlp_create_qkv_heads_decode - outputs 1BKD format
+        q_heads_1bkd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
+            xqkv_fused,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(xqkv_fused)
 
-        query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
-        key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
-        value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
-
-        query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
-
-        query = ttnn.transpose(query, 1, 2)  # [batch, heads, 1, head_dim]
-        key = ttnn.transpose(key, 1, 2)
-        value = ttnn.transpose(value, 1, 2)
-
-        # 2. Apply RoPE (uses pos_tensor which is uint32)
-        query, key = self._apply_rope_manual(query, key, current_pos, seq_len, pos_tensor)
-
-        # 3. Convert BKSD to 1BKD: [batch, heads, 1, dim] -> [1, batch, heads, dim]
-        query_1bkd = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-        query_1bkd = ttnn.permute(query_1bkd, (2, 0, 1, 3))
-        query_1bkd = ttnn.to_layout(query_1bkd, ttnn.TILE_LAYOUT)
-
-        key_1bkd = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-        key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))
-        key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
-
-        value_1bkd = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
-        value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))
-        value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
+        # 3. Apply RoPE to Q and K in 1BKD format
+        # RoPE expects [1, batch, heads, head_dim]
+        q_heads_1bkd = self._apply_rope_1bkd(q_heads_1bkd, current_pos, pos_tensor)
+        k_heads_1bkd = self._apply_rope_1bkd(k_heads_1bkd, current_pos, pos_tensor)
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
@@ -941,34 +941,34 @@ class MultiHeadAttention:
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        key_sharded = ttnn.interleaved_to_sharded(key_1bkd, shard_config)
-        value_sharded = ttnn.interleaved_to_sharded(value_1bkd, shard_config)
+        k_sharded = ttnn.interleaved_to_sharded(k_heads_1bkd, shard_config)
+        v_sharded = ttnn.interleaved_to_sharded(v_heads_1bkd, shard_config)
 
         # 6. Update cache in-place with paged_update_cache
         ttnn.experimental.paged_update_cache(
-            past_key_value.key_cache, key_sharded, update_idxs_tensor=pos_tensor_local
+            past_key_value.key_cache, k_sharded, update_idxs_tensor=pos_tensor_local
         )
         ttnn.experimental.paged_update_cache(
-            past_key_value.value_cache, value_sharded, update_idxs_tensor=pos_tensor_local
+            past_key_value.value_cache, v_sharded, update_idxs_tensor=pos_tensor_local
         )
         past_key_value.seq_len_cached = current_pos + 1
 
-        # Cleanup intermediate tensors
-        ttnn.deallocate(key_1bkd)
-        ttnn.deallocate(value_1bkd)
-        ttnn.deallocate(key_sharded)
-        ttnn.deallocate(value_sharded)
+        # Cleanup
+        ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
+        ttnn.deallocate(k_sharded)
+        ttnn.deallocate(v_sharded)
 
         # 7. SDPA decode with full cache + cur_pos_tensor
         attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
-            query_1bkd,
+            q_heads_1bkd,
             past_key_value.key_cache,
             past_key_value.value_cache,
             cur_pos_tensor=pos_tensor_local,
             scale=self.scale,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        ttnn.deallocate(query_1bkd)
+        ttnn.deallocate(q_heads_1bkd)
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
@@ -983,7 +983,7 @@ class MultiHeadAttention:
         attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, concat_shard_config)
         ttnn.deallocate(attn_output_1bkd)
 
-        # 9. Concat heads and reshape output
+        # 9. Concat heads
         attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_sharded,
             num_heads=self.num_heads,
@@ -999,6 +999,64 @@ class MultiHeadAttention:
         output = self.o_proj(attn_output)
 
         return output, past_key_value
+
+    def _apply_rope_1bkd(
+        self,
+        x: ttnn.Tensor,
+        current_pos: int,
+        pos_tensor: ttnn.Tensor | None,
+    ) -> ttnn.Tensor:
+        """Apply RoPE to 1BKD tensor [1, batch, heads, head_dim]."""
+        # For 1BKD, we need to apply RoPE per-head
+        # Since we don't have rot_mats, use manual computation
+        # Convert to BKSD temporarily for RoPE, then back to 1BKD
+        x_bksd = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        x_bksd = ttnn.permute(x_bksd, (1, 2, 0, 3))  # [batch, heads, 1, dim]
+        x_bksd = ttnn.to_layout(x_bksd, ttnn.TILE_LAYOUT)
+
+        # Apply RoPE using existing infrastructure
+        rotated = self._apply_rope_single(x_bksd, current_pos, 1, pos_tensor)
+
+        # Convert back to 1BKD
+        rotated = ttnn.to_layout(rotated, ttnn.ROW_MAJOR_LAYOUT)
+        rotated = ttnn.permute(rotated, (2, 0, 1, 3))  # [1, batch, heads, dim]
+        rotated = ttnn.to_layout(rotated, ttnn.TILE_LAYOUT)
+
+        return rotated
+
+    def _apply_rope_single(
+        self,
+        x: ttnn.Tensor,
+        current_pos: int,
+        seq_len: int,
+        pos_tensor: ttnn.Tensor | None,
+    ) -> ttnn.Tensor:
+        """Apply RoPE to single BKSD tensor using precomputed cos/sin."""
+        device = x.device()
+
+        if pos_tensor is not None:
+            positions = pos_tensor
+        else:
+            positions = ttnn.from_torch(
+                torch.arange(current_pos, current_pos + seq_len, dtype=torch.long).unsqueeze(0),
+                dtype=ttnn.uint32,
+                device=device,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+
+        # Get cos/sin from precomputed tensors
+        cos_slice = self.cos_cached[:, :, current_pos : current_pos + seq_len, :]
+        sin_slice = self.sin_cached[:, :, current_pos : current_pos + seq_len, :]
+
+        # Apply rotary: x * cos + rotate_half(x) * sin
+        x1 = x[..., : self.head_dim // 2]
+        x2 = x[..., self.head_dim // 2 :]
+        x_rot = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+
+        x_cos = ttnn.mul(x, cos_slice)
+        x_rot_sin = ttnn.mul(x_rot, sin_slice)
+
+        return ttnn.add(x_cos, x_rot_sin)
 
     def _forward_prefill(
         self,
