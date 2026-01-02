@@ -835,31 +835,20 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Use 1BKD path for decode with preallocated cache (TT-Metal pattern)
-        # This path uses rotary_embedding_llama and maintains sharded state
-        if (
-            mode == "decode"
-            and past_key_value is not None
-            and past_key_value._preallocated
-            and self.qkv_fused_weight is not None
-        ):
-            # Generate rot_mats if not provided externally
-            if rot_mats is None:
-                rot_mats = self.get_rot_mats(
-                    torch.tensor([current_pos], dtype=torch.int64),
-                    batch_size=batch_size,
-                )
-
-            # Fused QKV projection
-            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-            return self._forward_decode_1bkd(
-                xqkv_fused,
-                past_key_value,
-                current_pos,
-                rot_mats,
-                batch_size,
-                current_pos_tensor,
-            )
+        # NOTE: 1BKD path disabled - rotary_embedding_llama requires HEIGHT_SHARDED inputs
+        # which cannot be properly created for batch=1. TT's 1BKD optimizations are designed
+        # for batch≥32 scenarios. Using stable BKSD path for batch=1 decode.
+        #
+        # if (
+        #     mode == "decode"
+        #     and past_key_value is not None
+        #     and past_key_value._preallocated
+        #     and self.qkv_fused_weight is not None
+        # ):
+        #     if rot_mats is None:
+        #         rot_mats = self.get_rot_mats(...)
+        #     xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+        #     return self._forward_decode_1bkd(...)
 
         # Use BKSD format for prefill and fallback decode
         return self._forward_simple(
