@@ -224,18 +224,20 @@ class KVCache:
         value_states: ttnn.Tensor,
         current_pos: int,
         num_kv_groups: int = 1,
+        current_pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """
-        Update pre-allocated cache using ttnn.update_cache for in-place updates.
+        Update pre-allocated cache using paged_update_cache for in-place updates.
 
-        This method enables Metal Trace by avoiding memory reallocation (concat).
+        This method enables Metal Trace by using tensor position (not frozen int).
         Cache stores NON-EXPANDED KV heads. GQA expansion happens when returning.
 
         Args:
             key_states: [batch, kv_heads, 1, head_dim] - single new token (NON-EXPANDED)
             value_states: [batch, kv_heads, 1, head_dim] - single new token (NON-EXPANDED)
-            current_pos: Current sequence position (cache_idx)
+            current_pos: Current sequence position (cache_idx) - for seq_len_cached tracking
             num_kv_groups: Number of query heads per KV head (for GQA expansion when returning)
+            current_pos_tensor: Device tensor with position (for Trace compatibility)
 
         Returns:
             GQA-expanded key and value for attention (sliced from cache)
@@ -243,23 +245,39 @@ class KVCache:
         if not self._preallocated:
             raise RuntimeError("Cache must be preallocated for in-place update")
 
-        # Convert BKSD [batch, kv_heads, 1, head_dim] to 1HBD [1, kv_heads, batch, head_dim]
-        # for ttnn.update_cache - NO GQA expansion, cache stores raw KV heads
-        key_1hbd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
-        key_1hbd = ttnn.permute(key_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
-        key_1hbd = ttnn.to_layout(key_1hbd, ttnn.TILE_LAYOUT)
+        # Convert BKSD [batch, kv_heads, 1, head_dim] to 1BKD [1, batch, kv_heads, head_dim]
+        # for paged_update_cache
+        key_1bkd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
+        key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))  # [1, batch, kv_heads, head_dim]
+        key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
 
-        value_1hbd = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
-        value_1hbd = ttnn.permute(value_1hbd, (2, 1, 0, 3))  # [1, kv_heads, batch, head_dim]
-        value_1hbd = ttnn.to_layout(value_1hbd, ttnn.TILE_LAYOUT)
+        value_1bkd = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
+        value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))  # [1, batch, kv_heads, head_dim]
+        value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
 
-        # In-place update using ttnn.update_cache
-        self.key_cache = ttnn.update_cache(self.key_cache, key_1hbd, current_pos)
-        self.value_cache = ttnn.update_cache(self.value_cache, value_1hbd, current_pos)
+        # Create position tensor if not provided (backward compatibility)
+        pos_tensor_created_locally = current_pos_tensor is None
+        if current_pos_tensor is None:
+            current_pos_tensor = ttnn.from_torch(
+                torch.tensor([current_pos], dtype=torch.int32),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+            )
+
+        # In-place update using paged_update_cache (supports tensor position for Trace)
+        ttnn.experimental.paged_update_cache(
+            self.key_cache, key_1bkd, update_idxs_tensor=current_pos_tensor
+        )
+        ttnn.experimental.paged_update_cache(
+            self.value_cache, value_1bkd, update_idxs_tensor=current_pos_tensor
+        )
 
         # Cleanup temporary tensors
-        ttnn.deallocate(key_1hbd)
-        ttnn.deallocate(value_1hbd)
+        ttnn.deallocate(key_1bkd)
+        ttnn.deallocate(value_1bkd)
+        if pos_tensor_created_locally:
+            ttnn.deallocate(current_pos_tensor)
 
         self.seq_len_cached = current_pos + 1
 
@@ -783,7 +801,7 @@ class MultiHeadAttention:
                 # Otherwise fall back to concat-based update
                 if past_key_value._preallocated:
                     key_expanded, value_expanded = past_key_value.update_decode_inplace(
-                        key, value, current_pos, self.num_kv_groups
+                        key, value, current_pos, self.num_kv_groups, current_pos_tensor
                     )
                 else:
                     key_expanded, value_expanded = past_key_value.update_decode_expanded(

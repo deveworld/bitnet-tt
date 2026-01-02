@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: ttnn.update_cache uses int position (frozen in trace); need paged_update_cache with tensor for Trace
+        enable_trace: bool = True,  # paged_update_cache with tensor position enables dynamic KV updates in Trace
         batch_size: int = 1,
     ) -> None:
         """
