@@ -359,6 +359,7 @@ class TextGenerator:
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=self.device,
         )
+        ttnn.synchronize_device(self.device)  # Ensure buffer is allocated
 
         _, _ = self.model(
             input_tensor,
