@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: paged_update_cache requires sharded input (complex refactoring needed)
+        enable_trace: bool = True,  # Sharded KV path with paged_update_cache enables Trace
         batch_size: int = 1,
     ) -> None:
         """
