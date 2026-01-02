@@ -905,29 +905,18 @@ class MultiHeadAttention:
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
         fqkv_shape = xqkv_fused.shape
 
-        # Handle both 3D [batch, seq, qkv_dim] and 4D [1, 1, batch*seq, qkv_dim] inputs
-        # First layer: hidden_states is 3D, subsequent layers may be 4D
+        # Handle both 3D and 4D inputs
+        # First layer: input is 3D [batch, seq, qkv_dim]
+        # Subsequent layers: input is already 4D [1, 1, X, qkv_dim] from previous layer
         if len(fqkv_shape) == 3:
             # 3D: [batch, seq, qkv_dim] -> [1, 1, batch, qkv_dim]
             qkv_dim = fqkv_shape[-1]
             xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
         elif len(fqkv_shape) == 4:
-            # 4D: already [1, 1, ..., qkv_dim], just need to adjust batch dim
-            # Input is [1, 1, X, qkv_dim], need [1, 1, batch, qkv_dim]
-            qkv_dim = fqkv_shape[-1]
-            # Flatten and reshape: [1, 1, X, qkv_dim] -> [1, 1, batch, qkv_dim]
-            # But we need to handle padding. If X > batch, we need to slice.
-            current_batch_dim = fqkv_shape[2]
-            if current_batch_dim == batch_size:
-                # Already correct shape, no reshape needed
-                pass
-            else:
-                # Flatten to 3D first, then reshape
-                total_volume = 1
-                for d in fqkv_shape:
-                    total_volume *= d
-                # Calculate actual qkv_dim based on volume
-                xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
+            # 4D: already has correct format [1, 1, X, qkv_dim]
+            # nlp_create_qkv_heads_decode can handle padded batch (X may include TILE padding)
+            # No reshape needed - pass through as-is
+            pass
         else:
             raise ValueError(f"Unexpected xqkv_fused shape: {fqkv_shape}")
 
