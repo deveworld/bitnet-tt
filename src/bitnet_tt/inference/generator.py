@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: 1BKD path incompatible with batch=1
+        enable_trace: bool = True,  # 1BKD path with TT-Metal rotary_embedding_llama
         batch_size: int = 1,
     ) -> None:
         """

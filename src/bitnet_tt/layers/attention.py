@@ -627,6 +627,116 @@ class MultiHeadAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
+        # TILE layout cos/sin for rotary_embedding_llama
+        # Format: [1, 1, max_seq_len, head_dim]
+        self.cos_cache_tile = ttnn.from_torch(
+            torch.from_numpy(cos_np.astype(np.float32)),
+            device=device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self.sin_cache_tile = ttnn.from_torch(
+            torch.from_numpy(sin_np.astype(np.float32)),
+            device=device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # Transformation matrix for rotary_embedding_llama (decode mode)
+        # TT pattern uses 32x32 matrix for single tile
+        trans_mat = self._get_rot_transformation_mat()
+        self.transformation_mat_decode = ttnn.from_torch(
+            trans_mat,
+            device=device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+
+        # Store core grid for dynamic sharding
+        self.core_grid = device.compute_with_storage_grid_size()
+
+    def _get_rot_transformation_mat(self) -> torch.Tensor:
+        """
+        Create transformation matrix for rotary_embedding_llama.
+
+        TT pattern: 32x32 matrix that performs the rotation operation.
+        Based on models/tt_transformers/tt/common.py:get_rot_transformation_mat
+        """
+        dhead = 32  # TILE_SIZE
+        rot_emb_matrix = torch.zeros(1, 1, dhead, dhead)
+        rot_emb_matrix[..., torch.arange(0, dhead, 2), torch.arange(1, dhead, 2)] = 1
+        rot_emb_matrix[..., torch.arange(1, dhead, 2), torch.arange(0, dhead, 2)] = -1
+        return rot_emb_matrix
+
+    def get_rot_mats(
+        self, position_ids: torch.Tensor, batch_size: int = 1
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Get rotation matrices (cos, sin) for given positions.
+
+        TT pattern: Use embedding lookup, then transpose and shard.
+        Based on models/tt_transformers/tt/rope.py:RotarySetup.get_rot_mats
+
+        Args:
+            position_ids: [batch] tensor of position indices
+            batch_size: Batch size for sharding config
+
+        Returns:
+            (cos, sin) tuple of sharded tensors
+        """
+        # Pad to nearest 32 for TILE alignment
+        padded_batch = ((batch_size + 31) // 32) * 32
+        if len(position_ids) < padded_batch:
+            position_ids = torch.nn.functional.pad(
+                position_ids, (0, padded_batch - len(position_ids)), value=0
+            )
+
+        # Create position tensor [1, padded_batch]
+        rot_idxs = ttnn.from_torch(
+            position_ids.reshape(1, -1).to(torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # Embedding lookup: [1, batch, head_dim]
+        cos = ttnn.embedding(rot_idxs, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(rot_idxs, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
+
+        # Expand to 4D: [1, 1, batch, head_dim]
+        cos = ttnn.unsqueeze_to_4D(cos)
+        sin = ttnn.unsqueeze_to_4D(sin)
+
+        # Transpose: [1, batch, 1[32], head_dim]
+        cos = ttnn.transpose(cos, 1, 2)
+        sin = ttnn.transpose(sin, 1, 2)
+
+        # Slice to actual batch if padded
+        if batch_size < padded_batch:
+            cos = cos[:, :batch_size, :, :]
+            sin = sin[:, :batch_size, :, :]
+
+        # Create sharded memory config with dynamic core grid
+        batch_grid = ttnn.num_cores_to_corerangeset(batch_size, self.core_grid, row_wise=True)
+        mem_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),  # TILE_SIZE x head_dim
+            core_grid=batch_grid,
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+
+        # Convert to sharded
+        cos = ttnn.interleaved_to_sharded(cos, mem_config)
+        sin = ttnn.interleaved_to_sharded(sin, mem_config)
+
+        ttnn.deallocate(rot_idxs)
+        return cos, sin
+
     def load_weights(
         self,
         q_weight: NDArray[np.floating],
@@ -738,11 +848,33 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # NOTE: 1BKD path disabled due to batch=1 vs TT's batch=32 incompatibility
-        # and complex sharding/RoPE requirements. Using stable BKSD path.
-        # TODO: Re-enable when proper batch=1 1BKD support is implemented
+        # Use 1BKD path for decode with preallocated cache (TT-Metal pattern)
+        # This path uses rotary_embedding_llama and maintains sharded state
+        if (
+            mode == "decode"
+            and past_key_value is not None
+            and past_key_value._preallocated
+            and self.qkv_fused_weight is not None
+        ):
+            # Generate rot_mats if not provided externally
+            if rot_mats is None:
+                rot_mats = self.get_rot_mats(
+                    torch.tensor([current_pos], dtype=torch.int64),
+                    batch_size=batch_size,
+                )
 
-        # Use BKSD format for all decode and prefill
+            # Fused QKV projection
+            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+            return self._forward_decode_1bkd(
+                xqkv_fused,
+                past_key_value,
+                current_pos,
+                rot_mats,
+                batch_size,
+                current_pos_tensor,
+            )
+
+        # Use BKSD format for prefill and fallback decode
         return self._forward_simple(
             query,
             key,
@@ -867,59 +999,73 @@ class MultiHeadAttention:
         xqkv_fused: ttnn.Tensor,
         past_key_value: KVCache,
         current_pos: int,
+        rot_mats: Tuple[ttnn.Tensor, ttnn.Tensor],
         batch_size: int,
         current_pos_tensor: ttnn.Tensor | None,
-        pos_tensor: ttnn.Tensor | None,
     ) -> Tuple[ttnn.Tensor, KVCache]:
         """
         Decode forward with 1BKD tensor format for Metal Trace compatibility.
 
-        Uses nlp_create_qkv_heads_decode for direct 1BKD QKV split, then
-        paged_update_cache + sdpa_decode + nlp_concat_heads_decode.
-        All operations use tensor positions, enabling Trace.
+        Uses TT-Metal pattern:
+        - nlp_create_qkv_heads_decode for 1BKD heads
+        - rotary_embedding_llama for RoPE (maintains sharded state)
+        - paged_update_cache for cache update
+        - sdpa_decode for attention
+        - nlp_concat_heads_decode for output
 
         Args:
-            xqkv_fused: Fused QKV output [batch, 1, qkv_dim] from matmul with qkv_fused_weight
+            xqkv_fused: Fused QKV output [batch, 1, qkv_dim] from matmul
             past_key_value: Pre-allocated KV cache
             current_pos: Current sequence position (int)
+            rot_mats: (cos, sin) from get_rot_mats
             batch_size: Batch size
             current_pos_tensor: Position as tensor (int32) for cache update
-            pos_tensor: Position as tensor (uint32) for RoPE
         """
         # 1. Reshape fused QKV to [1, 1, batch, qkv_dim] for nlp_create_qkv_heads_decode
+        # TT pattern uses reshape with tile shape for proper padding
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
         fqkv_shape = xqkv_fused.shape
 
-        # Handle both 3D and 4D inputs
-        # First layer: input is 3D [batch, seq, qkv_dim]
-        # Subsequent layers: input is already 4D [1, 1, X, qkv_dim] from previous layer
         if len(fqkv_shape) == 3:
             # 3D: [batch, seq, qkv_dim] -> [1, 1, batch, qkv_dim]
             qkv_dim = fqkv_shape[-1]
-            xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
+            # Use reshape with tile shape (second arg) for proper TILE padding
+            xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim), (1, 1, 32, qkv_dim))
         elif len(fqkv_shape) == 4:
-            # 4D: already has correct format [1, 1, X, qkv_dim]
-            # nlp_create_qkv_heads_decode can handle padded batch (X may include TILE padding)
-            # No reshape needed - pass through as-is
+            # 4D: already correct format, pass through
             pass
         else:
             raise ValueError(f"Unexpected xqkv_fused shape: {fqkv_shape}")
 
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
-        # 2. Create QKV heads using nlp_create_qkv_heads_decode - outputs 1BKD format
+        # 2. Create QKV heads - outputs 1BKD sharded tensors
+        # Use dynamic shard config based on batch size
+        batch_grid = ttnn.num_cores_to_corerangeset(batch_size, self.core_grid, row_wise=True)
+        create_qkv_shard = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),  # TILE_SIZE x head_dim
+            core_grid=batch_grid,
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+
         q_heads_1bkd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
+            memory_config=create_qkv_shard,
         )
         ttnn.deallocate(xqkv_fused)
 
-        # 3. Apply RoPE to Q and K in 1BKD format
-        # RoPE expects [1, batch, heads, head_dim]
-        q_heads_1bkd = self._apply_rope_1bkd(q_heads_1bkd, current_pos, pos_tensor)
-        k_heads_1bkd = self._apply_rope_1bkd(k_heads_1bkd, current_pos, pos_tensor)
+        # 3. Apply RoPE using rotary_embedding_llama (maintains sharded state)
+        cos, sin = rot_mats
+        q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+            q_heads_1bkd, cos, sin, self.transformation_mat_decode, is_decode_mode=True
+        )
+        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+            k_heads_1bkd, cos, sin, self.transformation_mat_decode, is_decode_mode=True
+        )
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
@@ -932,9 +1078,8 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # 5. Update cache in-place with paged_update_cache
-        # nlp_create_qkv_heads_decode outputs are already sharded - no extra sharding needed
-        # TT pattern: call paged_update_cache directly (Lines 490-492 in tt-metal attention.py)
+        # 5. Update cache with paged_update_cache
+        # TT pattern: nlp outputs are sharded, call paged_update_cache directly
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache, k_heads_1bkd, update_idxs_tensor=pos_tensor_local
         )
@@ -947,7 +1092,7 @@ class MultiHeadAttention:
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_heads_1bkd)
 
-        # 7. SDPA decode with full cache + cur_pos_tensor
+        # 6. SDPA decode
         # Q must be in DRAM when not sharded
         q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bkd)
@@ -964,32 +1109,30 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
-        # 8. Convert to sharded for nlp_concat_heads_decode
-        concat_shard_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),
-            core_grid=ttnn.CoreGrid(y=1, x=1),
+        # 7. Convert to sharded for nlp_concat_heads_decode
+        scores_shard_config = ttnn.create_sharded_memory_config(
+            shape=(math.ceil(self.num_heads / 32) * 32, self.head_dim),
+            core_grid=batch_grid,
             strategy=ttnn.ShardStrategy.HEIGHT,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, concat_shard_config)
+        attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, scores_shard_config)
         ttnn.deallocate(attn_output_1bkd)
 
-        # 9. Concat heads
+        # 8. Concat heads
         attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_sharded,
             num_heads=self.num_heads,
         )
         ttnn.deallocate(attn_output_sharded)
 
-        # 10. Convert from sharded to interleaved for RMS norm
+        # 9. Convert from sharded to interleaved for RMS norm
         attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(attn_output_concat)
 
-        # Keep 4D format consistent throughout - no reshape needed
+        # 10. Apply sub-norm and output projection
         # TT pattern: nlp_concat_heads_decode output goes directly to matmul(wo)
-
-        # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
