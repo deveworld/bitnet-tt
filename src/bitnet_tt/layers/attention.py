@@ -966,6 +966,7 @@ class MultiHeadAttention:
         """Manual RoPE implementation using device-cached cos/sin tables."""
         if seq_len == 1:
             # Decode mode: use embedding lookup with single position
+            pos_tensor_created_locally = pos_tensor is None
             if pos_tensor is None:
                 pos_tensor = ttnn.from_torch(
                     torch.tensor([[start_pos]], dtype=torch.int32),
@@ -977,7 +978,9 @@ class MultiHeadAttention:
             sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
             cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, 1, self.head_dim))
             sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, 1, self.head_dim))
-            ttnn.deallocate(pos_tensor)
+            # Only deallocate if we created it locally; keep external tensor alive for Trace
+            if pos_tensor_created_locally:
+                ttnn.deallocate(pos_tensor)
         else:
             # Prefill mode: use embedding lookup for range
             pos_indices = torch.arange(start_pos, start_pos + seq_len, dtype=torch.int32)
