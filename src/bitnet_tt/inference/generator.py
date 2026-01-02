@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = True,  # Enabled: in-place KV cache allows Trace for 2-3x speedup
+        enable_trace: bool = False,  # Disabled: pos_tensor buffer issue with external passing
         batch_size: int = 1,
     ) -> None:
         """
