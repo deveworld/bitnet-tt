@@ -947,35 +947,20 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # 5. Convert to sharded for paged_update_cache
-        # Note: k_heads after RoPE is interleaved, but v_heads is still sharded from nlp_create
-        v_heads_interleaved = ttnn.sharded_to_interleaved(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
-
-        shard_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),
-            core_grid=ttnn.CoreGrid(y=1, x=1),
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
-        )
-        k_sharded = ttnn.interleaved_to_sharded(k_heads_1bkd, shard_config)
-        v_sharded = ttnn.interleaved_to_sharded(v_heads_interleaved, shard_config)
-        ttnn.deallocate(v_heads_interleaved)
-
-        # 6. Update cache in-place with paged_update_cache
+        # 5. Update cache in-place with paged_update_cache
+        # nlp_create_qkv_heads_decode outputs are already sharded - no extra sharding needed
+        # TT pattern: call paged_update_cache directly (Lines 490-492 in tt-metal attention.py)
         ttnn.experimental.paged_update_cache(
-            past_key_value.key_cache, k_sharded, update_idxs_tensor=pos_tensor_local
+            past_key_value.key_cache, k_heads_1bkd, update_idxs_tensor=pos_tensor_local
         )
         ttnn.experimental.paged_update_cache(
-            past_key_value.value_cache, v_sharded, update_idxs_tensor=pos_tensor_local
+            past_key_value.value_cache, v_heads_1bkd, update_idxs_tensor=pos_tensor_local
         )
         past_key_value.seq_len_cached = current_pos + 1
 
-        # Cleanup
+        # Cleanup K, V after cache update
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_heads_1bkd)
-        ttnn.deallocate(k_sharded)
-        ttnn.deallocate(v_sharded)
 
         # 7. SDPA decode with full cache + cur_pos_tensor
         # Q must be in DRAM when not sharded
