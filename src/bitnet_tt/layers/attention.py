@@ -476,33 +476,28 @@ class KVCache:
         if not self._preallocated:
             raise RuntimeError("Cache not preallocated")
 
-        # Copy prefill KV to the start of pre-allocated cache
-        # Use slice assignment: cache[:, :, :seq_len, :] = states
-        # TT-NN doesn't have direct slice assignment, so we use paged_update_cache
-        # for each position, or slice + concat
+        prefill_seq_len = key_states.shape[2]
+        if prefill_seq_len > self.max_seq_len:
+            raise RuntimeError(
+                f"Prefill seq_len {prefill_seq_len} > max_seq_len {self.max_seq_len}"
+            )
 
-        # For efficiency, we'll slice the pre-allocated cache and copy
-        # Actually, for prefill we need to write to positions 0..seq_len-1
+        # Use ttnn.fill_cache to copy prefill KV into preallocated cache
+        # fill_cache writes to cache[batch_idx, :, :seq_len, :]
+        # Since we have batch=1, use batch_idx=0
+        for batch_idx in range(key_states.shape[0]):
+            # Slice single batch item: [1, heads, seq, head_dim]
+            k_batch = key_states[batch_idx : batch_idx + 1, :, :, :]
+            v_batch = value_states[batch_idx : batch_idx + 1, :, :, :]
 
-        # Simple approach: just overwrite the pre-allocated cache with the prefill result
-        # The cache tensors from prefill should fit within the pre-allocated size
-        if key_states.shape[2] <= self.max_seq_len:
-            # The prefill cache is smaller than or equal to max_seq_len
-            # We can use it directly for decode since SDPA will use cur_pos to limit
-            # But we need the pre-allocated format for paged_update_cache
+            # fill_cache expects input shape matching cache dimensions
+            # Cache: [batch, heads, max_seq, head_dim]
+            # Input: [1, heads, prefill_seq, head_dim]
+            self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
+            self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
 
-            # For now, store the prefill cache and use it
-            # The decode path will check seq_len_cached
-            # Note: This isn't truly pre-allocated mode but works as a fallback
-            if self.key_cache is not None:
-                ttnn.deallocate(self.key_cache)
-            if self.value_cache is not None:
-                ttnn.deallocate(self.value_cache)
-            self.key_cache = key_states
-            self.value_cache = value_states
-            self.seq_len_cached = seq_len
-            # Mark as NOT preallocated since we replaced the buffer
-            self._preallocated = False
+        self.seq_len_cached = prefill_seq_len
+        # Keep _preallocated=True since we're using the preallocated buffer
 
 
 def precompute_freqs_cis(
