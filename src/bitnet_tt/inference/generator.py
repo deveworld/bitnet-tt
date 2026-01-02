@@ -41,9 +41,7 @@ def _on_device_argmax(logits: ttnn.Tensor) -> NDArray[np.int64]:
     return indices_np.flatten()
 
 
-def _on_device_topk(
-    logits: ttnn.Tensor, k: int
-) -> tuple[NDArray[np.floating], NDArray[np.int64]]:
+def _on_device_topk(logits: ttnn.Tensor, k: int) -> tuple[NDArray[np.floating], NDArray[np.int64]]:
     """
     Perform top-k selection on device.
 
@@ -102,10 +100,10 @@ class GenerationStats:
     def __str__(self) -> str:
         return (
             f"\n[Stats] "
-            f"Prompt: {self.prompt_tokens} tokens ({self.prompt_time*1000:.1f}ms) | "
+            f"Prompt: {self.prompt_tokens} tokens ({self.prompt_time * 1000:.1f}ms) | "
             f"Generated: {self.generated_tokens} tokens ({self.generation_time:.2f}s) | "
             f"Speed: {self.tokens_per_second:.2f} tokens/s | "
-            f"TTFT: {self.time_to_first_token*1000:.1f}ms"
+            f"TTFT: {self.time_to_first_token * 1000:.1f}ms"
         )
 
 
@@ -179,9 +177,7 @@ class TextGenerator:
         try:
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "microsoft/bitnet-b1.58-2B-4T"
-            )
+            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T")
         except ImportError:
             print("Warning: transformers not installed. Cannot load tokenizer.")
             self.tokenizer = None
@@ -270,12 +266,15 @@ class TextGenerator:
         # Key optimization: Cache stores already-expanded heads, so decode
         # only needs to expand the single new token (not all cached positions)
         for cache in kv_cache:
-            if hasattr(cache, '_prefill_key') and cache._prefill_key is not None:
+            if hasattr(cache, "_prefill_key") and cache._prefill_key is not None:
                 # _prefill_key/value are already GQA-expanded!
                 cache.key_cache = cache._prefill_key
                 cache.value_cache = cache._prefill_value
                 cache._prefill_key = None
                 cache._prefill_value = None
+                # Mark as preallocated to enable in-place decode updates
+                cache._preallocated = True
+                cache._gqa_expanded = True
 
         return logits, kv_cache
 
@@ -485,14 +484,10 @@ class TextGenerator:
         logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_optimized)
 
         # Sample first token
-        next_token = self._sample_next_token(
-            logits, temperature, top_k, do_sample
-        )
+        next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
         ttnn.deallocate(logits)
 
-        generated = np.concatenate(
-            [generated, next_token.reshape(batch_size, 1)], axis=1
-        )
+        generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
 
         # Check EOS
         if self._is_eos(next_token[0]):
@@ -508,12 +503,13 @@ class TextGenerator:
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
-                    self._trace_id, self._trace_output, self._trace_inputs = \
+                    self._trace_id, self._trace_output, self._trace_inputs = (
                         self._capture_decode_trace(
                             generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
+                    )
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
@@ -526,14 +522,10 @@ class TextGenerator:
                 )
 
             # Sample next token
-            next_token = self._sample_next_token(
-                logits, temperature, top_k, do_sample
-            )
+            next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
             ttnn.deallocate(logits)
 
-            generated = np.concatenate(
-                [generated, next_token.reshape(batch_size, 1)], axis=1
-            )
+            generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
 
             if self._is_eos(next_token[0]):
                 break
@@ -624,7 +616,7 @@ class TextGenerator:
         top_k: int | None = 50,
         do_sample: bool = True,
         use_cache: bool = True,  # Always True in optimized version
-        use_optimized: bool = False,  # Disabled: paged_update_cache requires HEIGHT_SHARDED
+        use_optimized: bool = True,  # Use in-place KV cache update for better performance
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """
         Generate text with streaming output.
@@ -664,9 +656,7 @@ class TextGenerator:
         next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
         ttnn.deallocate(logits)
 
-        generated = np.concatenate(
-            [generated, next_token.reshape(batch_size, 1)], axis=1
-        )
+        generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
         stats.generated_tokens += 1
 
         # Yield first token
@@ -689,12 +679,13 @@ class TextGenerator:
             if self.enable_trace:
                 if self._trace_id is None:
                     # First decode step: capture trace
-                    self._trace_id, self._trace_output, self._trace_inputs = \
+                    self._trace_id, self._trace_output, self._trace_inputs = (
                         self._capture_decode_trace(
                             generated[:, -1:],
                             current_pos,
                             kv_cache,
                         )
+                    )
                     logits = self._trace_output
                 else:
                     # Subsequent steps: execute captured trace
@@ -714,9 +705,7 @@ class TextGenerator:
             next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
             ttnn.deallocate(logits)
 
-            generated = np.concatenate(
-                [generated, next_token.reshape(batch_size, 1)], axis=1
-            )
+            generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
             stats.generated_tokens += 1
 
             # Yield new text
