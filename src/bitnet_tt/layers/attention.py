@@ -1036,17 +1036,8 @@ class MultiHeadAttention:
         pos_tensor: ttnn.Tensor | None,
     ) -> ttnn.Tensor:
         """Apply RoPE to single BKSD tensor using precomputed cos/sin."""
-        device = x.device()
-
-        if pos_tensor is not None:
-            positions = pos_tensor
-        else:
-            positions = ttnn.from_torch(
-                torch.arange(current_pos, current_pos + seq_len, dtype=torch.long).unsqueeze(0),
-                dtype=ttnn.uint32,
-                device=device,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-            )
+        # Note: pos_tensor is available for Trace-compatible position-based indexing
+        # but current implementation uses int-based slicing (not Trace-safe)
 
         # Get cos/sin from precomputed tensors
         cos_slice = self.cos_cached[:, :, current_pos : current_pos + seq_len, :]
