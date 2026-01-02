@@ -810,21 +810,96 @@ class MultiHeadAttention:
                 past_key_value = KVCache()
 
             if mode == "prefill":
-                # Prefill: expand and store in cache
+                # Prefill: expand and store in cache (BKSD)
                 key_expanded, value_expanded = past_key_value.update_prefill(
                     key, value, self.num_kv_groups
                 )
+                # Prefill uses standard SDPA with causal mask
+                attn_output = ttnn.transformer.scaled_dot_product_attention(
+                    query,
+                    key_expanded,
+                    value_expanded,
+                    attn_mask=attention_mask,
+                    is_causal=True,
+                    scale=self.scale,
+                )
             else:
-                # Decode: use in-place update if cache is preallocated (Trace compatible)
-                # Otherwise fall back to concat-based update
-                if past_key_value._preallocated:
-                    key_expanded, value_expanded = past_key_value.update_decode_inplace(
-                        key, value, current_pos, self.num_kv_groups, current_pos_tensor
+                # Decode with 1BKD format for Trace compatibility
+                # 1. Convert BKSD [batch, heads, 1, head_dim] -> 1BKD [1, batch, heads, head_dim]
+                query_1bkd = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
+                query_1bkd = ttnn.permute(query_1bkd, (2, 0, 1, 3))  # [1, batch, heads, head_dim]
+                query_1bkd = ttnn.to_layout(query_1bkd, ttnn.TILE_LAYOUT)
+
+                key_1bkd = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
+                key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))
+                key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
+
+                value_1bkd = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+                value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))
+                value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
+
+                # 2. Create position tensor if not provided
+                pos_tensor_local = current_pos_tensor
+                pos_created_locally = current_pos_tensor is None
+                if pos_created_locally:
+                    pos_tensor_local = ttnn.from_torch(
+                        torch.tensor([current_pos], dtype=torch.int32),
+                        dtype=ttnn.int32,
+                        layout=ttnn.ROW_MAJOR_LAYOUT,
+                        device=self.device,
                     )
-                else:
-                    key_expanded, value_expanded = past_key_value.update_decode_expanded(
-                        key, value, current_pos, self.num_kv_groups
-                    )
+
+                # 3. Convert to sharded for paged_update_cache
+                shard_config = ttnn.create_sharded_memory_config(
+                    shape=(32, self.head_dim),
+                    core_grid=ttnn.CoreGrid(y=1, x=1),
+                    strategy=ttnn.ShardStrategy.HEIGHT,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+                key_sharded = ttnn.interleaved_to_sharded(key_1bkd, shard_config)
+                value_sharded = ttnn.interleaved_to_sharded(value_1bkd, shard_config)
+
+                # 4. Update cache in-place with paged_update_cache
+                ttnn.experimental.paged_update_cache(
+                    past_key_value.key_cache, key_sharded, update_idxs_tensor=pos_tensor_local
+                )
+                ttnn.experimental.paged_update_cache(
+                    past_key_value.value_cache, value_sharded, update_idxs_tensor=pos_tensor_local
+                )
+                past_key_value.seq_len_cached = current_pos + 1
+
+                # Cleanup intermediate tensors
+                ttnn.deallocate(key_1bkd)
+                ttnn.deallocate(value_1bkd)
+                ttnn.deallocate(key_sharded)
+                ttnn.deallocate(value_sharded)
+
+                # 5. SDPA decode with full cache + cur_pos_tensor
+                attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
+                    query_1bkd,
+                    past_key_value.key_cache,
+                    past_key_value.value_cache,
+                    cur_pos_tensor=pos_tensor_local,
+                    scale=self.scale,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                ttnn.deallocate(query_1bkd)
+                if pos_created_locally:
+                    ttnn.deallocate(pos_tensor_local)
+
+                # 6. Concat heads and reshape output
+                attn_output = ttnn.experimental.nlp_concat_heads_decode(
+                    attn_output_1bkd,
+                    num_heads=self.num_heads,
+                )
+                ttnn.deallocate(attn_output_1bkd)
+
+                # Apply sub-norm and output projection
+                attn_output = self.attn_sub_norm(attn_output)
+                output = self.o_proj(attn_output)
+                return output, past_key_value
+
             updated_cache = past_key_value
         else:
             # No cache: expand inline
@@ -834,17 +909,16 @@ class MultiHeadAttention:
             else:
                 key_expanded = key
                 value_expanded = value
-
-        # SDPA - use standard version (sdpa_decode requires 1BKD format, not compatible with BKSD cache)
-        is_causal = mode == "prefill"
-        attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query,
-            key_expanded,
-            value_expanded,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-            scale=self.scale,
-        )
+            # No cache SDPA
+            attn_output = ttnn.transformer.scaled_dot_product_attention(
+                query,
+                key_expanded,
+                value_expanded,
+                attn_mask=attention_mask,
+                is_causal=mode == "prefill",
+                scale=self.scale,
+            )
+            updated_cache = None
 
         # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         # Optimization: transpose in TILE, reshape in ROW_MAJOR
