@@ -738,26 +738,11 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Route decode with preallocated cache to 1BKD path (Trace-safe)
-        # Uses nlp_create_qkv_heads_decode for proper 1BKD format
-        if (
-            mode == "decode"
-            and past_key_value is not None
-            and past_key_value._preallocated
-            and self.qkv_fused_weight is not None
-        ):
-            # Use fused QKV for nlp_create_qkv_heads_decode
-            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-            return self._forward_decode_1bkd(
-                xqkv_fused,
-                past_key_value,
-                current_pos,
-                batch_size,
-                current_pos_tensor,
-                pos_tensor,
-            )
+        # NOTE: 1BKD path disabled due to batch=1 vs TT's batch=32 incompatibility
+        # and complex sharding/RoPE requirements. Using stable BKSD path.
+        # TODO: Re-enable when proper batch=1 1BKD support is implemented
 
-        # Use BKSD format for prefill and non-preallocated decode
+        # Use BKSD format for all decode and prefill
         return self._forward_simple(
             query,
             key,
