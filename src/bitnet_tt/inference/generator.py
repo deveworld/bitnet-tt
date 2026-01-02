@@ -262,30 +262,20 @@ class TextGenerator:
         )
         ttnn.deallocate(input_tensor)
 
-        # Initialize KV caches for decode using pre-expanded GQA cache
-        # Key optimization: Cache stores already-expanded heads, so decode
-        # only needs to expand the single new token (not all cached positions)
+        # For non-preallocated caches, transfer prefill results to cache
+        # (Preallocated caches are handled directly in update_prefill via fill_cache)
         for cache in kv_cache:
-            if hasattr(cache, "_prefill_key") and cache._prefill_key is not None:
-                # _prefill_key/value are already GQA-expanded!
-                prefill_key = cache._prefill_key
-                prefill_value = cache._prefill_value
-                prefill_seq_len = prefill_key.shape[2]
+            if (
+                not cache._preallocated
+                and hasattr(cache, "_prefill_key")
+                and cache._prefill_key is not None
+            ):
+                # _prefill_key/value are already GQA-expanded for concat-based decode
+                cache.key_cache = cache._prefill_key
+                cache.value_cache = cache._prefill_value
                 cache._prefill_key = None
                 cache._prefill_value = None
-
-                # If cache is preallocated, copy prefill into it using fill_cache
-                if cache._preallocated and cache.key_cache is not None:
-                    cache.copy_from_prefill(prefill_key, prefill_value, prefill_seq_len)
-                    # Deallocate prefill tensors since they're now in the preallocated cache
-                    ttnn.deallocate(prefill_key)
-                    ttnn.deallocate(prefill_value)
-                else:
-                    # Not preallocated: use prefill tensors directly (concat-based decode)
-                    cache.key_cache = prefill_key
-                    cache.value_cache = prefill_value
-                    cache.seq_len_cached = prefill_seq_len
-                    cache._gqa_expanded = True
+                cache._gqa_expanded = True
 
         return logits, kv_cache
 

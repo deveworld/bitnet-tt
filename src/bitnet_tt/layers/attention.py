@@ -132,7 +132,6 @@ class KVCache:
             Expanded key and value for attention
         """
         seq_len = key_states.shape[2]
-        self.seq_len_cached = seq_len
         self.num_kv_heads = key_states.shape[1]
         self.num_heads = self.num_kv_heads * num_kv_groups
         self._gqa_expanded = num_kv_groups > 1
@@ -145,15 +144,30 @@ class KVCache:
             key_expanded = key_states
             value_expanded = value_states
 
-        # Store in temporary variables for decode initialization
-        self._prefill_key = key_expanded
-        self._prefill_value = value_expanded
+        # If preallocated, use fill_cache to write into the existing buffer
+        if self._preallocated and self.key_cache is not None:
+            # Use fill_cache to copy prefill results into preallocated cache
+            # fill_cache writes to cache[batch_idx, :, :seq_len, :]
+            for batch_idx in range(key_expanded.shape[0]):
+                k_batch = key_expanded[batch_idx : batch_idx + 1, :, :, :]
+                v_batch = value_expanded[batch_idx : batch_idx + 1, :, :, :]
+                self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
+                self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
 
-        # Also set as cache for concat-based decode
-        self.key_cache = key_expanded
-        self.value_cache = value_expanded
-
-        return key_expanded, value_expanded
+            self.seq_len_cached = seq_len
+            # Return sliced view of preallocated cache for attention
+            key_for_attn = self.key_cache[:, :, :seq_len, :]
+            value_for_attn = self.value_cache[:, :, :seq_len, :]
+            return key_for_attn, value_for_attn
+        else:
+            # Not preallocated: store in temporary variables for decode initialization
+            self._prefill_key = key_expanded
+            self._prefill_value = value_expanded
+            # Also set as cache for concat-based decode
+            self.key_cache = key_expanded
+            self.value_cache = value_expanded
+            self.seq_len_cached = seq_len
+            return key_expanded, value_expanded
 
     def update_decode_expanded(
         self,
