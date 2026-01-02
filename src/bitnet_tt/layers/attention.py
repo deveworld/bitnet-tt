@@ -1009,10 +1009,14 @@ class MultiHeadAttention:
         """Apply RoPE to 1BKD tensor [1, batch, heads, head_dim]."""
         # For 1BKD, we need to apply RoPE per-head
         # Since we don't have rot_mats, use manual computation
+        # nlp_create_qkv_heads_decode outputs sharded tensors, convert to interleaved first
+        x_interleaved = ttnn.sharded_to_interleaved(x, ttnn.L1_MEMORY_CONFIG)
+
         # Convert to BKSD temporarily for RoPE, then back to 1BKD
-        x_bksd = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        x_bksd = ttnn.to_layout(x_interleaved, ttnn.ROW_MAJOR_LAYOUT)
         x_bksd = ttnn.permute(x_bksd, (1, 2, 0, 3))  # [batch, heads, 1, dim]
         x_bksd = ttnn.to_layout(x_bksd, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(x_interleaved)
 
         # Apply RoPE using existing infrastructure
         rotated = self._apply_rope_single(x_bksd, current_pos, 1, pos_tensor)
