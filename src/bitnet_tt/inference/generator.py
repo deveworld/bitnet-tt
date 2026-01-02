@@ -360,8 +360,11 @@ class TextGenerator:
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=None,  # HOST tensor
         )
-        # Step 2: Copy to DEVICE
-        pos_tensor = ttnn.to_device(pos_tensor_host, self.device)
+        # Step 2: Copy to DEVICE with explicit memory config (required for buffer allocation)
+        # Pattern from tt_transformers/tt/rope.py Line 509
+        pos_tensor = ttnn.to_device(
+            pos_tensor_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
 
         _, _ = self.model(
             input_tensor,
