@@ -427,6 +427,8 @@ class TextGenerator:
 
         # Execute trace
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
+        # Synchronize to ensure trace execution completes before using output
+        ttnn.synchronize_device(self.device)
 
         return self._trace_output
 
@@ -732,7 +734,9 @@ class TextGenerator:
             stats.generation_time += token_time
 
             next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
-            ttnn.deallocate(logits)
+            # Don't deallocate trace output - it's reused across iterations
+            if not self.enable_trace:
+                ttnn.deallocate(logits)
 
             generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
             stats.generated_tokens += 1
