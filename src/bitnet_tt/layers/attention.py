@@ -295,9 +295,10 @@ class KVCache:
 
         self.seq_len_cached = current_pos + 1
 
-        # Slice cache up to current position
-        key_for_attn = self.key_cache[:, :, : self.seq_len_cached, :]
-        value_for_attn = self.value_cache[:, :, : self.seq_len_cached, :]
+        # Return full cache (NOT sliced) - Trace-safe
+        # SDPA decode will use cur_pos_tensor to handle valid range
+        key_for_attn = self.key_cache
+        value_for_attn = self.value_cache
 
         # Expand for GQA when returning (same as concat-based path)
         if num_kv_groups > 1:
@@ -834,16 +835,27 @@ class MultiHeadAttention:
                 key_expanded = key
                 value_expanded = value
 
-        # SDPA (cache is already expanded, no GQA expansion needed!)
-        is_causal = mode == "prefill"
-        attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query,
-            key_expanded,
-            value_expanded,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-            scale=self.scale,
-        )
+        # SDPA - use decode-specific version for decode mode (Trace compatible)
+        if mode == "decode" and current_pos_tensor is not None:
+            # Decode mode: use full cache with cur_pos_tensor for position handling
+            # This avoids int-based slicing which freezes in Trace
+            attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
+                query,
+                key_expanded,
+                value_expanded,
+                cur_pos_tensor=current_pos_tensor,
+                scale=self.scale,
+            )
+        else:
+            # Prefill mode: use standard SDPA with causal mask
+            attn_output = ttnn.transformer.scaled_dot_product_attention(
+                query,
+                key_expanded,
+                value_expanded,
+                attn_mask=attention_mask,
+                is_causal=True,
+                scale=self.scale,
+            )
 
         # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         # Optimization: transpose in TILE, reshape in ROW_MAJOR
