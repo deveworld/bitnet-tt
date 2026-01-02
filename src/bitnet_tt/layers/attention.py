@@ -901,11 +901,15 @@ class MultiHeadAttention:
                 ttnn.deallocate(attn_output_1bkd)
 
                 # 7. Concat heads and reshape output
-                attn_output = ttnn.experimental.nlp_concat_heads_decode(
+                attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
                     attn_output_sharded,
                     num_heads=self.num_heads,
                 )
                 ttnn.deallocate(attn_output_sharded)
+
+                # 8. Convert from sharded to interleaved for RMS norm
+                attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
+                ttnn.deallocate(attn_output_concat)
 
                 # Apply sub-norm and output projection
                 attn_output = self.attn_sub_norm(attn_output)
