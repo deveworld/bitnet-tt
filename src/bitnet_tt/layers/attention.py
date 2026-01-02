@@ -243,11 +243,6 @@ class KVCache:
         if not self._preallocated:
             raise RuntimeError("Cache must be preallocated for in-place update")
 
-        # Debug: print once to verify this path is being used
-        if not hasattr(self, "_inplace_debug_printed"):
-            print(f"[DEBUG] Using in-place KV cache update (layer cache, pos={current_pos})")
-            self._inplace_debug_printed = True
-
         # Convert BKSD [batch, kv_heads, 1, head_dim] to 1HBD [1, kv_heads, batch, head_dim]
         # for ttnn.update_cache - NO GQA expansion, cache stores raw KV heads
         key_1hbd = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
@@ -673,19 +668,6 @@ class MultiHeadAttention:
             current_pos = 0
 
         # Use optimized prefill path when pre-allocated cache is provided
-        # Debug: trace prefill cache state
-        if mode == "prefill" and not hasattr(self, "_prefill_debug_printed"):
-            has_cache = past_key_value is not None
-            preallocated = (
-                has_cache
-                and hasattr(past_key_value, "_preallocated")
-                and past_key_value._preallocated
-            )
-            print(
-                f"[DEBUG PREFILL] layer={self.layer_idx}, has_cache={has_cache}, preallocated={preallocated}"
-            )
-            self._prefill_debug_printed = True
-
         if (
             mode == "prefill"
             and past_key_value is not None
@@ -797,13 +779,6 @@ class MultiHeadAttention:
             else:
                 # Decode: use in-place update if cache is preallocated (Trace compatible)
                 # Otherwise fall back to concat-based update
-                # Debug: check preallocated status
-                if not hasattr(past_key_value, "_decode_debug_printed"):
-                    print(
-                        f"[DEBUG DECODE] _preallocated={past_key_value._preallocated}, layer={self.layer_idx}"
-                    )
-                    past_key_value._decode_debug_printed = True
-
                 if past_key_value._preallocated:
                     key_expanded, value_expanded = past_key_value.update_decode_inplace(
                         key, value, current_pos, self.num_kv_groups

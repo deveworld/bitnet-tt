@@ -36,14 +36,14 @@ python main.py --chat
 Measured on Tenstorrent Blackhole p150a:
 
 | Mode | Speed | Notes |
-|------|-------|-------|
+| ---- | ----- | ----- |
 | Chat (Streaming) | **8.0 - 9.7 t/s** | HiFi2 applied, batch_size=1 |
 | Full Demo | ~5.5 t/s | 30 tokens generation |
 
 ### Optimization Status
 
 | Optimization | Status | Effect |
-|--------------|--------|--------|
+| ------------ | ------ | ------ |
 | HiFi2 Compute Kernel | ✅ Applied | ~2x matmul acceleration (theoretical) |
 | KV-Cache | ✅ Applied | Concat-based |
 | Pre-transposed Weights | ✅ Applied | Transpose overhead removed |
@@ -54,7 +54,7 @@ Measured on Tenstorrent Blackhole p150a:
 ### Target Performance
 
 | Reference Model | Hardware | Speed |
-|-----------------|----------|-------|
+| --------------- | -------- | ----- |
 | Llama 3.1 8B | p150a | 33.1 t/s/u |
 | Llama 3.2 3B | n150 | 46.6 t/s/u |
 | **BitNet 2B (Target)** | p150a | **30+ t/s** |
@@ -64,7 +64,7 @@ Measured on Tenstorrent Blackhole p150a:
 Comparison with HuggingFace official implementation:
 
 | Metric | Result |
-|--------|--------|
+| ------ | ------ |
 | Logits Correlation | 0.988 ~ 0.999 |
 | Top-1 Prediction Match | 100% |
 | Max Logit Difference | < 2.5 |
@@ -79,7 +79,7 @@ python examples/debug_full_compare.py  # Full model comparison
 
 ### Model Structure
 
-```
+```text
 BitNetModel (2.4B params)
 ├── Embedding (128256 vocab, 2560 dim)
 ├── TransformerBlock x 30
@@ -114,7 +114,7 @@ weight_quant = (weight * s).round().clamp(-1, 1) / s
 ### Key Components
 
 | Component | File | Description |
-|-----------|------|-------------|
+| --------- | ---- | ----------- |
 | Config | `config.py` | Model configuration + HiFi2 kernel settings |
 | Embedding | `layers/embedding.py` | Token embedding |
 | RMSNorm | `layers/bitlinear.py` | Root Mean Square Normalization |
@@ -127,7 +127,7 @@ weight_quant = (weight * s).round().clamp(-1, 1) / s
 
 ## Project Structure
 
-```
+```text
 bitnet-tt/
 ├── src/bitnet_tt/
 │   ├── config.py              # Model configuration + compute kernel config
@@ -204,7 +204,7 @@ print(f"\n[Speed: {stats.tokens_per_second:.2f} t/s]")
 ### Tenstorrent Blackhole p150a
 
 | Specification | Value |
-|---------------|-------|
+| ------------- | ----- |
 | Tensix Cores | 140 |
 | SRAM | 210MB (1.5MB per core) |
 | Memory | 32GB GDDR6 |
@@ -231,7 +231,7 @@ kernel_config = get_compute_kernel_config("hifi2")
 ```
 
 | Fidelity | Precision | Speed | Use Case |
-|----------|-----------|-------|----------|
+| -------- | --------- | ----- | -------- |
 | HiFi4 | BF16 | 1x | Prefill, accuracy-critical |
 | HiFi2 | BFP8 | ~2x | Decode (currently used) |
 | LoFi | BFP4 | ~3.6x | MLP (experimental) |
