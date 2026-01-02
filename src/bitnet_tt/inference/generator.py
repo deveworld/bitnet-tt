@@ -339,24 +339,34 @@ class TextGenerator:
         token: NDArray[np.int64],
         current_pos: int,
         kv_cache: list[KVCache],
-    ) -> tuple[int, ttnn.Tensor, ttnn.Tensor]:
+    ) -> tuple[int, ttnn.Tensor, list[ttnn.Tensor]]:
         """
         Capture a trace for the decode forward pass.
 
         This compiles the decode graph once and reuses it for all subsequent
         decode steps, eliminating compilation overhead (2-3x speedup).
+        Also manages persistent pos_tensor to avoid device writes during trace.
 
         Returns:
-            (trace_id, output_tensor, input_tensor)
+            (trace_id, output_tensor, [input_tensor, pos_tensor])
         """
         # Compile run (warm up)
         input_tensor = numpy_int_to_ttnn(token, self.device)
+        # Create persistent pos_tensor for trace
+        pos_tensor = ttnn.from_torch(
+            torch.tensor([[current_pos]], dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+
         _, _ = self.model(
             input_tensor,
             past_key_values=kv_cache,
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
+            pos_tensor=pos_tensor,  # Pass persistent tensor
         )
         ttnn.synchronize_device(self.device)
 
@@ -368,11 +378,12 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
+            pos_tensor=pos_tensor,  # Pass persistent tensor
         )
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
 
-        return trace_id, logits, input_tensor
+        return trace_id, logits, [input_tensor, pos_tensor]
 
     def _execute_decode_trace(
         self,
@@ -389,14 +400,19 @@ class TextGenerator:
         Returns:
             Output logits tensor
         """
-        # Copy new token to the trace input tensor
+        # 1. Update Input Token
         new_input = numpy_int_to_ttnn(token, self.device)
-        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs)
+        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs[0])
+
+        # 2. Update Position Tensor
+        new_pos = ttnn.from_torch(
+            torch.tensor([[current_pos]], dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+        ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
 
         # Execute trace
-        # Note: current_pos is passed for future use when trace supports
-        # position tensor updates for KV cache. Currently the trace captures
-        # a fixed position which may cause issues with long sequences.
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
 
         return self._trace_output

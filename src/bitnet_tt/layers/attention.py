@@ -718,6 +718,7 @@ class MultiHeadAttention:
             use_cache,
             batch_size,
             mode,
+            current_pos_tensor,
         )
 
     def _forward_simple(
@@ -732,6 +733,7 @@ class MultiHeadAttention:
         use_cache: bool,
         batch_size: int,
         mode: str,
+        current_pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Optimized forward using pre-expanded GQA cache.
@@ -763,7 +765,7 @@ class MultiHeadAttention:
         value = ttnn.transpose(value, 1, 2)
 
         # Apply RoPE
-        query, key = self._apply_rope_manual(query, key, current_pos, seq_len)
+        query, key = self._apply_rope_manual(query, key, current_pos, seq_len, current_pos_tensor)
 
         # Update KV-Cache with pre-expanded GQA optimization
         updated_cache = None
@@ -959,16 +961,18 @@ class MultiHeadAttention:
         key: ttnn.Tensor,
         start_pos: int,
         seq_len: int,
+        pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
         """Manual RoPE implementation using device-cached cos/sin tables."""
         if seq_len == 1:
             # Decode mode: use embedding lookup with single position
-            pos_tensor = ttnn.from_torch(
-                torch.tensor([[start_pos]], dtype=torch.int32),
-                dtype=ttnn.uint32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                device=self.device,
-            )
+            if pos_tensor is None:
+                pos_tensor = ttnn.from_torch(
+                    torch.tensor([[start_pos]], dtype=torch.int32),
+                    dtype=ttnn.uint32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    device=self.device,
+                )
             cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
             sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
             cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, 1, self.head_dim))
