@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # Disabled: concat-based cache incompatible with Trace
+        enable_trace: bool = True,  # Enabled: in-place KV cache allows Trace for 2-3x speedup
         batch_size: int = 1,
     ) -> None:
         """
