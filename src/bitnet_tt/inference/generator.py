@@ -353,17 +353,26 @@ class TextGenerator:
         # Compile run (warm up)
         input_tensor = numpy_int_to_ttnn(token, self.device)
         # Create persistent pos_tensor for trace using TT official two-step pattern:
-        # Step 1: Create HOST tensor (device=None)
+        # Step 1: Create HOST tensors (device=None)
+        # RoPE needs uint32, paged_update_cache needs int32
         pos_tensor_host = ttnn.from_torch(
             torch.tensor([[current_pos]], dtype=torch.int32),
-            dtype=ttnn.uint32,
+            dtype=ttnn.uint32,  # For RoPE embedding
             layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=None,  # HOST tensor
+            device=None,
         )
-        # Step 2: Copy to DEVICE with explicit memory config (required for buffer allocation)
-        # Pattern from tt_transformers/tt/rope.py Line 509
+        pos_tensor_int32_host = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,  # For paged_update_cache
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,
+        )
+        # Step 2: Copy to DEVICE
         pos_tensor = ttnn.to_device(
             pos_tensor_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        pos_tensor_int32 = ttnn.to_device(
+            pos_tensor_int32_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
 
         _, _ = self.model(
@@ -372,7 +381,8 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
-            pos_tensor=pos_tensor,  # Pass persistent tensor
+            pos_tensor=pos_tensor,  # For RoPE
+            current_pos_tensor=pos_tensor_int32,  # For KV cache
         )
         ttnn.synchronize_device(self.device)
 
@@ -384,12 +394,13 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
-            pos_tensor=pos_tensor,  # Pass persistent tensor
+            pos_tensor=pos_tensor,
+            current_pos_tensor=pos_tensor_int32,
         )
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
 
-        return trace_id, logits, [input_tensor, pos_tensor]
+        return trace_id, logits, [input_tensor, pos_tensor, pos_tensor_int32]
 
     def _execute_decode_trace(
         self,
@@ -416,14 +427,24 @@ class TextGenerator:
         )
         ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs[0])
 
-        # 2. Update Position Tensor - HOST tensor (device=None)
+        # 2. Update Position Tensors - HOST tensors (device=None)
+        # pos_tensor (uint32) for RoPE
         new_pos = ttnn.from_torch(
             torch.tensor([[current_pos]], dtype=torch.int32),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=None,  # HOST tensor for copy
+            device=None,
         )
         ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
+
+        # pos_tensor_int32 (int32) for KV cache paged_update_cache
+        new_pos_int32 = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,
+        )
+        ttnn.copy_host_to_device_tensor(new_pos_int32, self._trace_inputs[2])
 
         # Execute trace
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)

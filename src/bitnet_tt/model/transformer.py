@@ -146,7 +146,8 @@ class TransformerBlock:
         mode: str = "prefill",
         rot_mats: list | None = None,
         transformation_mat: ttnn.Tensor | None = None,
-        current_pos_tensor: ttnn.Tensor | None = None,
+        current_pos_tensor: ttnn.Tensor | None = None,  # int32 for KV cache
+        pos_tensor: ttnn.Tensor | None = None,  # uint32 for RoPE
     ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -160,7 +161,8 @@ class TransformerBlock:
             mode: "prefill" or "decode" - affects memory config and RoPE lookup
             rot_mats: [cos, sin] rotation matrices from RotarySetup (for optimized decode)
             transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
-            current_pos_tensor: Optional tensor containing current position (for trace)
+            current_pos_tensor: int32 tensor for KV cache paged_update_cache (trace)
+            pos_tensor: uint32 tensor for RoPE embedding (trace)
 
         Returns:
             Tuple of (output tensor, updated KV-Cache if use_cache else None)
@@ -181,6 +183,7 @@ class TransformerBlock:
             rot_mats=rot_mats,
             transformation_mat=transformation_mat,
             current_pos_tensor=current_pos_tensor,
+            pos_tensor=pos_tensor,
         )
 
         # Residual connection

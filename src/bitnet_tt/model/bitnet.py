@@ -171,9 +171,9 @@ class BitNetModel:
         Returns:
             Tuple of (logits tensor, updated KV-Cache list if use_cache else None)
         """
-        # Handle alias
-        if current_pos_tensor is None and pos_tensor is not None:
-            current_pos_tensor = pos_tensor
+        # Note: pos_tensor (uint32) is for RoPE embedding
+        # current_pos_tensor (int32) is for KV cache paged_update_cache
+        # They are NOT aliases - both may be used separately
 
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
@@ -202,7 +202,8 @@ class BitNetModel:
                 mode=mode,
                 rot_mats=rot_mats,
                 transformation_mat=transformation_mat,
-                current_pos_tensor=current_pos_tensor,
+                current_pos_tensor=current_pos_tensor,  # int32 for KV cache
+                pos_tensor=pos_tensor,  # uint32 for RoPE
             )
 
             if use_cache:

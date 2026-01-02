@@ -658,7 +658,8 @@ class MultiHeadAttention:
         mode: str = "prefill",
         rot_mats: list | None = None,
         transformation_mat: ttnn.Tensor | None = None,
-        current_pos_tensor: ttnn.Tensor | None = None,
+        current_pos_tensor: ttnn.Tensor | None = None,  # int32 for KV cache
+        pos_tensor: ttnn.Tensor | None = None,  # uint32 for RoPE
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -737,6 +738,7 @@ class MultiHeadAttention:
             batch_size,
             mode,
             current_pos_tensor,
+            pos_tensor,
         )
 
     def _forward_simple(
@@ -751,7 +753,8 @@ class MultiHeadAttention:
         use_cache: bool,
         batch_size: int,
         mode: str,
-        current_pos_tensor: ttnn.Tensor | None = None,
+        current_pos_tensor: ttnn.Tensor | None = None,  # int32 for KV cache
+        pos_tensor: ttnn.Tensor | None = None,  # uint32 for RoPE
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Optimized forward using pre-expanded GQA cache.
@@ -782,8 +785,8 @@ class MultiHeadAttention:
         key = ttnn.transpose(key, 1, 2)
         value = ttnn.transpose(value, 1, 2)
 
-        # Apply RoPE
-        query, key = self._apply_rope_manual(query, key, current_pos, seq_len, current_pos_tensor)
+        # Apply RoPE (uses pos_tensor which is uint32)
+        query, key = self._apply_rope_manual(query, key, current_pos, seq_len, pos_tensor)
 
         # Update KV-Cache with pre-expanded GQA optimization
         updated_cache = None
