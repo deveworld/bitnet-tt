@@ -738,9 +738,20 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Use BKSD format for both prefill and decode
-        # Note: 1BKD format + paged ops requires sharding, SDPA decode requires seq%32==0
-        # So we use simple concat-based cache with general SDPA for all cases
+        # Route decode with preallocated cache to 1BKD path (Trace-safe)
+        if mode == "decode" and past_key_value is not None and past_key_value._preallocated:
+            return self._forward_decode_1bkd(
+                query,
+                key,
+                value,
+                past_key_value,
+                current_pos,
+                batch_size,
+                current_pos_tensor,
+                pos_tensor,
+            )
+
+        # Use BKSD format for prefill and non-preallocated decode
         return self._forward_simple(
             query,
             key,
@@ -814,108 +825,11 @@ class MultiHeadAttention:
                 key_expanded, value_expanded = past_key_value.update_prefill(
                     key, value, self.num_kv_groups
                 )
-                # Prefill uses standard SDPA with causal mask
-                attn_output = ttnn.transformer.scaled_dot_product_attention(
-                    query,
-                    key_expanded,
-                    value_expanded,
-                    attn_mask=attention_mask,
-                    is_causal=True,
-                    scale=self.scale,
-                )
             else:
-                # Decode with 1BKD format for Trace compatibility
-                # 1. Convert BKSD [batch, heads, 1, head_dim] -> 1BKD [1, batch, heads, head_dim]
-                query_1bkd = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-                query_1bkd = ttnn.permute(query_1bkd, (2, 0, 1, 3))  # [1, batch, heads, head_dim]
-                query_1bkd = ttnn.to_layout(query_1bkd, ttnn.TILE_LAYOUT)
-
-                key_1bkd = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-                key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))
-                key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
-
-                value_1bkd = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
-                value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))
-                value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
-
-                # 2. Create position tensor if not provided
-                pos_tensor_local = current_pos_tensor
-                pos_created_locally = current_pos_tensor is None
-                if pos_created_locally:
-                    pos_tensor_local = ttnn.from_torch(
-                        torch.tensor([current_pos], dtype=torch.int32),
-                        dtype=ttnn.int32,
-                        layout=ttnn.ROW_MAJOR_LAYOUT,
-                        device=self.device,
-                    )
-
-                # 3. Convert to sharded for paged_update_cache
-                shard_config = ttnn.create_sharded_memory_config(
-                    shape=(32, self.head_dim),
-                    core_grid=ttnn.CoreGrid(y=1, x=1),
-                    strategy=ttnn.ShardStrategy.HEIGHT,
-                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                    use_height_and_width_as_shard_shape=True,
+                # Non-preallocated decode: use concat-based update
+                key_expanded, value_expanded = past_key_value.update_decode_expanded(
+                    key, value, current_pos, self.num_kv_groups
                 )
-                key_sharded = ttnn.interleaved_to_sharded(key_1bkd, shard_config)
-                value_sharded = ttnn.interleaved_to_sharded(value_1bkd, shard_config)
-
-                # 4. Update cache in-place with paged_update_cache
-                ttnn.experimental.paged_update_cache(
-                    past_key_value.key_cache, key_sharded, update_idxs_tensor=pos_tensor_local
-                )
-                ttnn.experimental.paged_update_cache(
-                    past_key_value.value_cache, value_sharded, update_idxs_tensor=pos_tensor_local
-                )
-                past_key_value.seq_len_cached = current_pos + 1
-
-                # Cleanup intermediate tensors
-                ttnn.deallocate(key_1bkd)
-                ttnn.deallocate(value_1bkd)
-                ttnn.deallocate(key_sharded)
-                ttnn.deallocate(value_sharded)
-
-                # 5. SDPA decode with full cache + cur_pos_tensor
-                attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
-                    query_1bkd,
-                    past_key_value.key_cache,
-                    past_key_value.value_cache,
-                    cur_pos_tensor=pos_tensor_local,
-                    scale=self.scale,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-                ttnn.deallocate(query_1bkd)
-                if pos_created_locally:
-                    ttnn.deallocate(pos_tensor_local)
-
-                # 6. Convert to sharded for nlp_concat_heads_decode
-                # TT pattern: use HEIGHT_SHARDED memory config
-                concat_shard_config = ttnn.create_sharded_memory_config(
-                    shape=(32, self.head_dim),  # [num_heads padded to 32, head_dim]
-                    core_grid=ttnn.CoreGrid(y=1, x=1),
-                    strategy=ttnn.ShardStrategy.HEIGHT,
-                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                    use_height_and_width_as_shard_shape=True,
-                )
-                attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, concat_shard_config)
-                ttnn.deallocate(attn_output_1bkd)
-
-                # 7. Concat heads and reshape output
-                attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
-                    attn_output_sharded,
-                    num_heads=self.num_heads,
-                )
-                ttnn.deallocate(attn_output_sharded)
-
-                # 8. Convert from sharded to interleaved for RMS norm
-                attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
-                ttnn.deallocate(attn_output_concat)
-
-                # Apply sub-norm and output projection
-                attn_output = self.attn_sub_norm(attn_output)
-                output = self.o_proj(attn_output)
-                return output, past_key_value
-
             updated_cache = past_key_value
         else:
             # No cache: expand inline
@@ -925,16 +839,18 @@ class MultiHeadAttention:
             else:
                 key_expanded = key
                 value_expanded = value
-            # No cache SDPA
-            attn_output = ttnn.transformer.scaled_dot_product_attention(
-                query,
-                key_expanded,
-                value_expanded,
-                attn_mask=attention_mask,
-                is_causal=mode == "prefill",
-                scale=self.scale,
-            )
             updated_cache = None
+
+        # SDPA with BKSD format
+        is_causal = mode == "prefill"
+        attn_output = ttnn.transformer.scaled_dot_product_attention(
+            query,
+            key_expanded,
+            value_expanded,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
+            scale=self.scale,
+        )
 
         # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         # Optimization: transpose in TILE, reshape in ROW_MAJOR
@@ -948,6 +864,147 @@ class MultiHeadAttention:
         output = self.o_proj(attn_output)
 
         return output, updated_cache
+
+    def _forward_decode_1bkd(
+        self,
+        query: ttnn.Tensor,
+        key: ttnn.Tensor,
+        value: ttnn.Tensor,
+        past_key_value: KVCache,
+        current_pos: int,
+        batch_size: int,
+        current_pos_tensor: ttnn.Tensor | None,
+        pos_tensor: ttnn.Tensor | None,
+    ) -> Tuple[ttnn.Tensor, KVCache]:
+        """
+        Decode forward with 1BKD tensor format for Metal Trace compatibility.
+
+        Uses paged_update_cache with tensor position, sdpa_decode with cur_pos_tensor,
+        and nlp_concat_heads_decode - all operations use tensor positions instead of
+        frozen int values, enabling Trace.
+
+        Args:
+            query: Q projection output [batch, 1, q_dim]
+            key: K projection output [batch, 1, k_dim]
+            value: V projection output [batch, 1, v_dim]
+            past_key_value: Pre-allocated KV cache
+            current_pos: Current sequence position (int)
+            batch_size: Batch size
+            current_pos_tensor: Position as tensor (int32) for cache update
+            pos_tensor: Position as tensor (uint32) for RoPE
+        """
+        seq_len = 1  # Decode is always single token
+
+        # 1. Reshape to BKSD: [batch, heads, 1, head_dim]
+        query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
+        key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
+        value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+
+        query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
+        key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+
+        query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
+        key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
+        value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
+
+        query = ttnn.transpose(query, 1, 2)  # [batch, heads, 1, head_dim]
+        key = ttnn.transpose(key, 1, 2)
+        value = ttnn.transpose(value, 1, 2)
+
+        # 2. Apply RoPE (uses pos_tensor which is uint32)
+        query, key = self._apply_rope_manual(query, key, current_pos, seq_len, pos_tensor)
+
+        # 3. Convert BKSD to 1BKD: [batch, heads, 1, dim] -> [1, batch, heads, dim]
+        query_1bkd = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
+        query_1bkd = ttnn.permute(query_1bkd, (2, 0, 1, 3))
+        query_1bkd = ttnn.to_layout(query_1bkd, ttnn.TILE_LAYOUT)
+
+        key_1bkd = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
+        key_1bkd = ttnn.permute(key_1bkd, (2, 0, 1, 3))
+        key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
+
+        value_1bkd = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
+        value_1bkd = ttnn.permute(value_1bkd, (2, 0, 1, 3))
+        value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
+
+        # 4. Create position tensor if not provided
+        pos_tensor_local = current_pos_tensor
+        pos_created_locally = current_pos_tensor is None
+        if pos_created_locally:
+            pos_tensor_local = ttnn.from_torch(
+                torch.tensor([current_pos], dtype=torch.int32),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+            )
+
+        # 5. Convert to sharded for paged_update_cache
+        shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=1, x=1),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        key_sharded = ttnn.interleaved_to_sharded(key_1bkd, shard_config)
+        value_sharded = ttnn.interleaved_to_sharded(value_1bkd, shard_config)
+
+        # 6. Update cache in-place with paged_update_cache
+        ttnn.experimental.paged_update_cache(
+            past_key_value.key_cache, key_sharded, update_idxs_tensor=pos_tensor_local
+        )
+        ttnn.experimental.paged_update_cache(
+            past_key_value.value_cache, value_sharded, update_idxs_tensor=pos_tensor_local
+        )
+        past_key_value.seq_len_cached = current_pos + 1
+
+        # Cleanup intermediate tensors
+        ttnn.deallocate(key_1bkd)
+        ttnn.deallocate(value_1bkd)
+        ttnn.deallocate(key_sharded)
+        ttnn.deallocate(value_sharded)
+
+        # 7. SDPA decode with full cache + cur_pos_tensor
+        attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
+            query_1bkd,
+            past_key_value.key_cache,
+            past_key_value.value_cache,
+            cur_pos_tensor=pos_tensor_local,
+            scale=self.scale,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(query_1bkd)
+        if pos_created_locally:
+            ttnn.deallocate(pos_tensor_local)
+
+        # 8. Convert to sharded for nlp_concat_heads_decode
+        concat_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=1, x=1),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        attn_output_sharded = ttnn.to_memory_config(attn_output_1bkd, concat_shard_config)
+        ttnn.deallocate(attn_output_1bkd)
+
+        # 9. Concat heads and reshape output
+        attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
+            attn_output_sharded,
+            num_heads=self.num_heads,
+        )
+        ttnn.deallocate(attn_output_sharded)
+
+        # 10. Convert from sharded to interleaved for RMS norm
+        attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(attn_output_concat)
+
+        # Apply sub-norm and output projection
+        attn_output = self.attn_sub_norm(attn_output)
+        output = self.o_proj(attn_output)
+
+        return output, past_key_value
 
     def _forward_prefill(
         self,
