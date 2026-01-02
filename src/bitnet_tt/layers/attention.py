@@ -1027,13 +1027,8 @@ class MultiHeadAttention:
         attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(attn_output_concat)
 
-        # Ensure output is 3D [batch, 1, hidden_dim] for consistency across layers
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_shape = attn_output.shape
-        if len(attn_shape) == 4:
-            # Reshape 4D [1, 1, X, hidden] -> 3D [batch, 1, hidden]
-            attn_output = ttnn.reshape(attn_output, (batch_size, 1, attn_shape[-1]))
-        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
+        # Keep 4D format consistent throughout - no reshape needed
+        # TT pattern: nlp_concat_heads_decode output goes directly to matmul(wo)
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
