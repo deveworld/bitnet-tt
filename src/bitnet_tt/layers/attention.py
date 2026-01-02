@@ -790,6 +790,13 @@ class MultiHeadAttention:
             else:
                 # Decode: use in-place update if cache is preallocated (Trace compatible)
                 # Otherwise fall back to concat-based update
+                # Debug: check preallocated status
+                if not hasattr(past_key_value, "_decode_debug_printed"):
+                    print(
+                        f"[DEBUG DECODE] _preallocated={past_key_value._preallocated}, layer={self.layer_idx}"
+                    )
+                    past_key_value._decode_debug_printed = True
+
                 if past_key_value._preallocated:
                     key_expanded, value_expanded = past_key_value.update_decode_inplace(
                         key, value, current_pos, self.num_kv_groups
