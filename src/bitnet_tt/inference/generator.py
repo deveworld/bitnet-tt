@@ -244,14 +244,25 @@ class TextGenerator:
         Returns:
             (logits, updated_kv_cache)
         """
+        # Debug: trace preallocation condition
+        print(
+            f"[DEBUG GEN] prefill_forward called: use_preallocated={use_preallocated}, kv_cache is None={kv_cache is None}"
+        )
+
         # Optionally use pre-allocated caches for optimized decode path
         if use_preallocated and kv_cache is None:
+            print("[DEBUG GEN] Creating preallocated caches...")
             if self._preallocated_kv_caches is None:
                 self._preallocated_kv_caches = self._preallocate_kv_caches()
             # Reset caches for new generation
             for cache in self._preallocated_kv_caches:
                 cache.seq_len_cached = 0
             kv_cache = self._preallocated_kv_caches
+            print(
+                f"[DEBUG GEN] Created {len(kv_cache)} caches, first._preallocated={kv_cache[0]._preallocated}"
+            )
+        else:
+            print(f"[DEBUG GEN] Preallocation condition not met")
 
         # Debug: verify kv_cache before model call
         if kv_cache is not None:
