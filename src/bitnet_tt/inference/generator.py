@@ -253,6 +253,14 @@ class TextGenerator:
                 cache.seq_len_cached = 0
             kv_cache = self._preallocated_kv_caches
 
+        # Debug: verify kv_cache before model call
+        if kv_cache is not None:
+            print(
+                f"[DEBUG GEN] Passing kv_cache to model: len={len(kv_cache)}, first._preallocated={kv_cache[0]._preallocated if kv_cache else 'N/A'}"
+            )
+        else:
+            print("[DEBUG GEN] kv_cache is None before model call")
+
         input_tensor = numpy_int_to_ttnn(tokens, self.device)
         logits, kv_cache = self.model(
             input_tensor,
