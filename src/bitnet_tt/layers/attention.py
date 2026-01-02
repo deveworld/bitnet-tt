@@ -1035,21 +1035,29 @@ class MultiHeadAttention:
         seq_len: int,
         _pos_tensor: ttnn.Tensor | None,  # Reserved for future Trace-safe RoPE
     ) -> ttnn.Tensor:
-        """Apply RoPE to single BKSD tensor using precomputed cos/sin."""
-        # Note: pos_tensor is available for Trace-compatible position-based indexing
-        # but current implementation uses int-based slicing (not Trace-safe)
+        """Apply RoPE to single BKSD tensor using embedding lookup."""
+        # Create position tensor for embedding lookup
+        pos_tensor = ttnn.from_torch(
+            torch.tensor([[current_pos]], dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
 
-        # Get cos/sin from precomputed tensors
-        cos_slice = self.cos_cached[:, :, current_pos : current_pos + seq_len, :]
-        sin_slice = self.sin_cached[:, :, current_pos : current_pos + seq_len, :]
+        # Get cos/sin via embedding lookup
+        cos_ttnn = ttnn.embedding(pos_tensor, self.cos_cache_2d, layout=ttnn.TILE_LAYOUT)
+        sin_ttnn = ttnn.embedding(pos_tensor, self.sin_cache_2d, layout=ttnn.TILE_LAYOUT)
+        cos_ttnn = ttnn.reshape(cos_ttnn, (1, 1, 1, self.head_dim))
+        sin_ttnn = ttnn.reshape(sin_ttnn, (1, 1, 1, self.head_dim))
+        ttnn.deallocate(pos_tensor)
 
         # Apply rotary: x * cos + rotate_half(x) * sin
         x1 = x[..., : self.head_dim // 2]
         x2 = x[..., self.head_dim // 2 :]
         x_rot = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
-        x_cos = ttnn.mul(x, cos_slice)
-        x_rot_sin = ttnn.mul(x_rot, sin_slice)
+        x_cos = ttnn.mul(x, cos_ttnn)
+        x_rot_sin = ttnn.mul(x_rot, sin_ttnn)
 
         return ttnn.add(x_cos, x_rot_sin)
 
