@@ -720,10 +720,7 @@ class MultiHeadAttention:
             cos = cos[:, :batch_size, :, :]
             sin = sin[:, :batch_size, :, :]
 
-        # Convert to sharded using L1_HEIGHT_SHARDED (TT pattern)
-        cos = ttnn.interleaved_to_sharded(cos, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG)
-        sin = ttnn.interleaved_to_sharded(sin, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG)
-
+        # Keep interleaved - rotary_embedding_llama will handle memory layout
         ttnn.deallocate(rot_idxs)
         return cos, sin
 
