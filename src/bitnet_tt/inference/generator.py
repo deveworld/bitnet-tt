@@ -262,7 +262,7 @@ class TextGenerator:
                 f"[DEBUG GEN] Created {len(kv_cache)} caches, first._preallocated={kv_cache[0]._preallocated}"
             )
         else:
-            print(f"[DEBUG GEN] Preallocation condition not met")
+            print("[DEBUG GEN] Preallocation condition not met")
 
         # Debug: verify kv_cache before model call
         if kv_cache is not None:
@@ -766,7 +766,7 @@ class TextGenerator:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         use_cache: bool = True,  # Always True in optimized version
-        use_optimized: bool = False,  # Disabled: paged_update_cache requires HEIGHT_SHARDED
+        use_optimized: bool = True,  # Use in-place KV cache for better performance
     ) -> Generator[tuple[str, GenerationStats], None, None]:
         """Generate a chat response with streaming output."""
         if self.tokenizer is None:
