@@ -738,20 +738,8 @@ class MultiHeadAttention:
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Route decode with preallocated cache to 1BKD path (Trace-safe)
-        if mode == "decode" and past_key_value is not None and past_key_value._preallocated:
-            return self._forward_decode_1bkd(
-                query,
-                key,
-                value,
-                past_key_value,
-                current_pos,
-                batch_size,
-                current_pos_tensor,
-                pos_tensor,
-            )
-
-        # Use BKSD format for prefill and non-preallocated decode
+        # Use BKSD format for all cases (prefill and decode)
+        # NOTE: 1BKD format requires major refactoring for Trace support
         return self._forward_simple(
             query,
             key,
@@ -826,10 +814,16 @@ class MultiHeadAttention:
                     key, value, self.num_kv_groups
                 )
             else:
-                # Non-preallocated decode: use concat-based update
-                key_expanded, value_expanded = past_key_value.update_decode_expanded(
-                    key, value, current_pos, self.num_kv_groups
-                )
+                # Decode: use in-place update if cache is preallocated
+                if past_key_value._preallocated:
+                    key_expanded, value_expanded = past_key_value.update_decode_inplace(
+                        key, value, current_pos, self.num_kv_groups, current_pos_tensor
+                    )
+                else:
+                    # Non-preallocated decode: use concat-based update
+                    key_expanded, value_expanded = past_key_value.update_decode_expanded(
+                        key, value, current_pos, self.num_kv_groups
+                    )
             updated_cache = past_key_value
         else:
             # No cache: expand inline
