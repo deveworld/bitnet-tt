@@ -902,29 +902,35 @@ class MultiHeadAttention:
             pos_tensor: Position as tensor (uint32) for RoPE
         """
         # 1. Reshape fused QKV to [1, 1, batch, qkv_dim] for nlp_create_qkv_heads_decode
-        # Input is [batch, 1, qkv_dim] from matmul (3D), need [1, 1, batch, qkv_dim] (4D)
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
         fqkv_shape = xqkv_fused.shape
 
-        # DEBUG: Print actual shapes
-        print(f"[DEBUG] xqkv_fused shape after to_layout: {fqkv_shape}")
-        print(f"[DEBUG] xqkv_fused ndim: {len(fqkv_shape)}")
-        print(f"[DEBUG] batch_size: {batch_size}")
+        # Handle both 3D [batch, seq, qkv_dim] and 4D [1, 1, batch*seq, qkv_dim] inputs
+        # First layer: hidden_states is 3D, subsequent layers may be 4D
+        if len(fqkv_shape) == 3:
+            # 3D: [batch, seq, qkv_dim] -> [1, 1, batch, qkv_dim]
+            qkv_dim = fqkv_shape[-1]
+            xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
+        elif len(fqkv_shape) == 4:
+            # 4D: already [1, 1, ..., qkv_dim], just need to adjust batch dim
+            # Input is [1, 1, X, qkv_dim], need [1, 1, batch, qkv_dim]
+            qkv_dim = fqkv_shape[-1]
+            # Flatten and reshape: [1, 1, X, qkv_dim] -> [1, 1, batch, qkv_dim]
+            # But we need to handle padding. If X > batch, we need to slice.
+            current_batch_dim = fqkv_shape[2]
+            if current_batch_dim == batch_size:
+                # Already correct shape, no reshape needed
+                pass
+            else:
+                # Flatten to 3D first, then reshape
+                total_volume = 1
+                for d in fqkv_shape:
+                    total_volume *= d
+                # Calculate actual qkv_dim based on volume
+                xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
+        else:
+            raise ValueError(f"Unexpected xqkv_fused shape: {fqkv_shape}")
 
-        # fqkv_shape is 3D: [batch, 1, qkv_dim], use -1 for last dim
-        qkv_dim = fqkv_shape[-1]
-        print(f"[DEBUG] qkv_dim: {qkv_dim}")
-
-        # Calculate volumes for debugging
-        old_volume = 1
-        for d in fqkv_shape:
-            old_volume *= d
-        new_volume = 1 * 1 * batch_size * qkv_dim
-        print(f"[DEBUG] Old volume: {old_volume}, New volume: {new_volume}")
-
-        # Reshape: [batch, 1, qkv_dim] -> [1, 1, batch, qkv_dim]
-        # Volume: batch * 1 * qkv_dim = 1 * 1 * batch * qkv_dim ✓
-        xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim))
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
         # 2. Create QKV heads using nlp_create_qkv_heads_decode - outputs 1BKD format
@@ -1020,6 +1026,14 @@ class MultiHeadAttention:
         # 10. Convert from sharded to interleaved for RMS norm
         attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(attn_output_concat)
+
+        # Ensure output is 3D [batch, 1, hidden_dim] for consistency across layers
+        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
+        attn_shape = attn_output.shape
+        if len(attn_shape) == 4:
+            # Reshape 4D [1, 1, X, hidden] -> 3D [batch, 1, hidden]
+            attn_output = ttnn.reshape(attn_output, (batch_size, 1, attn_shape[-1]))
+        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
