@@ -1651,16 +1651,19 @@ class MultiHeadAttention:
 
         past_key_value.seq_len_cached = current_pos + 1
 
-        # 4. Scaled dot-product attention for decode
+        # 4. SDPA decode requires Q in DRAM when not sharded
+        q_dram = ttnn.to_memory_config(q_heads_1bqd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_heads_1bqd)
+
         attn_output_1g4d = ttnn.transformer.scaled_dot_product_attention_decode(
-            q_heads_1bqd,
+            q_dram,
             past_key_value.key_cache,
             past_key_value.value_cache,
             cur_pos_tensor=cur_pos_tensor,
             scale=self.scale,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        ttnn.deallocate(q_heads_1bqd)
+        ttnn.deallocate(q_dram)
 
         # Only deallocate if we created it locally
         if current_pos_tensor is None:
