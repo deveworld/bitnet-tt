@@ -1672,25 +1672,36 @@ class MultiHeadAttention:
         if current_pos_tensor is None:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 5. nlp_concat_heads_decode requires sharded input - use actual num_heads, not padded
+        # 5. Pad heads to TILE_SIZE (32) for nlp_concat_heads_decode, then slice back
+        TILE_SIZE = 32
+        padded_num_heads = ((self.num_heads + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+        attn_pad_heads = padded_num_heads - self.num_heads
+
+        attn_output_padded = ttnn.pad(
+            attn_output_1g4d, [(0, 0), (0, attn_pad_heads), (0, 0), (0, 0)], 0.0
+        )
+        ttnn.deallocate(attn_output_1g4d)
+
         attn_shard_config = ttnn.create_sharded_memory_config(
-            shape=(self.num_heads, self.head_dim),
+            shape=(padded_num_heads, self.head_dim),
             core_grid=ttnn.CoreGrid(y=1, x=1),
             strategy=ttnn.ShardStrategy.HEIGHT,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        attn_output_sharded = ttnn.to_memory_config(attn_output_1g4d, attn_shard_config)
-        ttnn.deallocate(attn_output_1g4d)
+        attn_output_sharded = ttnn.to_memory_config(attn_output_padded, attn_shard_config)
+        ttnn.deallocate(attn_output_padded)
 
         attn_output = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_sharded,
-            num_heads=self.num_heads,
+            num_heads=padded_num_heads,
         )
         ttnn.deallocate(attn_output_sharded)
 
         attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
-        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.num_heads * self.head_dim))
+        actual_hidden_dim = self.num_heads * self.head_dim
+        attn_output = attn_output[:, :, :, :actual_hidden_dim]
+        attn_output = ttnn.reshape(attn_output, (batch_size, 1, actual_hidden_dim))
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
