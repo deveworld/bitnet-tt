@@ -170,6 +170,54 @@ class KVCache:
             self.seq_len_cached = seq_len
             return key_expanded, value_expanded
 
+    def update_decode_simple(
+        self,
+        key_states: ttnn.Tensor,
+        value_states: ttnn.Tensor,
+        current_pos: int,
+        num_kv_groups: int = 1,
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Update pre-allocated cache using ttnn.kv_cache.update_cache_for_token_.
+
+        This is the PREFERRED decode method for Phase 1 optimization:
+        - Uses kv_cache API that accepts [batch, heads, 1, head_dim] directly
+        - Avoids memory allocation (no concat)
+        - No permute/padding overhead
+
+        Args:
+            key_states: [batch, kv_heads, 1, head_dim] - single new token
+            value_states: [batch, kv_heads, 1, head_dim] - single new token
+            current_pos: Current sequence position (update index)
+            num_kv_groups: Number of query heads per KV head (for GQA expansion)
+
+        Returns:
+            GQA-expanded key and value for attention (sliced from cache)
+        """
+        if not self._preallocated:
+            raise RuntimeError("Cache must be preallocated for in-place update")
+
+        # Use kv_cache.update_cache_for_token_ which accepts [batch, heads, 1, head_dim] directly
+        self.key_cache = ttnn.kv_cache.update_cache_for_token_(
+            self.key_cache, key_states, update_index=current_pos, batch_offset=0
+        )
+        self.value_cache = ttnn.kv_cache.update_cache_for_token_(
+            self.value_cache, value_states, update_index=current_pos, batch_offset=0
+        )
+
+        self.seq_len_cached = current_pos + 1
+
+        # Slice cache up to current position for attention
+        key_for_attn = self.key_cache[:, :, : self.seq_len_cached, :]
+        value_for_attn = self.value_cache[:, :, : self.seq_len_cached, :]
+
+        # Expand for GQA when returning
+        if num_kv_groups > 1:
+            key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
+            value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
+
+        return key_for_attn, value_for_attn
+
     def update_decode_expanded(
         self,
         key_states: ttnn.Tensor,
@@ -180,11 +228,11 @@ class KVCache:
         """
         Update pre-expanded cache for decode using concat.
 
-        Key optimization: Expand only the NEW token's KV (1 position).
+        DEPRECATED: Use update_decode_simple instead for better performance.
+        This method uses concat which allocates new memory every decode step,
+        making Trace capture impossible.
 
-        Note: In-place update via paged_update_cache requires HEIGHT_SHARDED input
-        which is not yet properly configured. Using concat-based approach for now.
-        This means Trace capture is not compatible with the current implementation.
+        Key optimization: Expand only the NEW token's KV (1 position).
 
         Args:
             key_states: [batch, kv_heads, 1, head_dim] - single new token
@@ -920,18 +968,15 @@ class MultiHeadAttention:
                 past_key_value = KVCache()
 
             if mode == "prefill":
-                # Prefill: expand and store in cache (BKSD)
                 key_expanded, value_expanded = past_key_value.update_prefill(
                     key, value, self.num_kv_groups
                 )
             else:
-                # Decode: use in-place update if cache is preallocated
                 if past_key_value._preallocated:
-                    key_expanded, value_expanded = past_key_value.update_decode_inplace(
-                        key, value, current_pos, self.num_kv_groups, current_pos_tensor
+                    key_expanded, value_expanded = past_key_value.update_decode_simple(
+                        key, value, current_pos, self.num_kv_groups
                     )
                 else:
-                    # Non-preallocated decode: use concat-based update
                     key_expanded, value_expanded = past_key_value.update_decode_expanded(
                         key, value, current_pos, self.num_kv_groups
                     )
