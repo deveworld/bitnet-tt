@@ -1689,7 +1689,7 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(attn_output_sharded)
 
-        # Apply sub-norm and output projection
+        attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
