@@ -1608,12 +1608,24 @@ class MultiHeadAttention:
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
-        # 3. Update KV cache - keep 1BKD format, pad to 32 heads
+        # 3. Update KV cache - 1BKD format [seqlen, batch, heads, head_dim], pad to 32 heads
         pad_heads = 32 - self.num_kv_heads
         k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_interleaved)
+
+        kv_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=1, x=1),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        k_sharded = ttnn.to_memory_config(k_padded, kv_shard_config)
+        v_sharded = ttnn.to_memory_config(v_padded, kv_shard_config)
+        ttnn.deallocate(k_padded)
+        ttnn.deallocate(v_padded)
 
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
@@ -1627,16 +1639,16 @@ class MultiHeadAttention:
 
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache,
-            k_padded,
+            k_sharded,
             update_idxs_tensor=cur_pos_tensor,
         )
         ttnn.experimental.paged_update_cache(
             past_key_value.value_cache,
-            v_padded,
+            v_sharded,
             update_idxs_tensor=cur_pos_tensor,
         )
-        ttnn.deallocate(k_padded)
-        ttnn.deallocate(v_padded)
+        ttnn.deallocate(k_sharded)
+        ttnn.deallocate(v_sharded)
 
         past_key_value.seq_len_cached = current_pos + 1
 
