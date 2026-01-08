@@ -1586,11 +1586,13 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(xqkv_fused_4d)
 
-        # 2. Apply RoPE - convert sharded 1BKD to interleaved BKSD, apply RoPE, convert back
+        # 2. Apply RoPE - convert to interleaved for permute operations
         q_interleaved = ttnn.to_memory_config(q_heads_1bqd, ttnn.L1_MEMORY_CONFIG)
         k_interleaved = ttnn.to_memory_config(k_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
+        v_interleaved = ttnn.to_memory_config(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bqd)
         ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
 
         q_bksd = ttnn.permute(q_interleaved, (1, 2, 0, 3))  # [1,B,Q,D] -> [B,Q,1,D]
         k_bksd = ttnn.permute(k_interleaved, (1, 2, 0, 3))  # [1,B,K,D] -> [B,K,1,D]
@@ -1607,9 +1609,9 @@ class MultiHeadAttention:
         # 3. Update KV cache - paged_update_cache requires HEIGHT_SHARDED input with 32 heads
         pad_heads = 32 - self.num_kv_heads
         k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
-        v_padded = ttnn.pad(v_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
+        v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         ttnn.deallocate(k_heads_1bkd)
-        ttnn.deallocate(v_heads_1bkd)
+        ttnn.deallocate(v_interleaved)
 
         kv_shard_config = ttnn.create_sharded_memory_config(
             shape=(32, self.head_dim),
