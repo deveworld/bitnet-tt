@@ -1604,7 +1604,13 @@ class MultiHeadAttention:
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
-        # 3. Update KV cache - paged_update_cache requires HEIGHT_SHARDED input
+        # 3. Update KV cache - paged_update_cache requires HEIGHT_SHARDED input with 32 heads
+        pad_heads = 32 - self.num_kv_heads
+        k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
+        v_padded = ttnn.pad(v_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
+        ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
+
         kv_shard_config = ttnn.create_sharded_memory_config(
             shape=(32, self.head_dim),
             core_grid=ttnn.CoreGrid(y=1, x=1),
@@ -1612,10 +1618,10 @@ class MultiHeadAttention:
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        k_sharded = ttnn.to_memory_config(k_heads_1bkd, kv_shard_config)
-        v_sharded = ttnn.to_memory_config(v_heads_1bkd, kv_shard_config)
-        ttnn.deallocate(k_heads_1bkd)
-        ttnn.deallocate(v_heads_1bkd)
+        k_sharded = ttnn.to_memory_config(k_padded, kv_shard_config)
+        v_sharded = ttnn.to_memory_config(v_padded, kv_shard_config)
+        ttnn.deallocate(k_padded)
+        ttnn.deallocate(v_padded)
 
         # Create position tensor for cache update if not provided
         if current_pos_tensor is not None:
