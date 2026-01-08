@@ -982,6 +982,7 @@ class MultiHeadAttention:
                 transformation_mat,
                 batch_size,
                 current_pos_tensor=current_pos_tensor,
+                pos_tensor=pos_tensor,
             )
 
         # Standard path: separate QKV projections
@@ -1547,6 +1548,7 @@ class MultiHeadAttention:
         transformation_mat: ttnn.Tensor,
         batch_size: int,
         current_pos_tensor: ttnn.Tensor | None = None,
+        pos_tensor: ttnn.Tensor | None = None,
     ) -> Tuple[ttnn.Tensor, KVCache]:
         """
         Optimized decode forward using tt_transformers patterns.
@@ -1599,7 +1601,7 @@ class MultiHeadAttention:
         ttnn.deallocate(q_interleaved)
         ttnn.deallocate(k_interleaved)
 
-        q_bksd, k_bksd = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, None)
+        q_bksd, k_bksd = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, pos_tensor)
 
         q_heads_1bqd = ttnn.permute(q_bksd, (2, 0, 1, 3))  # [B,Q,1,D] -> [1,B,Q,D]
         k_heads_1bkd = ttnn.permute(k_bksd, (2, 0, 1, 3))  # [B,K,1,D] -> [1,B,K,D]
