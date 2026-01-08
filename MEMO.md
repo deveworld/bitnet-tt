@@ -464,16 +464,51 @@ Week 4: Phase 3 - Custom QKV Decode (Optional)
 └── Option B: Custom geometry (1 week)
 ```
 
-### 12.4 Expected Performance
+### 12.4 Phase 1 Results (COMPLETED)
+
+**Implementation**: `update_decode_simple()` using `ttnn.kv_cache.update_cache_for_token_`
+
+```python
+# New method in KVCache class (attention.py)
+def update_decode_simple(self, key_states, value_states, current_pos, num_kv_groups=1):
+    # Uses kv_cache API that accepts [batch, heads, 1, head_dim] directly
+    self.key_cache = ttnn.kv_cache.update_cache_for_token_(
+        self.key_cache, key_states, update_index=current_pos, batch_offset=0
+    )
+    self.value_cache = ttnn.kv_cache.update_cache_for_token_(
+        self.value_cache, value_states, update_index=current_pos, batch_offset=0
+    )
+    # ... slice and GQA expansion
+```
+
+**Test Results**:
+- Performance: **5.74 t/s** (baseline ~5.5 t/s, minimal improvement)
+- Accuracy: **0.990** logits correlation with HuggingFace
+- Text quality: Coherent output ("The capital of France is Paris...")
+- Commit: `744bc69` - "feat: Phase 1 - use kv_cache.update_cache_for_token_ for in-place decode"
+
+**Why Minimal Speed Improvement**:
+- `update_cache_for_token_` uses integer position (not tensor), so **Trace capture still blocked**
+- The concat→in-place change saves allocation but kernel dispatch overhead dominates
+- Real 2-3x speedup requires Trace, which needs `paged_update_cache` with HEIGHT_SHARDED
+
+**Blocking Issue for Trace**:
+- `paged_update_cache` requires HEIGHT_SHARDED input
+- HEIGHT_SHARDED requires shard height divisible by 32 (core grid constraint)
+- `num_heads=20` (BitNet) is incompatible with 32-core grid requirement
+- Options: (A) Pad to 32 heads (1.6x compute overhead), (B) Custom shard geometry
+
+### 12.5 Expected Performance (Updated)
 
 | Phase | Implementation | Speed | vs Current |
 | --- | --- | --- | --- |
 | Current | concat + BF16 | 8.5 t/s | 1x |
-| Phase 1 | In-place + Trace | 17-25 t/s | **2-3x** |
+| **Phase 1 (DONE)** | **In-place (no Trace)** | **5.7 t/s** | **~1x (blocked)** |
+| Phase 1b | In-place + Trace | 17-25 t/s | **2-3x** (needs HEIGHT_SHARDED) |
 | Phase 2 | + Ternary Matmul | 25-35 t/s | **3-4x** |
 | Phase 3 | + Custom QKV | 30-45 t/s | **4-5x** |
 
-### 12.5 Risks and Alternatives
+### 12.6 Risks and Alternatives
 
 | Risk | Probability | Alternative |
 | --- | --- | --- |
@@ -482,7 +517,7 @@ Week 4: Phase 3 - Custom QKV Decode (Optional)
 | QKV geometry conflict | High | Fallback to padding approach |
 | Trace instability | Medium | Apply only non-trace optimizations |
 
-### 12.6 Immediately Actionable Items
+### 12.7 Immediately Actionable Items
 
 1. **Investigate ttnn.fill_cache / ttnn.update_cache API**
 
