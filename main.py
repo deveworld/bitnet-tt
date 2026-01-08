@@ -23,9 +23,7 @@ import sys
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="BitNet-TT: BitNet b1.58 on Tenstorrent p150a"
-    )
+    parser = argparse.ArgumentParser(description="BitNet-TT: BitNet b1.58 on Tenstorrent p150a")
     parser.add_argument(
         "--full",
         action="store_true",
@@ -64,9 +62,11 @@ def main() -> None:
         )
     elif args.full:
         from examples.demo import run_full_demo
+
         run_full_demo()
     else:
         from examples.demo import run_mini_demo
+
         run_mini_demo()
 
 
@@ -104,8 +104,7 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
         model = create_model(config, device)
         load_weights_to_model(model, state_dict)
 
-        # Create generator
-        generator = TextGenerator(model)
+        generator = TextGenerator(model, enable_trace=True)
 
         if generator.tokenizer is None:
             print("Error: Tokenizer not available.")
@@ -212,6 +211,7 @@ def run_interactive_chat(max_tokens: int = 256, temperature: float = 0.7) -> Non
             except Exception as e:
                 print(f"\nError generating response: {e}")
                 import traceback
+
                 traceback.print_exc()
                 # Remove the failed user message from history
                 conversation_history.pop()

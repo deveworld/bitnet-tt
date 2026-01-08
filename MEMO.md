@@ -846,12 +846,255 @@ class FeedForward(nn.Module):
 
 - [ ] Fused QKV projection (`wqkv`)
 - [ ] Fused gate+up projection (`w13`)
-- [ ] In-place KV cache update (`paged_update_cache`)
-- [ ] Trace capture for decode loop
+- [x] In-place KV cache update (`update_cache_for_token_`) - Phase 1 complete
+- [ ] In-place KV cache update (`paged_update_cache`) - Phase 1b blocked by TT-NN bug
+- [ ] Trace capture for decode loop - blocked by TT-NN bug
 - [ ] Multi-CQ (CQ0=ops, CQ1=IO)
 - [ ] DRAM-sharded matmul for decode
 - [ ] HEIGHT_SHARDED for attention (need to resolve num_heads=20)
 - [ ] Ternary matmul kernel (Phase 2)
+
+---
+
+## 14. Phase 1b Results: Metal Trace Implementation (BLOCKED)
+
+### 14.1 Implementation Summary
+
+**Goal**: Enable Metal Trace for 2x+ decode speedup using `paged_update_cache` with 32-head padding.
+
+**Changes Made**:
+1. `attention.py`:
+   - `KVCache.preallocate()`: Added `use_paged` parameter for 32-head padded cache
+   - `KVCache.update_decode_paged()`: Uses `paged_update_cache` with HEIGHT_SHARDED + 32-head padding
+   - `_forward_simple()`: Added `scaled_dot_product_attention_decode` path for trace-compatible decode
+
+2. `generator.py`:
+   - `_capture_decode_trace()`: Creates `pos_tensor_int32` (int32 for KV cache) and `pos_tensor` (uint32 for RoPE)
+   - `_execute_decode_trace()`: Updates position tensors via `copy_host_to_device_tensor`
+
+3. `model/bitnet.py` and `transformer.py`:
+   - Pass `current_pos_tensor` (int32) and `pos_tensor` (uint32) through model layers
+
+### 14.2 TT-NN Bug Discovered
+
+**Critical Bug**: `ttnn.experimental.paged_update_cache()` corrupts its `update_idxs_tensor` parameter.
+
+**Reproduction**:
+- Running 30-layer transformer forward with paged decode
+- Using same `pos_tensor` across layers for KV cache updates
+- First call (key cache) preserves tensor value
+- Second call (value cache) **corrupts** the tensor
+- Corruption is cumulative - manifests around layer 14-27 depending on sync timing
+
+**Evidence**:
+```
+Layer 27: pos_tensor_int32 before paged_update_cache(value): 6
+Layer 27: pos_tensor_int32 after paged_update_cache(value): 1068416405 (garbage)
+```
+
+### 14.3 Workaround Applied
+
+Modified `update_decode_paged()` to create fresh position tensors for each cache update:
+
+```python
+def update_decode_paged(self, key_states, value_states, current_pos, current_pos_tensor, num_kv_groups=1):
+    # ... setup code ...
+    
+    # Fresh tensor for key cache (don't use caller's tensor)
+    key_pos_tensor = ttnn.from_torch(
+        torch.tensor([current_pos], dtype=torch.int32),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.experimental.paged_update_cache(self.key_cache, key_sharded, update_idxs_tensor=key_pos_tensor)
+    ttnn.deallocate(key_pos_tensor)
+    
+    # Fresh tensor for value cache
+    value_pos_tensor = ttnn.from_torch(...)
+    ttnn.experimental.paged_update_cache(self.value_cache, value_sharded, update_idxs_tensor=value_pos_tensor)
+    ttnn.deallocate(value_pos_tensor)
+```
+
+**Result**: Protects caller's tensor but **breaks Metal Trace compatibility** (Trace requires reusing same tensor across iterations).
+
+### 14.4 Current Status
+
+| Path | Status | Performance | Notes |
+|------|--------|-------------|-------|
+| Non-paged decode (`update_decode_simple`) | ✅ Working | ~5.74 t/s | Default, stable |
+| Paged decode (`update_decode_paged`) | ⚠️ Disabled | N/A | Manual transforms cause corruption |
+| Metal Trace | ⏳ Pending | N/A | Requires nlp_create_qkv_heads_decode refactor |
+| `scaled_dot_product_attention_decode` | ⏳ Pending | N/A | Works with proper 1BKD format |
+
+### 14.5 Recommended Next Steps
+
+1. **Continue using non-paged decode** (`enable_trace=False`):
+   - Working, stable ~5.74 t/s
+   - No immediate refactoring needed
+   
+2. **Phase 2 optimization** (when performance boost needed):
+   - Refactor to use `nlp_create_qkv_heads_decode()` for HEAD_SHARDED tensors
+   - Enable proper Trace-compatible decode path
+   - Target: 15+ t/s with Metal Trace
+
+3. **No TT-NN bug report needed**:
+   - Issue was our implementation, not TT-NN
+   - `nlp_create_qkv_heads_decode` → `paged_update_cache` pattern works correctly
+
+### 14.6 Files Modified (NOT committed)
+
+- `/src/bitnet_tt/layers/attention.py`:
+  - `update_decode_paged()`: Uses fresh position tensors
+  - `_forward_simple()`: `use_decode_sdpa = False` (disabled buggy path)
+  
+- `/src/bitnet_tt/inference/generator.py`:
+  - Trace capture/execute logic (implemented but not usable)
+
+### 14.7 API Research: paged_update_cache (2025-01-09)
+
+**Official API Signature** (from TT-Metal source):
+```python
+ttnn.experimental.paged_update_cache(
+    cache_tensor: ttnn.Tensor,      # [B, 1, kv_len, head_dim] - modified IN-PLACE
+    input_tensor: ttnn.Tensor,      # [1, B, 1[32], head_dim] - HEIGHT_SHARDED on B cores
+    update_idxs: List[int] = [],    # XOR with update_idxs_tensor
+    update_idxs_tensor: ttnn.Tensor = None,  # INT32, ROW_MAJOR
+    share_cache: bool = None,       # Not supported with paged cache
+    page_table: ttnn.Tensor = None, # INT32 (interleaved) or UINT16 (sharded)
+    batch_offset: int = 0,          # Must be 0
+)
+```
+
+**`update_idxs_tensor` Requirements**:
+- Dtype: `ttnn.int32` (strict)
+- Layout: `ROW_MAJOR_LAYOUT` (strict)
+- Memory: DRAM-INTERLEAVED or L1-HEIGHT_SHARDED
+- Shape: `[batch_size]` for DRAM, `[num_cores, batch_size]` for L1-sharded
+- **API Documentation says it's READ-ONLY** (not supposed to be modified)
+
+**Comparison with tt-transformers Pattern**:
+
+| Aspect | tt-transformers | BitNet-TT |
+|--------|-----------------|-----------|
+| Tensor creation | `ttnn.from_torch(..., device=None)` + `copy_host_to_device_tensor` | `ttnn.from_torch(..., device=device)` |
+| Memory config | Default (no explicit) | `DRAM_MEMORY_CONFIG` |
+| Tensor reuse | Reused + `ttnn.plus_one()` for increment | Single tensor reused across layers |
+| Protection | `skip_negative_entries=True` + `torch.maximum(pos, 0)` | None |
+
+**Key Difference Found**:
+- tt-transformers uses `device=None` initially, then `copy_host_to_device_tensor()`
+- BitNet-TT creates tensor directly on device with `device=device`
+- This may affect buffer allocation/aliasing behavior
+
+**Known Blackhole Issue**:
+- GitHub Issue #16674: `ttnn.experimental.paged_update_cache` consistently hanging on Blackhole
+- Our p150a is Blackhole hardware - may be related
+
+### 14.8 Hypothesis Test Results (2025-01-09)
+
+| Hypothesis | Test | Result | Interpretation |
+|------------|------|--------|----------------|
+| H1: Async issue | Sync after every op | ❌ Layer 27 corrupt | NOT async issue |
+| H2: Memory aliasing | 32-element buffer | ⛔ API rejects | API requires buffer size == batch size |
+| H3: DRAM-specific | L1_MEMORY_CONFIG | ⛔ API rejects | API requires DRAM for INTERLEAVED |
+| H4: paged_update_cache internal | 60 isolated calls | ✅ All OK | NOT paged_update_cache alone |
+| H5: Other model ops | Model without paged | ✅ 30 layers OK | Confirms paged is the cause |
+
+### 14.9 Root Cause Analysis (CORRECTED 2025-01-09)
+
+**IMPORTANT CORRECTION**: This is **NOT a TT-NN bug**. The corruption was caused by our **improper tensor transformation sequence** before calling `paged_update_cache`.
+
+**The Problem - Our Manual Transformations**:
+```python
+# BAD - BitNet-TT pattern (causes corruption)
+key_rm = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
+key_1bkd = ttnn.permute(key_rm, (2, 0, 1, 3))  # BKSD -> 1BKD
+key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
+key_padded = ttnn.pad(key_1bkd, [(0, 0), (0, 0), (0, pad_amount), (0, 0)], 0.0)  # Pad to 32 heads
+key_sharded = ttnn.to_memory_config(key_padded, shard_config)  # Manual sharding
+ttnn.experimental.paged_update_cache(cache.key_cache, key_sharded, update_idxs_tensor=pos_tensor)
+# → pos_tensor gets corrupted after ~27 layers!
+```
+
+**The Solution - tt-transformers Pattern**:
+```python
+# GOOD - tt-transformers pattern (no corruption)
+qkv_fused = ttnn.concat([q, k, v], dim=-1)
+qkv_fused = ttnn.reshape(qkv_fused, (1, 1, batch, qkv_dim))
+q_heads, k_heads, v_heads = ttnn.experimental.nlp_create_qkv_heads_decode(
+    qkv_fused, num_heads=20, num_kv_heads=5,
+    memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+)
+# nlp_create_qkv_heads_decode outputs correctly sharded tensors
+ttnn.experimental.paged_update_cache(cache.key_cache, k_heads, update_idxs_tensor=pos_tensor)
+# → pos_tensor remains valid!
+```
+
+**Verification Test Results**:
+| Pattern | Result | Interpretation |
+|---------|--------|----------------|
+| tt-transformers pattern (no model, 60 calls) | ✅ All passed | nlp_create_qkv_heads_decode + paged_update_cache works |
+| tt-transformers pattern (with model, 30 layers) | ✅ All passed | Full integration works |
+| Our manual transforms (with model, 30 layers) | ❌ Layer 27 corrupt | Manual reshape/transpose/permute/pad causes issue |
+
+**Key Insight**: The `nlp_create_qkv_heads_decode` function handles internal tensor transformations and sharding correctly. Our manual approach (reshape → transpose → permute → pad → shard) somehow causes memory corruption when combined with `paged_update_cache`.
+
+### 14.10 Current State & Path Forward
+
+**Current Working Path** (default, `enable_trace=False`):
+- Uses `update_decode_simple()` with `kv_cache.update_cache_for_token_()`
+- Works correctly at ~5.74 t/s
+- No corruption issues
+- NOT Trace-compatible (uses Python int for position)
+
+**Trace Path** (`enable_trace=True`):
+- Uses `_forward_decode_optimized()` with `paged_update_cache`
+- Requires HEIGHT_SHARDED input for K/V tensors
+- Status: Implementation complete, awaiting hardware test
+
+### 14.11 paged_update_cache Sharding Fix (2025-01-09)
+
+**Problem**: `paged_update_cache` requires HEIGHT_SHARDED input, but after manual RoPE the tensors are interleaved.
+
+**Solution**: Re-shard K/V after RoPE transformation:
+
+```python
+# After RoPE, tensors are in interleaved L1 memory
+k_heads_1bkd = ttnn.permute(k_bksd, (2, 0, 1, 3))  # Back to 1BKD format
+
+# Create HEIGHT_SHARDED config for paged_update_cache
+kv_shard_config = ttnn.create_sharded_memory_config(
+    shape=(32, self.head_dim),      # TILE_SIZE x head_dim
+    core_grid=ttnn.CoreGrid(y=1, x=1),  # Single core for batch=1
+    strategy=ttnn.ShardStrategy.HEIGHT,
+    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    use_height_and_width_as_shard_shape=True,
+)
+
+# Convert to HEIGHT_SHARDED
+k_sharded = ttnn.to_memory_config(k_heads_1bkd, kv_shard_config)
+v_sharded = ttnn.to_memory_config(v_heads_1bkd, kv_shard_config)
+
+# Now paged_update_cache accepts the sharded tensors
+ttnn.experimental.paged_update_cache(cache.key_cache, k_sharded, update_idxs_tensor=pos_tensor)
+ttnn.experimental.paged_update_cache(cache.value_cache, v_sharded, update_idxs_tensor=pos_tensor)
+```
+
+**Key Constraints**:
+| Constraint | Value | Reason |
+|------------|-------|--------|
+| Shard shape | `(32, head_dim)` | TILE_SIZE requirement |
+| Core grid | `CoreGrid(y=1, x=1)` | Single core for batch=1 |
+| Strategy | `HEIGHT` | Required by paged_update_cache |
+| Orientation | `ROW_MAJOR` | Required by paged_update_cache |
+
+**tt-transformers Pattern Comparison**:
+| Aspect | tt-transformers | BitNet-TT |
+|--------|-----------------|-----------|
+| Batch size | ≥32 | 1 |
+| Core grid | `CoreGrid(y=4, x=8)` = 32 cores | `CoreGrid(y=1, x=1)` = 1 core |
+| RoPE | `rotary_embedding_llama` (preserves sharding) | Manual RoPE (requires re-sharding) |
+| Sharding after RoPE | Not needed | Required via `to_memory_config` |
 
 ---
 

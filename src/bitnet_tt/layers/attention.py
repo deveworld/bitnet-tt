@@ -58,6 +58,7 @@ class KVCache:
         head_dim: int,
         device: ttnn.Device,
         num_heads: int | None = None,
+        use_paged: bool = False,
     ) -> None:
         """
         Pre-allocate cache buffers for maximum sequence length.
@@ -71,15 +72,22 @@ class KVCache:
             num_heads: Full head count for GQA expansion. If provided,
                        cache is pre-expanded to [batch, num_heads, max_seq, head_dim]
                        to avoid per-token GQA expansion during decode.
+            use_paged: If True, use 32 padded heads for paged_update_cache (Trace compatible)
         """
         self.batch_size = batch_size
         self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         self.device = device
+        self._use_paged = use_paged
 
-        # Determine cache head count - use GQA-expanded form if num_heads provided
-        if num_heads is not None:
+        # Determine cache head count
+        if use_paged:
+            # Padded to 32 heads for HEIGHT_SHARDED compatibility (enables Metal Trace)
+            cache_heads = 32
+            self.num_heads = num_heads if num_heads is not None else num_kv_heads
+            self._gqa_expanded = False  # Store non-expanded, expand on return
+        elif num_heads is not None:
             # Pre-expanded cache for GQA (avoids expansion during decode)
             cache_heads = num_heads
             self.num_heads = num_heads
@@ -138,18 +146,35 @@ class KVCache:
 
         # If preallocated, store NON-EXPANDED KV, expand only when returning
         if self._preallocated and self.key_cache is not None:
-            # Use fill_cache with NON-EXPANDED key/value (5 heads)
-            for batch_idx in range(key_states.shape[0]):
-                k_batch = key_states[batch_idx : batch_idx + 1, :, :, :]
-                v_batch = value_states[batch_idx : batch_idx + 1, :, :, :]
-                self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
-                self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
+            cache_heads = self.key_cache.shape[1]
+            kv_heads = key_states.shape[1]
+
+            if self._use_paged and cache_heads > kv_heads:
+                pad_amount = cache_heads - kv_heads
+                key_padded = ttnn.pad(key_states, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
+                value_padded = ttnn.pad(
+                    value_states, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0
+                )
+
+                for batch_idx in range(key_padded.shape[0]):
+                    k_batch = key_padded[batch_idx : batch_idx + 1, :, :, :]
+                    v_batch = value_padded[batch_idx : batch_idx + 1, :, :, :]
+                    self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
+                    self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
+
+                ttnn.deallocate(key_padded)
+                ttnn.deallocate(value_padded)
+            else:
+                for batch_idx in range(key_states.shape[0]):
+                    k_batch = key_states[batch_idx : batch_idx + 1, :, :, :]
+                    v_batch = value_states[batch_idx : batch_idx + 1, :, :, :]
+                    self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
+                    self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
 
             self.seq_len_cached = seq_len
 
-            # Return GQA-expanded view for attention
-            key_for_attn = self.key_cache[:, :, :seq_len, :]
-            value_for_attn = self.value_cache[:, :, :seq_len, :]
+            key_for_attn = self.key_cache[:, : self.num_kv_heads, :seq_len, :]
+            value_for_attn = self.value_cache[:, : self.num_kv_heads, :seq_len, :]
             if num_kv_groups > 1:
                 key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
                 value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
@@ -212,6 +237,87 @@ class KVCache:
         value_for_attn = self.value_cache[:, :, : self.seq_len_cached, :]
 
         # Expand for GQA when returning
+        if num_kv_groups > 1:
+            key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
+            value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
+
+        return key_for_attn, value_for_attn
+
+    def update_decode_paged(
+        self,
+        key_states: ttnn.Tensor,
+        value_states: ttnn.Tensor,
+        current_pos: int,
+        current_pos_tensor: ttnn.Tensor,
+        num_kv_groups: int = 1,
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Trace-compatible KV cache update using paged_update_cache with 32-head padding.
+        All operations are device-side to maintain Trace compatibility.
+        """
+        if not self._preallocated:
+            raise RuntimeError("Cache must be preallocated for paged update")
+
+        kv_heads = key_states.shape[1]
+        padded_heads = 32
+        pad_amount = padded_heads - kv_heads
+
+        key_rm = ttnn.to_layout(key_states, ttnn.ROW_MAJOR_LAYOUT)
+        key_1bkd = ttnn.permute(key_rm, (2, 0, 1, 3))
+        key_1bkd = ttnn.to_layout(key_1bkd, ttnn.TILE_LAYOUT)
+
+        value_rm = ttnn.to_layout(value_states, ttnn.ROW_MAJOR_LAYOUT)
+        value_1bkd = ttnn.permute(value_rm, (2, 0, 1, 3))
+        value_1bkd = ttnn.to_layout(value_1bkd, ttnn.TILE_LAYOUT)
+
+        key_padded = ttnn.pad(key_1bkd, [(0, 0), (0, 0), (0, pad_amount), (0, 0)], 0.0)
+        value_padded = ttnn.pad(value_1bkd, [(0, 0), (0, 0), (0, pad_amount), (0, 0)], 0.0)
+
+        shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        key_sharded = ttnn.to_memory_config(key_padded, shard_config)
+        value_sharded = ttnn.to_memory_config(value_padded, shard_config)
+
+        key_pos_tensor = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.experimental.paged_update_cache(
+            self.key_cache, key_sharded, update_idxs_tensor=key_pos_tensor
+        )
+        ttnn.deallocate(key_pos_tensor)
+        value_pos_tensor = ttnn.from_torch(
+            torch.tensor([current_pos], dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.experimental.paged_update_cache(
+            self.value_cache, value_sharded, update_idxs_tensor=value_pos_tensor
+        )
+        ttnn.deallocate(value_pos_tensor)
+
+        ttnn.deallocate(key_1bkd)
+        ttnn.deallocate(value_1bkd)
+        ttnn.deallocate(key_padded)
+        ttnn.deallocate(value_padded)
+        ttnn.deallocate(key_sharded)
+        ttnn.deallocate(value_sharded)
+
+        self.seq_len_cached = current_pos + 1
+
+        key_for_attn = self.key_cache[:, : self.num_kv_heads, :, :]
+        value_for_attn = self.value_cache[:, : self.num_kv_heads, :, :]
+
         if num_kv_groups > 1:
             key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
             value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
@@ -972,7 +1078,16 @@ class MultiHeadAttention:
                     key, value, self.num_kv_groups
                 )
             else:
-                if past_key_value._preallocated:
+                if (
+                    past_key_value._preallocated
+                    and hasattr(past_key_value, "_use_paged")
+                    and past_key_value._use_paged
+                    and current_pos_tensor is not None
+                ):
+                    key_expanded, value_expanded = past_key_value.update_decode_paged(
+                        key, value, current_pos, current_pos_tensor, self.num_kv_groups
+                    )
+                elif past_key_value._preallocated:
                     key_expanded, value_expanded = past_key_value.update_decode_simple(
                         key, value, current_pos, self.num_kv_groups
                     )
@@ -991,20 +1106,36 @@ class MultiHeadAttention:
                 value_expanded = value
             updated_cache = None
 
-        # SDPA with BKSD format
-        is_causal = mode == "prefill"
-        attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query,
-            key_expanded,
-            value_expanded,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-            scale=self.scale,
-        )
+        use_decode_sdpa = False
 
-        # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
-        # Optimization: transpose in TILE, reshape in ROW_MAJOR
-        attn_output = ttnn.transpose(attn_output, 1, 2)  # [b, s, h, d]
+        if use_decode_sdpa:
+            q_rm = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
+            q_1bkd = ttnn.permute(q_rm, (2, 0, 1, 3))
+            q_1bkd = ttnn.to_layout(q_1bkd, ttnn.TILE_LAYOUT)
+
+            attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
+                q_1bkd,
+                key_expanded,
+                value_expanded,
+                cur_pos_tensor=current_pos_tensor,
+                scale=self.scale,
+            )
+
+            attn_rm = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
+            attn_bksd = ttnn.permute(attn_rm, (1, 2, 0, 3))
+            attn_output = ttnn.to_layout(attn_bksd, ttnn.TILE_LAYOUT)
+        else:
+            is_causal = mode == "prefill"
+            attn_output = ttnn.transformer.scaled_dot_product_attention(
+                query,
+                key_expanded,
+                value_expanded,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+                scale=self.scale,
+            )
+
+        attn_output = ttnn.transpose(attn_output, 1, 2)
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
         attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
         attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
@@ -1452,27 +1583,40 @@ class MultiHeadAttention:
             xqkv_fused_4d,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         ttnn.deallocate(xqkv_fused_4d)
 
-        # 2. Apply RoPE using fused rotary_embedding_llama
-        q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1bqd,
-            rot_mats[0],  # cos
-            rot_mats[1],  # sin
-            transformation_mat,
-            is_decode_mode=True,
-        )
-        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1bkd,
-            rot_mats[0],
-            rot_mats[1],
-            transformation_mat,
-            is_decode_mode=True,
-        )
+        # 2. Apply RoPE - convert sharded 1BKD to interleaved BKSD, apply RoPE, convert back
+        q_interleaved = ttnn.to_memory_config(q_heads_1bqd, ttnn.L1_MEMORY_CONFIG)
+        k_interleaved = ttnn.to_memory_config(k_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(q_heads_1bqd)
+        ttnn.deallocate(k_heads_1bkd)
 
-        # 3. Update KV cache in-place using paged_update_cache
+        q_bksd = ttnn.permute(q_interleaved, (1, 2, 0, 3))  # [1,B,Q,D] -> [B,Q,1,D]
+        k_bksd = ttnn.permute(k_interleaved, (1, 2, 0, 3))  # [1,B,K,D] -> [B,K,1,D]
+        ttnn.deallocate(q_interleaved)
+        ttnn.deallocate(k_interleaved)
+
+        q_bksd, k_bksd = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, None)
+
+        q_heads_1bqd = ttnn.permute(q_bksd, (2, 0, 1, 3))  # [B,Q,1,D] -> [1,B,Q,D]
+        k_heads_1bkd = ttnn.permute(k_bksd, (2, 0, 1, 3))  # [B,K,1,D] -> [1,B,K,D]
+        ttnn.deallocate(q_bksd)
+        ttnn.deallocate(k_bksd)
+
+        # 3. Update KV cache - paged_update_cache requires HEIGHT_SHARDED input
+        kv_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=1, x=1),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        k_sharded = ttnn.to_memory_config(k_heads_1bkd, kv_shard_config)
+        v_sharded = ttnn.to_memory_config(v_heads_1bkd, kv_shard_config)
+        ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
+
         # Create position tensor for cache update if not provided
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
@@ -1486,16 +1630,16 @@ class MultiHeadAttention:
 
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache,
-            k_heads_1bkd,
+            k_sharded,
             update_idxs_tensor=cur_pos_tensor,
         )
         ttnn.experimental.paged_update_cache(
             past_key_value.value_cache,
-            v_heads_1bkd,
+            v_sharded,
             update_idxs_tensor=cur_pos_tensor,
         )
-        ttnn.deallocate(k_heads_1bkd)
-        ttnn.deallocate(v_heads_1bkd)
+        ttnn.deallocate(k_sharded)
+        ttnn.deallocate(v_sharded)
 
         past_key_value.seq_len_cached = current_pos + 1
 
@@ -1574,59 +1718,84 @@ class MultiHeadAttention:
         # Apply RoPE
         query, key = self._apply_rope_manual(query, key, 0, seq_len)
 
-        # Store non-expanded KV in pre-allocated cache
-        # Copy KV states to the start of the pre-allocated cache
-        # For prefill, we store positions 0..seq_len-1
-
-        # Update cache position tracking
         past_key_value.seq_len_cached = seq_len
 
-        # For prefill, we need to slice the pre-allocated cache and copy
-        # TT-NN slice and assign: cache[:, :, :seq_len, :] = key/value
-        # Since TT-NN doesn't have direct slice assignment, we replace the cache
-        # with a new tensor that has the prefill data
+        if past_key_value._use_paged and past_key_value.key_cache is not None:
+            cache_heads = past_key_value.key_cache.shape[1]
+            kv_heads = key.shape[1]
 
-        # Deallocate old cache and assign new data
-        if past_key_value.key_cache is not None:
-            ttnn.deallocate(past_key_value.key_cache)
-        if past_key_value.value_cache is not None:
-            ttnn.deallocate(past_key_value.value_cache)
+            if cache_heads > kv_heads:
+                pad_amount = cache_heads - kv_heads
+                key_padded = ttnn.pad(key, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
+                value_padded = ttnn.pad(value, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
 
-        # Pad key/value to max_seq_len if needed for SDPA compatibility
-        if seq_len < past_key_value.max_seq_len:
-            # Pad with zeros
-            pad_len = past_key_value.max_seq_len - seq_len
-            pad_shape = (batch_size, self.num_kv_heads, pad_len, self.head_dim)
-            zeros = torch.zeros(pad_shape, dtype=torch.bfloat16)
-            zeros_ttnn = ttnn.from_torch(
-                zeros,
-                device=self.device,
-                layout=ttnn.TILE_LAYOUT,
-                dtype=ttnn.bfloat16,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            key_padded = ttnn.concat([key, zeros_ttnn], dim=2)
-            value_padded = ttnn.concat([value, zeros_ttnn], dim=2)
+                for batch_idx in range(batch_size):
+                    k_batch = key_padded[batch_idx : batch_idx + 1, :, :, :]
+                    v_batch = value_padded[batch_idx : batch_idx + 1, :, :, :]
+                    past_key_value.key_cache = ttnn.fill_cache(
+                        past_key_value.key_cache, k_batch, batch_idx
+                    )
+                    past_key_value.value_cache = ttnn.fill_cache(
+                        past_key_value.value_cache, v_batch, batch_idx
+                    )
+
+                ttnn.deallocate(key_padded)
+                ttnn.deallocate(value_padded)
+            else:
+                for batch_idx in range(batch_size):
+                    k_batch = key[batch_idx : batch_idx + 1, :, :, :]
+                    v_batch = value[batch_idx : batch_idx + 1, :, :, :]
+                    past_key_value.key_cache = ttnn.fill_cache(
+                        past_key_value.key_cache, k_batch, batch_idx
+                    )
+                    past_key_value.value_cache = ttnn.fill_cache(
+                        past_key_value.value_cache, v_batch, batch_idx
+                    )
             ttnn.deallocate(key)
             ttnn.deallocate(value)
-            ttnn.deallocate(zeros_ttnn)
-            past_key_value.key_cache = key_padded
-            past_key_value.value_cache = value_padded
         else:
-            past_key_value.key_cache = key
-            past_key_value.value_cache = value
+            if past_key_value.key_cache is not None:
+                ttnn.deallocate(past_key_value.key_cache)
+            if past_key_value.value_cache is not None:
+                ttnn.deallocate(past_key_value.value_cache)
 
-        # For prefill SDPA, we need to expand KV for GQA
+            if seq_len < past_key_value.max_seq_len:
+                pad_len = past_key_value.max_seq_len - seq_len
+                pad_shape = (batch_size, self.num_kv_heads, pad_len, self.head_dim)
+                zeros = torch.zeros(pad_shape, dtype=torch.bfloat16)
+                zeros_ttnn = ttnn.from_torch(
+                    zeros,
+                    device=self.device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                key_padded = ttnn.concat([key, zeros_ttnn], dim=2)
+                value_padded = ttnn.concat([value, zeros_ttnn], dim=2)
+                ttnn.deallocate(key)
+                ttnn.deallocate(value)
+                ttnn.deallocate(zeros_ttnn)
+                past_key_value.key_cache = key_padded
+                past_key_value.value_cache = value_padded
+            else:
+                past_key_value.key_cache = key
+                past_key_value.value_cache = value
+
+        kv_heads_slice = self.num_kv_heads
         if self.num_kv_groups > 1:
             key_expanded = ttnn.repeat_interleave(
-                past_key_value.key_cache[:, :, :seq_len, :], self.num_kv_groups, dim=1
+                past_key_value.key_cache[:, :kv_heads_slice, :seq_len, :],
+                self.num_kv_groups,
+                dim=1,
             )
             value_expanded = ttnn.repeat_interleave(
-                past_key_value.value_cache[:, :, :seq_len, :], self.num_kv_groups, dim=1
+                past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :],
+                self.num_kv_groups,
+                dim=1,
             )
         else:
-            key_expanded = past_key_value.key_cache[:, :, :seq_len, :]
-            value_expanded = past_key_value.value_cache[:, :, :seq_len, :]
+            key_expanded = past_key_value.key_cache[:, :kv_heads_slice, :seq_len, :]
+            value_expanded = past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :]
 
         # SDPA (causal attention for prefill)
         attn_output = ttnn.transformer.scaled_dot_product_attention(
