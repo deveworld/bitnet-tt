@@ -1674,11 +1674,11 @@ class MultiHeadAttention:
         if current_pos_tensor is None:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 5. Concat heads: [1, num_heads, batch, head_dim] -> [batch, 1, hidden_dim]
+        # 5. Concat heads: [1, batch, num_heads, head_dim] -> [batch, 1, hidden_dim]
         attn_output = ttnn.to_memory_config(attn_output_1g4d, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(attn_output_1g4d)
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_output = ttnn.permute(attn_output, (2, 0, 1, 3))
+        attn_output = ttnn.permute(attn_output, (1, 0, 2, 3))
         attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.num_heads * self.head_dim))
         attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
         attn_output = self.attn_sub_norm(attn_output)
