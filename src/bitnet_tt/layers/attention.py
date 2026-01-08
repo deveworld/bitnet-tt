@@ -1608,17 +1608,12 @@ class MultiHeadAttention:
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
-        # 3. Update KV cache - convert 1BKD to BKSD, pad to 32 heads
+        # 3. Update KV cache - keep 1BKD format, pad to 32 heads
         pad_heads = 32 - self.num_kv_heads
         k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_interleaved)
-
-        k_bksd = ttnn.permute(k_padded, (1, 2, 0, 3))
-        v_bksd = ttnn.permute(v_padded, (1, 2, 0, 3))
-        ttnn.deallocate(k_padded)
-        ttnn.deallocate(v_padded)
 
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
@@ -1632,16 +1627,16 @@ class MultiHeadAttention:
 
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache,
-            k_bksd,
+            k_padded,
             update_idxs_tensor=cur_pos_tensor,
         )
         ttnn.experimental.paged_update_cache(
             past_key_value.value_cache,
-            v_bksd,
+            v_padded,
             update_idxs_tensor=cur_pos_tensor,
         )
-        ttnn.deallocate(k_bksd)
-        ttnn.deallocate(v_bksd)
+        ttnn.deallocate(k_padded)
+        ttnn.deallocate(v_padded)
 
         past_key_value.seq_len_cached = current_pos + 1
 
