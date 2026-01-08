@@ -1672,9 +1672,9 @@ class MultiHeadAttention:
         if current_pos_tensor is None:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 5. nlp_concat_heads_decode requires sharded input
+        # 5. nlp_concat_heads_decode requires sharded input - use actual num_heads, not padded
         attn_shard_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),
+            shape=(self.num_heads, self.head_dim),
             core_grid=ttnn.CoreGrid(y=1, x=1),
             strategy=ttnn.ShardStrategy.HEIGHT,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
