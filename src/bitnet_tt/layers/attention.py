@@ -1690,6 +1690,7 @@ class MultiHeadAttention:
         ttnn.deallocate(attn_output_sharded)
 
         attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
+        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.num_heads * self.head_dim))
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
