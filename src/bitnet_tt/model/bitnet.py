@@ -152,6 +152,8 @@ class BitNetModel:
         transformation_mat: ttnn.Tensor | None = None,
         current_pos_tensor: ttnn.Tensor | None = None,
         pos_tensor: ttnn.Tensor | None = None,  # For backward compatibility / alias
+        cos_sin_tensors: tuple[ttnn.Tensor, ttnn.Tensor]
+        | None = None,  # Pre-computed cos/sin for trace
     ) -> tuple[ttnn.Tensor, Optional[list[KVCache]]]:
         """
         Forward pass with mode-aware optimization.
@@ -204,6 +206,7 @@ class BitNetModel:
                 transformation_mat=transformation_mat,
                 current_pos_tensor=current_pos_tensor,  # int32 for KV cache
                 pos_tensor=pos_tensor,  # uint32 for RoPE
+                cos_sin_tensors=cos_sin_tensors,
             )
 
             if use_cache:

@@ -57,8 +57,8 @@ def compute_cos_sin_cache(
 
     # Permute to meta format (for rotary_embedding_llama)
     # Stack interleaved: [cos0, cos0, cos1, cos1, ...]
-    cos_half = cos[:, :head_dim // 2]
-    sin_half = sin[:, :head_dim // 2]
+    cos_half = cos[:, : head_dim // 2]
+    sin_half = sin[:, : head_dim // 2]
 
     cos_interleaved = torch.stack([cos_half, cos_half], dim=-1).flatten(-2)
     sin_interleaved = torch.stack([sin_half, sin_half], dim=-1).flatten(-2)
@@ -105,6 +105,7 @@ class RotarySetup:
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
+        self.rope_theta = rope_theta
 
         # Compute cos/sin cache on CPU
         cos_cache, sin_cache = compute_cos_sin_cache(
@@ -175,7 +176,7 @@ class RotarySetup:
         if isinstance(position_ids, ttnn.Tensor):
             # Already on device (for trace)
             rot_idxs = position_ids
-            batch = position_ids.shape[1] # Assuming [1, batch] from trace setup
+            batch = position_ids.shape[1]  # Assuming [1, batch] from trace setup
         else:
             batch = position_ids.shape[0]
 
@@ -195,8 +196,12 @@ class RotarySetup:
             )
 
         # Use embedding lookup for cos/sin (device-side operation!)
-        cos = ttnn.embedding(rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT)  # [1, batch, head_dim]
-        sin = ttnn.embedding(rot_idxs, self.sin_matrix, layout=ttnn.TILE_LAYOUT)  # [1, batch, head_dim]
+        cos = ttnn.embedding(
+            rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT
+        )  # [1, batch, head_dim]
+        sin = ttnn.embedding(
+            rot_idxs, self.sin_matrix, layout=ttnn.TILE_LAYOUT
+        )  # [1, batch, head_dim]
 
         # Reshape for rotary_embedding_llama: [1, batch, 1, head_dim]
         cos = ttnn.unsqueeze_to_4D(cos)  # [1, 1, batch, head_dim]
@@ -255,3 +260,73 @@ class RotarySetup:
             "decode": self.transformation_mat_decode,
             "prefill": self.transformation_mat_prefill,
         }
+
+    def get_cos_sin_for_position(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get cos/sin for single position. Shape: [1, 1, 1, head_dim].
+
+        Uses NON-INTERLEAVED format [f0..f63, f0..f63] matching precompute_freqs_cis(),
+        NOT the interleaved format [f0,f0,f1,f1..] used by compute_cos_sin_cache().
+        """
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        pos_freqs = float(position) * inv_freq
+        emb = torch.cat([pos_freqs, pos_freqs], dim=-1)
+
+        cos_val = emb.cos().reshape(1, 1, 1, self.head_dim)
+        sin_val = emb.sin().reshape(1, 1, 1, self.head_dim)
+
+        return cos_val, sin_val
+
+    def create_cos_sin_device_tensors(
+        self, position: int, datatype: ttnn.DataType = ttnn.bfloat16
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Create device tensors for cos/sin that can be updated via copy_host_to_device_tensor.
+
+        Returns DEVICE tensors - use copy_host_to_device_tensor to update.
+        Shape: [1, 1, 1, head_dim] - padded to TILE_SIZE for TILE_LAYOUT compatibility.
+        """
+        cos_torch, sin_torch = self.get_cos_sin_for_position(position)
+
+        cos_device = ttnn.from_torch(
+            cos_torch,
+            device=self.device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=datatype,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        sin_device = ttnn.from_torch(
+            sin_torch,
+            device=self.device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=datatype,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        return cos_device, sin_device
+
+    def get_cos_sin_host_tensor(
+        self, position: int, datatype: ttnn.DataType = ttnn.bfloat16
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """
+        Get HOST tensors for cos/sin that can be copied to device.
+
+        Returns HOST tensors (device=None) - use with copy_host_to_device_tensor.
+        """
+        cos_torch, sin_torch = self.get_cos_sin_for_position(position)
+
+        cos_host = ttnn.from_torch(
+            cos_torch,
+            dtype=datatype,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        sin_host = ttnn.from_torch(
+            sin_torch,
+            dtype=datatype,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        return cos_host, sin_host

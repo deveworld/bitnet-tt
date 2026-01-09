@@ -148,6 +148,8 @@ class TransformerBlock:
         transformation_mat: ttnn.Tensor | None = None,
         current_pos_tensor: ttnn.Tensor | None = None,  # int32 for KV cache
         pos_tensor: ttnn.Tensor | None = None,  # uint32 for RoPE
+        cos_sin_tensors: tuple[ttnn.Tensor, ttnn.Tensor]
+        | None = None,  # Pre-computed cos/sin for trace
     ) -> tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -184,6 +186,7 @@ class TransformerBlock:
             transformation_mat=transformation_mat,
             current_pos_tensor=current_pos_tensor,
             pos_tensor=pos_tensor,
+            cos_sin_tensors=cos_sin_tensors,
         )
 
         # Residual connection

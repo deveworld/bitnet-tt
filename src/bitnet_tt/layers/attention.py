@@ -926,6 +926,8 @@ class MultiHeadAttention:
         transformation_mat: ttnn.Tensor | None = None,
         current_pos_tensor: ttnn.Tensor | None = None,  # int32 for KV cache
         pos_tensor: ttnn.Tensor | None = None,  # uint32 for RoPE
+        cos_sin_tensors: Tuple[ttnn.Tensor, ttnn.Tensor]
+        | None = None,  # Pre-computed cos/sin for trace
     ) -> Tuple[ttnn.Tensor, Optional[KVCache]]:
         """
         Forward pass with mode-aware optimization.
@@ -983,6 +985,7 @@ class MultiHeadAttention:
                 batch_size,
                 current_pos_tensor=current_pos_tensor,
                 pos_tensor=pos_tensor,
+                cos_sin_tensors=cos_sin_tensors,
             )
 
         # Standard path: separate QKV projections
@@ -1478,9 +1481,24 @@ class MultiHeadAttention:
         start_pos: int,
         seq_len: int,
         pos_tensor: ttnn.Tensor | None = None,
+        cos_sin_tensors: Tuple[ttnn.Tensor, ttnn.Tensor] | None = None,
     ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Manual RoPE implementation using device-cached cos/sin tables."""
-        if seq_len == 1:
+        """Manual RoPE implementation using device-cached cos/sin tables.
+
+        Args:
+            query: Query tensor [batch, heads, seq, head_dim]
+            key: Key tensor [batch, heads, seq, head_dim]
+            start_pos: Starting position for RoPE
+            seq_len: Sequence length
+            pos_tensor: Optional position tensor for embedding lookup (deprecated for trace)
+            cos_sin_tensors: Optional pre-computed (cos, sin) tensors for trace mode.
+                             When provided, skips embedding lookup entirely.
+                             Expected shape: [1, 1, 1, head_dim] for decode.
+        """
+        if cos_sin_tensors is not None:
+            # Trace mode: use pre-computed cos/sin directly (no embedding lookup)
+            cos_ttnn, sin_ttnn = cos_sin_tensors
+        elif seq_len == 1:
             # Decode mode: use embedding lookup with single position
             pos_tensor_created_locally = pos_tensor is None
             if pos_tensor is None:
@@ -1549,6 +1567,7 @@ class MultiHeadAttention:
         batch_size: int,
         current_pos_tensor: ttnn.Tensor | None = None,
         pos_tensor: ttnn.Tensor | None = None,
+        cos_sin_tensors: Tuple[ttnn.Tensor, ttnn.Tensor] | None = None,
     ) -> Tuple[ttnn.Tensor, KVCache]:
         """
         Optimized decode forward using tt_transformers patterns with batch=32 padding.
@@ -1651,7 +1670,9 @@ class MultiHeadAttention:
         q_bksd = ttnn.to_layout(q_bksd, ttnn.TILE_LAYOUT)
         k_bksd = ttnn.to_layout(k_bksd, ttnn.TILE_LAYOUT)
 
-        q_rotated, k_rotated = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, pos_tensor)
+        q_rotated, k_rotated = self._apply_rope_manual(
+            q_bksd, k_bksd, current_pos, 1, pos_tensor, cos_sin_tensors
+        )
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
@@ -1683,7 +1704,19 @@ class MultiHeadAttention:
         ttnn.deallocate(v_rm2)
         ttnn.deallocate(v_bksd)
 
-        # paged_update_cache requires HEIGHT_SHARDED inputs
+        # paged_update_cache requires:
+        # 1. Input heads must match cache heads (cache has 32 padded heads)
+        # 2. HEIGHT_SHARDED inputs
+        cache_heads = past_key_value.key_cache.shape[1]  # 32
+        kv_heads = k_heads_1bkd.shape[2]  # 5 (num_kv_heads)
+
+        if cache_heads > kv_heads:
+            # Pad K/V from 5 heads to 32 heads to match cache
+            # K/V shape: [1, batch, kv_heads, head_dim] -> [1, batch, 32, head_dim]
+            pad_amount = cache_heads - kv_heads
+            k_heads_1bkd = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_amount), (0, 0)], 0.0)
+            v_heads_1bkd = ttnn.pad(v_heads_1bkd, [(0, 0), (0, 0), (0, pad_amount), (0, 0)], 0.0)
+
         kv_shard_config = ttnn.create_sharded_memory_config(
             shape=(32, self.head_dim),
             core_grid=ttnn.CoreGrid(y=4, x=8),

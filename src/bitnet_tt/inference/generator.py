@@ -323,37 +323,33 @@ class TextGenerator:
         token: NDArray[np.int64],
         current_pos: int,
         kv_cache: list[KVCache],
-    ) -> tuple[int, ttnn.Tensor, list[ttnn.Tensor]]:
+    ) -> tuple[int, ttnn.Tensor, dict[str, ttnn.Tensor]]:
         """
         Capture a trace for the decode forward pass.
 
         This compiles the decode graph once and reuses it for all subsequent
         decode steps, eliminating compilation overhead (2-3x speedup).
-        Also manages persistent pos_tensor to avoid device writes during trace.
+
+        Key fix for RoPE in trace mode:
+        - Pre-compute cos/sin OUTSIDE the trace as device tensors
+        - Update them via copy_host_to_device_tensor before each trace execution
+        - Pass cos_sin_tensors to the model instead of relying on embedding lookup
 
         Returns:
-            (trace_id, output_tensor, [input_tensor, pos_tensor])
+            (trace_id, output_tensor, dict of trace input tensors)
         """
         input_tensor = numpy_int_to_ttnn(token, self.device)
 
-        pos_tensor_host = ttnn.from_torch(
-            torch.tensor([[current_pos]], dtype=torch.int32),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=None,
-        )
-        pos_tensor_int32_host = ttnn.from_torch(
+        pos_tensor_int32 = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
             dtype=ttnn.int32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=None,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        pos_tensor = ttnn.to_device(
-            pos_tensor_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
-        pos_tensor_int32 = ttnn.to_device(
-            pos_tensor_int32_host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
+
+        cos_device, sin_device = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
+        cos_sin_tensors = (cos_device, sin_device)
 
         rot_mats = self.get_rot_mats_decode(current_pos)
         transformation_mat = self.get_transformation_mat()
@@ -364,10 +360,10 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
-            pos_tensor=pos_tensor,
             current_pos_tensor=pos_tensor_int32,
             rot_mats=rot_mats,
             transformation_mat=transformation_mat,
+            cos_sin_tensors=cos_sin_tensors,
         )
         ttnn.synchronize_device(self.device)
 
@@ -378,15 +374,21 @@ class TextGenerator:
             use_cache=True,
             mode="decode",
             current_pos=current_pos,
-            pos_tensor=pos_tensor,
             current_pos_tensor=pos_tensor_int32,
             rot_mats=rot_mats,
             transformation_mat=transformation_mat,
+            cos_sin_tensors=cos_sin_tensors,
         )
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
 
-        return trace_id, logits, [input_tensor, pos_tensor, pos_tensor_int32]
+        trace_inputs = {
+            "input": input_tensor,
+            "pos_int32": pos_tensor_int32,
+            "cos": cos_device,
+            "sin": sin_device,
+        }
+        return trace_id, logits, trace_inputs
 
     def _execute_decode_trace(
         self,
@@ -396,45 +398,32 @@ class TextGenerator:
         """
         Execute the captured decode trace with new input.
 
-        Args:
-            token: New token to process
-            current_pos: Current position in sequence (for KV cache update)
-
-        Returns:
-            Output logits tensor
+        Updates trace inputs via copy_host_to_device_tensor:
+        1. Input token
+        2. Position tensor (int32) for KV cache
+        3. Pre-computed cos/sin tensors for RoPE (key fix for trace mode)
         """
-        # 1. Update Input Token - create HOST tensor (device=None) for copy_host_to_device
-        # Convert numpy to torch, then to HOST ttnn tensor
         if token.dtype != np.int32:
             token = token.astype(np.int32)
         torch_token = torch.from_numpy(token)
         new_input = ttnn.from_torch(
             torch_token, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=None
         )
-        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs[0])
+        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs["input"])
 
-        # 2. Update Position Tensors - HOST tensors (device=None)
-        # pos_tensor (uint32) for RoPE
-        new_pos = ttnn.from_torch(
-            torch.tensor([[current_pos]], dtype=torch.int32),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=None,
-        )
-        ttnn.copy_host_to_device_tensor(new_pos, self._trace_inputs[1])
-
-        # pos_tensor_int32 (int32) for KV cache paged_update_cache
         new_pos_int32 = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
             dtype=ttnn.int32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=None,
         )
-        ttnn.copy_host_to_device_tensor(new_pos_int32, self._trace_inputs[2])
+        ttnn.copy_host_to_device_tensor(new_pos_int32, self._trace_inputs["pos_int32"])
 
-        # Execute trace
+        cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
+        ttnn.copy_host_to_device_tensor(cos_host, self._trace_inputs["cos"])
+        ttnn.copy_host_to_device_tensor(sin_host, self._trace_inputs["sin"])
+
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
-        # Synchronize to ensure trace execution completes before using output
         ttnn.synchronize_device(self.device)
 
         return self._trace_output
