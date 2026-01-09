@@ -1742,43 +1742,17 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 7. Convert to HEIGHT_SHARDED for nlp_concat_heads_decode
-        sdpa_output_shard_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),
-            core_grid=ttnn.CoreGrid(y=4, x=8),
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
-        )
-        attn_output_sharded = ttnn.to_memory_config(attn_output_1bqd, sdpa_output_shard_config)
+        # 7. Reshape SDPA output: [1, num_heads, batch, head_dim] -> [batch, 1, hidden]
+        # nlp_concat_heads_decode requires num_cores == batch, which doesn't work for batch=1
+        # So we use manual reshape instead of the fused op
+        attn_output = ttnn.to_layout(attn_output_1bqd, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(attn_output_1bqd)
 
-        # 8. Concat heads using fused op
-        attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
-            attn_output_sharded,
-            num_heads=self.num_heads,
-        )
-        ttnn.deallocate(attn_output_sharded)
-
-        # 9. Convert from sharded to interleaved for downstream ops
-        attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(attn_output_concat)
-
-        # 10. Slice to actual batch size (remove padding)
-        # Output from nlp_concat_heads_decode: [1, padded_batch, 1, hidden_dim]
-        # We need: [batch, 1, hidden_dim]
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-
-        # Get output shape and slice to actual batch
         out_shape = attn_output.shape
         if len(out_shape) == 4:
-            # [1, padded_batch, 1, hidden] -> slice to [1, batch, 1, hidden]
-            if out_shape[1] > batch_size:
-                attn_output = attn_output[:, :batch_size, :, :]
-            # Reshape to [batch, 1, hidden]
+            attn_output = ttnn.permute(attn_output, (2, 0, 1, 3))
             attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
         else:
-            # Already correct shape, just reshape
             attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
 
         attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
