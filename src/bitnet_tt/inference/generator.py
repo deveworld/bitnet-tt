@@ -354,10 +354,11 @@ class TextGenerator:
         rot_mats = self.get_rot_mats_decode(current_pos)
         transformation_mat = self.get_transformation_mat()
 
+        saved_seq_len = [cache.seq_len_cached for cache in kv_cache]
         _, _ = self.model(
             input_tensor,
             past_key_values=kv_cache,
-            use_cache=False,
+            use_cache=True,
             mode="decode",
             current_pos=current_pos,
             current_pos_tensor=pos_tensor_int32,
@@ -365,6 +366,8 @@ class TextGenerator:
             transformation_mat=transformation_mat,
             cos_sin_tensors=cos_sin_tensors,
         )
+        for cache, saved_len in zip(kv_cache, saved_seq_len):
+            cache.seq_len_cached = saved_len
         ttnn.synchronize_device(self.device)
 
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
