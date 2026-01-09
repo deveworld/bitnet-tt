@@ -1683,6 +1683,17 @@ class MultiHeadAttention:
         ttnn.deallocate(v_rm2)
         ttnn.deallocate(v_bksd)
 
+        # paged_update_cache requires HEIGHT_SHARDED inputs
+        kv_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        k_heads_1bkd = ttnn.interleaved_to_sharded(k_heads_1bkd, kv_shard_config)
+        v_heads_1bkd = ttnn.interleaved_to_sharded(v_heads_1bkd, kv_shard_config)
+
         # 4. Create position tensor if not provided
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
