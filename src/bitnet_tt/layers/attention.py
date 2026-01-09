@@ -1630,9 +1630,14 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        past_key_value.key_cache = ttnn.fill_cache(past_key_value.key_cache, k_bksd, current_pos)
-        past_key_value.value_cache = ttnn.fill_cache(
-            past_key_value.value_cache, v_bksd, current_pos
+        # Use update_cache_for_token_ for in-place update at specific sequence position
+        # This is trace-compatible and uses integer indexing (not tensor)
+        # Input shape: [batch, heads, 1, head_dim] (BKSD format)
+        past_key_value.key_cache = ttnn.kv_cache.update_cache_for_token_(
+            past_key_value.key_cache, k_bksd, update_index=current_pos, batch_offset=0
+        )
+        past_key_value.value_cache = ttnn.kv_cache.update_cache_for_token_(
+            past_key_value.value_cache, v_bksd, update_index=current_pos, batch_offset=0
         )
         ttnn.deallocate(k_bksd)
         ttnn.deallocate(v_bksd)
