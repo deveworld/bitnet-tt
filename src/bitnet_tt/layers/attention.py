@@ -1633,15 +1633,15 @@ class MultiHeadAttention:
             )
 
         # Create HEIGHT_SHARDED memory config for paged_update_cache input
-        kv_shard_spec = ttnn.ShardSpec(
-            ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))]),
-            (32, self.head_dim),
-            ttnn.ShardOrientation.ROW_MAJOR,
-        )
-        kv_shard_config = ttnn.MemoryConfig(
-            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
-            ttnn.BufferType.L1,
-            kv_shard_spec,
+        # Use ttnn.create_sharded_memory_config for proper shard calculation
+        # Tensor shape after padding: [1, batch=1, 32, head_dim=128]
+        # For batch=1, use single core with shard shape matching the full tensor
+        kv_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),  # shard shape: heads x head_dim
+            core_grid=ttnn.CoreGrid(y=1, x=1),  # Single core for batch=1
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
         )
 
         k_sharded = ttnn.to_memory_config(k_padded, kv_shard_config)
