@@ -131,31 +131,14 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = False,  # 1BKD requires batch≥32, disabled for batch=1
+        enable_trace: bool = True,
         batch_size: int = 1,
     ) -> None:
-        """
-        Initialize the text generator.
-
-        Args:
-            model: BitNet model instance
-            tokenizer: HuggingFace tokenizer (optional)
-            enable_trace: Whether to use trace capture for decode (default: True)
-            batch_size: Maximum batch size for generation
-        """
         self.model = model
         self.device = model.device
         self.config = model.config
         self.tokenizer = tokenizer
         self.batch_size = batch_size
-
-        if enable_trace and batch_size < 32:
-            print(
-                f"Warning: Metal Trace requires batch_size >= 32 for HEIGHT_SHARDED ops. "
-                f"batch_size={batch_size} will cause trace to produce garbage output. "
-                f"Disabling trace automatically. Use batch_size >= 32 for trace speedup."
-            )
-            enable_trace = False
         self.enable_trace = enable_trace
 
         # Trace state
