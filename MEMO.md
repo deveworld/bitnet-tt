@@ -1096,6 +1096,35 @@ ttnn.experimental.paged_update_cache(cache.value_cache, v_sharded, update_idxs_t
 | RoPE | `rotary_embedding_llama` (preserves sharding) | Manual RoPE (requires re-sharding) |
 | Sharding after RoPE | Not needed | Required via `to_memory_config` |
 
+### 14.12 Metal Trace Limitation for batch=1 (2025-01-09)
+
+**CONFIRMED LIMITATION**: Metal Trace cannot work for batch=1 due to TT-NN sharding requirements.
+
+**Root Cause Chain**:
+1. Metal Trace requires NO buffer allocations during trace execution
+2. `rotary_embedding_llama` is the only RoPE op that doesn't allocate (preserves sharding)
+3. `rotary_embedding_llama` REQUIRES HEIGHT_SHARDED inputs
+4. `nlp_create_qkv_heads_decode` with `memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG` doesn't produce HEIGHT_SHARDED outputs for batch=1
+5. Manual RoPE requires permute/concat ops which ALLOCATE buffers
+6. **Conclusion**: For batch=1, trace-compatible decode is impossible with current TT-NN
+
+**Error When Attempting**:
+```
+TT_FATAL: Sharded inputs for RoPE must be HEIGHT_SHARDED.
+```
+
+**Current Status**:
+| Mode | Status | Speed |
+|------|--------|-------|
+| NO TRACE (batch=1) | ✅ Working | ~5.5 t/s |
+| WITH TRACE (batch=1) | ❌ Impossible | N/A |
+| WITH TRACE (batch≥32) | ✅ Supported by TT | 15+ t/s |
+
+**Path Forward**:
+- For single-user inference (batch=1): Accept ~5.5 t/s without trace
+- For batch inference (batch≥32): Implement batched generation to enable trace and achieve 15+ t/s
+- Alternative: Wait for TT-NN to support non-sharded `rotary_embedding_llama`
+
 ---
 
 This document is a core summary with duplicates/failure logs removed. When adding new experiments, record successful configurations in detail, leave only one-line cause for failures.

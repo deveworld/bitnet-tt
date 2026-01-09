@@ -147,8 +147,16 @@ class TextGenerator:
         self.device = model.device
         self.config = model.config
         self.tokenizer = tokenizer
-        self.enable_trace = enable_trace
         self.batch_size = batch_size
+
+        if enable_trace and batch_size < 32:
+            print(
+                f"Warning: Metal Trace requires batch_size >= 32 for HEIGHT_SHARDED ops. "
+                f"batch_size={batch_size} will cause trace to produce garbage output. "
+                f"Disabling trace automatically. Use batch_size >= 32 for trace speedup."
+            )
+            enable_trace = False
+        self.enable_trace = enable_trace
 
         # Trace state
         self._trace_id: Optional[int] = None
