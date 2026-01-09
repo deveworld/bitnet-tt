@@ -1742,15 +1742,15 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 7. Reshape SDPA output: [1, num_heads, batch, head_dim] -> [batch, 1, hidden]
-        # nlp_concat_heads_decode requires num_cores == batch, which doesn't work for batch=1
-        # So we use manual reshape instead of the fused op
+        # 7. Reshape SDPA output: [1, batch, num_heads, head_dim] -> [batch, 1, hidden]
+        # SDPA decode output is same format as Q: [1, B, NH, D]
+        # We need [batch, 1, hidden] where hidden = num_heads * head_dim
         attn_output = ttnn.to_layout(attn_output_1bqd, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(attn_output_1bqd)
 
         out_shape = attn_output.shape
         if len(out_shape) == 4:
-            attn_output = ttnn.permute(attn_output, (2, 0, 1, 3))
+            attn_output = attn_output[:, :batch_size, :, :]
             attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
         else:
             attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
