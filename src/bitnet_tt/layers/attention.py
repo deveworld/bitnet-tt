@@ -1572,56 +1572,33 @@ class MultiHeadAttention:
         Returns:
             (output, updated_cache)
         """
-        # 1. Create QKV heads using optimized fused op
-        # Input: [batch, 1, (n_heads + 2*n_kv_heads) * head_dim]
-        # Output: q [1, batch, n_heads, head_dim], k [1, batch, n_kv_heads, head_dim], v [1, batch, n_kv_heads, head_dim]
+        # 1. Reshape fused QKV for nlp_create_qkv_heads_decode
+        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
+        fqkv_shape = xqkv_fused.shape
+        if len(fqkv_shape) == 3:
+            qkv_dim = fqkv_shape[-1]
+            xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim), (1, 1, 32, qkv_dim))
+        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
-        # Reshape to 4D for nlp_create_qkv_heads_decode: [1, batch, 1, qkv_dim]
-        # xqkv_fused is [batch, 1, qkv_dim]
-        xqkv_fused_4d = ttnn.reshape(xqkv_fused, (1, batch_size, 1, self._qkv_dim))
-        ttnn.deallocate(xqkv_fused)
-
-        q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
-            xqkv_fused_4d,
+        # 2. Create QKV heads with HEIGHT_SHARDED output (preserves sharding for trace)
+        q_heads_1bkd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
+            xqkv_fused,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
+            memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
         )
-        ttnn.deallocate(xqkv_fused_4d)
+        ttnn.deallocate(xqkv_fused)
 
-        # 2. Apply RoPE
-        # nlp_create_qkv_heads_decode outputs [seqlen=1, batch, heads, head_dim] = [1, B, K, D]
-        # Convert to BKSD for RoPE: [batch, heads, seq, head_dim]
-        q_interleaved = ttnn.to_memory_config(q_heads_1bqd, ttnn.L1_MEMORY_CONFIG)
-        k_interleaved = ttnn.to_memory_config(k_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
-        v_interleaved = ttnn.to_memory_config(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(q_heads_1bqd)
-        ttnn.deallocate(k_heads_1bkd)
-        ttnn.deallocate(v_heads_1bkd)
+        # 3. Apply RoPE using rotary_embedding_llama (maintains sharding, no allocations)
+        cos, sin = rot_mats
+        q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+            q_heads_1bkd, cos, sin, transformation_mat, is_decode_mode=True
+        )
+        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+            k_heads_1bkd, cos, sin, transformation_mat, is_decode_mode=True
+        )
 
-        # [1, B, K, D] -> [B, K, 1, D] for RoPE (BKSD format)
-        q_bksd = ttnn.permute(q_interleaved, (1, 2, 0, 3))
-        k_bksd = ttnn.permute(k_interleaved, (1, 2, 0, 3))
-        ttnn.deallocate(q_interleaved)
-        ttnn.deallocate(k_interleaved)
-
-        q_bksd, k_bksd = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, pos_tensor)
-
-        # Convert back to 1BKD: [B, K, 1, D] -> [1, B, K, D]
-        q_heads_1bkd = ttnn.permute(q_bksd, (2, 0, 1, 3))
-        k_heads_1bkd = ttnn.permute(k_bksd, (2, 0, 1, 3))
-        ttnn.deallocate(q_bksd)
-        ttnn.deallocate(k_bksd)
-
-        # 3. Update KV cache using paged_update_cache
-        # paged_update_cache input: [1, batch, n_kv_heads, head_dim]
-        # Cache: [batch, n_kv_heads, max_seq, head_dim] (BKSD format)
-        # Pad heads from n_kv_heads to 32 (dimension 2)
-        pad_heads = 32 - self.num_kv_heads
-        k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
-        v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
-        ttnn.deallocate(k_heads_1bkd)
-        ttnn.deallocate(v_interleaved)
-
+        # 4. Create position tensor if not provided
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
         else:
@@ -1632,62 +1609,52 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # Create HEIGHT_SHARDED memory config for paged_update_cache input
-        # Use ttnn.create_sharded_memory_config for proper shard calculation
-        # Tensor shape after padding: [1, batch=1, 32, head_dim=128]
-        # For batch=1, use single core with shard shape matching the full tensor
-        kv_shard_config = ttnn.create_sharded_memory_config(
-            shape=(32, self.head_dim),  # shard shape: heads x head_dim
-            core_grid=ttnn.CoreGrid(y=1, x=1),  # Single core for batch=1
-            strategy=ttnn.ShardStrategy.HEIGHT,
-            orientation=ttnn.ShardOrientation.ROW_MAJOR,
-            use_height_and_width_as_shard_shape=True,
-        )
-
-        k_sharded = ttnn.to_memory_config(k_padded, kv_shard_config)
-        v_sharded = ttnn.to_memory_config(v_padded, kv_shard_config)
-        ttnn.deallocate(k_padded)
-        ttnn.deallocate(v_padded)
-
+        # 5. Update cache with paged_update_cache (sharded K/V from nlp_create_qkv_heads_decode)
         ttnn.experimental.paged_update_cache(
-            past_key_value.key_cache, k_sharded, update_idxs_tensor=cur_pos_tensor
+            past_key_value.key_cache, k_heads_1bkd, update_idxs_tensor=cur_pos_tensor
         )
         ttnn.experimental.paged_update_cache(
-            past_key_value.value_cache, v_sharded, update_idxs_tensor=cur_pos_tensor
+            past_key_value.value_cache, v_heads_1bkd, update_idxs_tensor=cur_pos_tensor
         )
-        ttnn.deallocate(k_sharded)
-        ttnn.deallocate(v_sharded)
+        ttnn.deallocate(k_heads_1bkd)
+        ttnn.deallocate(v_heads_1bkd)
 
         past_key_value.seq_len_cached = current_pos + 1
 
-        # 4. SDPA decode
-        # Q is already in [1, batch, n_q_heads, head_dim] format
-        q_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        # 6. SDPA decode (Q must be in DRAM when not sharded)
+        q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bkd)
 
-        k_for_sdpa = past_key_value.key_cache[:, : self.num_kv_heads, :, :]
-        v_for_sdpa = past_key_value.value_cache[:, : self.num_kv_heads, :, :]
-
-        attn_output_1bqd = ttnn.transformer.scaled_dot_product_attention_decode(
-            q_dram,
-            k_for_sdpa,
-            v_for_sdpa,
+        attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
+            q_heads_dram,
+            past_key_value.key_cache,
+            past_key_value.value_cache,
             cur_pos_tensor=cur_pos_tensor,
             scale=self.scale,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        ttnn.deallocate(q_dram)
-
+        ttnn.deallocate(q_heads_dram)
         if current_pos_tensor is None:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 5. Output: [1, batch, num_heads, head_dim] -> [batch, 1, hidden_dim]
-        attn_output = ttnn.to_memory_config(attn_output_1bqd, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(attn_output_1bqd)
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-        attn_output = ttnn.permute(attn_output, (1, 0, 2, 3))
-        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.num_heads * self.head_dim))
-        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
+        # 7. Convert to sharded for nlp_concat_heads_decode
+        attn_output_sharded = ttnn.to_memory_config(
+            attn_output_1bkd, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+        )
+        ttnn.deallocate(attn_output_1bkd)
+
+        # 8. Concat heads using fused op
+        attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
+            attn_output_sharded,
+            num_heads=self.num_heads,
+        )
+        ttnn.deallocate(attn_output_sharded)
+
+        # 9. Convert from sharded to interleaved for RMS norm
+        attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(attn_output_concat)
+
+        # 10. Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
