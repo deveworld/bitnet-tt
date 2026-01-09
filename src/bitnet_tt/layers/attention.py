@@ -1588,7 +1588,9 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(xqkv_fused_4d)
 
-        # 2. Apply RoPE - convert to interleaved for permute operations
+        # 2. Apply RoPE
+        # nlp_create_qkv_heads_decode outputs [seqlen, n_kv_heads, batch, head_dim]
+        # Convert to BKSD for RoPE: [batch, heads, seq, head_dim]
         q_interleaved = ttnn.to_memory_config(q_heads_1bqd, ttnn.L1_MEMORY_CONFIG)
         k_interleaved = ttnn.to_memory_config(k_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
         v_interleaved = ttnn.to_memory_config(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
@@ -1596,28 +1598,30 @@ class MultiHeadAttention:
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_heads_1bkd)
 
-        q_bksd = ttnn.permute(q_interleaved, (1, 2, 0, 3))  # [1,B,Q,D] -> [B,Q,1,D]
-        k_bksd = ttnn.permute(k_interleaved, (1, 2, 0, 3))  # [1,B,K,D] -> [B,K,1,D]
+        # [1, K, B, D] -> [B, K, 1, D] for RoPE (BKSD format)
+        q_bksd = ttnn.permute(q_interleaved, (2, 1, 0, 3))
+        k_bksd = ttnn.permute(k_interleaved, (2, 1, 0, 3))
         ttnn.deallocate(q_interleaved)
         ttnn.deallocate(k_interleaved)
 
         q_bksd, k_bksd = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, pos_tensor)
 
-        q_heads_1bqd = ttnn.permute(q_bksd, (2, 0, 1, 3))  # [B,Q,1,D] -> [1,B,Q,D]
-        k_heads_1bkd = ttnn.permute(k_bksd, (2, 0, 1, 3))  # [B,K,1,D] -> [1,B,K,D]
+        # Convert back to 1KBD: [B, K, 1, D] -> [1, K, B, D]
+        q_heads_1kbd = ttnn.permute(q_bksd, (2, 1, 0, 3))
+        k_heads_1kbd = ttnn.permute(k_bksd, (2, 1, 0, 3))
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
-        # 3. Update KV cache using paged_update_cache for trace compatibility
-        # paged_update_cache requires:
-        # - Input: 1BKD format [1, batch, heads, head_dim], HEIGHT_SHARDED in L1
-        # - Cache: BKSD format [batch, heads, seq, head_dim], INTERLEAVED in DRAM
-        # - update_idxs_tensor: position tensor (not integer) for trace compatibility
+        # Also convert V: [1, K, B, D] format (from nlp_create_qkv_heads_decode)
+        # No permute needed for V since it doesn't go through RoPE
 
+        # 3. Update KV cache using paged_update_cache
+        # paged_update_cache input: [seqlen=1, n_kv_heads, batch, head_dim]
+        # Cache: [batch, n_kv_heads, max_seq, head_dim] (BKSD format)
         pad_heads = 32 - self.num_kv_heads
-        k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
-        v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
-        ttnn.deallocate(k_heads_1bkd)
+        k_padded = ttnn.pad(k_heads_1kbd, [(0, 0), (0, pad_heads), (0, 0), (0, 0)], 0.0)
+        v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, pad_heads), (0, 0), (0, 0)], 0.0)
+        ttnn.deallocate(k_heads_1kbd)
         ttnn.deallocate(v_interleaved)
 
         if current_pos_tensor is not None:
@@ -1658,14 +1662,21 @@ class MultiHeadAttention:
 
         past_key_value.seq_len_cached = current_pos + 1
 
-        # 4. SDPA decode requires Q in DRAM and non-padded K/V
-        q_dram = ttnn.to_memory_config(q_heads_1bqd, ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(q_heads_1bqd)
+        # 4. SDPA decode
+        # scaled_dot_product_attention_decode expects:
+        #   Q: [1, batch, n_q_heads, head_dim]
+        #   K: [batch, n_kv_heads, seq, head_dim]
+        #   V: [batch, n_kv_heads, seq, head_dim]
+        # Our Q is [1, n_q_heads, batch, head_dim], need to permute to [1, batch, n_q_heads, head_dim]
+        q_1bqd = ttnn.permute(q_heads_1kbd, (0, 2, 1, 3))
+        ttnn.deallocate(q_heads_1kbd)
+        q_dram = ttnn.to_memory_config(q_1bqd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_1bqd)
 
         k_for_sdpa = past_key_value.key_cache[:, : self.num_kv_heads, :, :]
         v_for_sdpa = past_key_value.value_cache[:, : self.num_kv_heads, :, :]
 
-        attn_output_1g4d = ttnn.transformer.scaled_dot_product_attention_decode(
+        attn_output_1bqd = ttnn.transformer.scaled_dot_product_attention_decode(
             q_dram,
             k_for_sdpa,
             v_for_sdpa,
@@ -1675,13 +1686,12 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(q_dram)
 
-        # Only deallocate if we created it locally
         if current_pos_tensor is None:
             ttnn.deallocate(cur_pos_tensor)
 
-        # 5. Concat heads: [1, batch, num_heads, head_dim] -> [batch, 1, hidden_dim]
-        attn_output = ttnn.to_memory_config(attn_output_1g4d, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(attn_output_1g4d)
+        # 5. Output: [1, batch, num_heads, head_dim] -> [batch, 1, hidden_dim]
+        attn_output = ttnn.to_memory_config(attn_output_1bqd, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(attn_output_1bqd)
         attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
         attn_output = ttnn.permute(attn_output, (1, 0, 2, 3))
         attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.num_heads * self.head_dim))
