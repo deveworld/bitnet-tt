@@ -1627,14 +1627,61 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(xqkv_fused)
 
-        # 3. Apply RoPE using rotary_embedding_llama (requires HEIGHT_SHARDED inputs)
-        cos, sin = rot_mats
-        q_heads_1bqd = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1bqd, cos, sin, transformation_mat, is_decode_mode=True
-        )
-        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1bkd, cos, sin, transformation_mat, is_decode_mode=True
-        )
+        # 3. Apply manual RoPE (rotary_embedding_llama requires batch>=32 with HEIGHT_SHARDED)
+        # Convert 1BQD -> BKSD for RoPE, then back to 1BKD for cache update
+        q_interleaved = ttnn.sharded_to_interleaved(q_heads_1bqd, ttnn.L1_MEMORY_CONFIG)
+        k_interleaved = ttnn.sharded_to_interleaved(k_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(q_heads_1bqd)
+        ttnn.deallocate(k_heads_1bkd)
+
+        q_rm = ttnn.to_layout(q_interleaved, ttnn.ROW_MAJOR_LAYOUT)
+        k_rm = ttnn.to_layout(k_interleaved, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(q_interleaved)
+        ttnn.deallocate(k_interleaved)
+
+        q_bksd = ttnn.permute(q_rm, (1, 2, 0, 3))
+        k_bksd = ttnn.permute(k_rm, (1, 2, 0, 3))
+        ttnn.deallocate(q_rm)
+        ttnn.deallocate(k_rm)
+
+        if q_bksd.shape[-1] > self.head_dim:
+            q_bksd = q_bksd[:, :, :, : self.head_dim]
+            k_bksd = k_bksd[:, :, :, : self.head_dim]
+
+        q_bksd = ttnn.to_layout(q_bksd, ttnn.TILE_LAYOUT)
+        k_bksd = ttnn.to_layout(k_bksd, ttnn.TILE_LAYOUT)
+
+        q_rotated, k_rotated = self._apply_rope_manual(q_bksd, k_bksd, current_pos, 1, pos_tensor)
+        ttnn.deallocate(q_bksd)
+        ttnn.deallocate(k_bksd)
+
+        # Convert q_rotated from BKSD back to 1BQD for SDPA
+        q_rm = ttnn.to_layout(q_rotated, ttnn.ROW_MAJOR_LAYOUT)
+        q_heads_1bqd = ttnn.permute(q_rm, (2, 0, 1, 3))  # BKSD -> 1BQD (S=1 for decode)
+        q_heads_1bqd = ttnn.to_layout(q_heads_1bqd, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(q_rm)
+        ttnn.deallocate(q_rotated)
+
+        # Convert k_rotated from BKSD back to 1BKD for cache update
+        k_rm = ttnn.to_layout(k_rotated, ttnn.ROW_MAJOR_LAYOUT)
+        k_heads_1bkd = ttnn.permute(k_rm, (2, 0, 1, 3))  # BKSD -> 1BKD
+        k_heads_1bkd = ttnn.to_layout(k_heads_1bkd, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(k_rm)
+        ttnn.deallocate(k_rotated)
+
+        v_interleaved = ttnn.sharded_to_interleaved(v_heads_1bkd, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(v_heads_1bkd)
+        v_rm = ttnn.to_layout(v_interleaved, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(v_interleaved)
+        v_bksd = ttnn.permute(v_rm, (1, 2, 0, 3))
+        ttnn.deallocate(v_rm)
+        if v_bksd.shape[-1] > self.head_dim:
+            v_bksd = v_bksd[:, :, :, : self.head_dim]
+        v_rm2 = ttnn.to_layout(v_bksd, ttnn.ROW_MAJOR_LAYOUT)
+        v_heads_1bkd = ttnn.permute(v_rm2, (2, 0, 1, 3))
+        v_heads_1bkd = ttnn.to_layout(v_heads_1bkd, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(v_rm2)
+        ttnn.deallocate(v_bksd)
 
         # 4. Create position tensor if not provided
         if current_pos_tensor is not None:
@@ -1664,7 +1711,6 @@ class MultiHeadAttention:
         ttnn.deallocate(v_heads_1bkd)
 
         # 6. SDPA decode
-        # Q is HEIGHT_SHARDED, convert to DRAM for SDPA
         q_dram = ttnn.to_memory_config(q_heads_1bqd, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bqd)
 
