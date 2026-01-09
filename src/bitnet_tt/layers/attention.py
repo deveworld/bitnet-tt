@@ -1608,17 +1608,17 @@ class MultiHeadAttention:
         ttnn.deallocate(q_bksd)
         ttnn.deallocate(k_bksd)
 
-        # 3. Update KV cache using fill_cache (same as prefill for consistent format)
+        # 3. Update KV cache using paged_update_cache for trace compatibility
+        # paged_update_cache requires:
+        # - Input: 1BKD format [1, batch, heads, head_dim], HEIGHT_SHARDED in L1
+        # - Cache: BKSD format [batch, heads, seq, head_dim], INTERLEAVED in DRAM
+        # - update_idxs_tensor: position tensor (not integer) for trace compatibility
+
         pad_heads = 32 - self.num_kv_heads
         k_padded = ttnn.pad(k_heads_1bkd, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         v_padded = ttnn.pad(v_interleaved, [(0, 0), (0, 0), (0, pad_heads), (0, 0)], 0.0)
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_interleaved)
-
-        k_bksd = ttnn.permute(k_padded, (1, 2, 0, 3))
-        v_bksd = ttnn.permute(v_padded, (1, 2, 0, 3))
-        ttnn.deallocate(k_padded)
-        ttnn.deallocate(v_padded)
 
         if current_pos_tensor is not None:
             cur_pos_tensor = current_pos_tensor
@@ -1630,17 +1630,31 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # Use update_cache_for_token_ for in-place update at specific sequence position
-        # This is trace-compatible and uses integer indexing (not tensor)
-        # Input shape: [batch, heads, 1, head_dim] (BKSD format)
-        past_key_value.key_cache = ttnn.kv_cache.update_cache_for_token_(
-            past_key_value.key_cache, k_bksd, update_index=current_pos, batch_offset=0
+        # Create HEIGHT_SHARDED memory config for paged_update_cache input
+        kv_shard_spec = ttnn.ShardSpec(
+            ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))]),
+            (32, self.head_dim),
+            ttnn.ShardOrientation.ROW_MAJOR,
         )
-        past_key_value.value_cache = ttnn.kv_cache.update_cache_for_token_(
-            past_key_value.value_cache, v_bksd, update_index=current_pos, batch_offset=0
+        kv_shard_config = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            kv_shard_spec,
         )
-        ttnn.deallocate(k_bksd)
-        ttnn.deallocate(v_bksd)
+
+        k_sharded = ttnn.to_memory_config(k_padded, kv_shard_config)
+        v_sharded = ttnn.to_memory_config(v_padded, kv_shard_config)
+        ttnn.deallocate(k_padded)
+        ttnn.deallocate(v_padded)
+
+        ttnn.experimental.paged_update_cache(
+            past_key_value.key_cache, k_sharded, update_idxs_tensor=cur_pos_tensor
+        )
+        ttnn.experimental.paged_update_cache(
+            past_key_value.value_cache, v_sharded, update_idxs_tensor=cur_pos_tensor
+        )
+        ttnn.deallocate(k_sharded)
+        ttnn.deallocate(v_sharded)
 
         past_key_value.seq_len_cached = current_pos + 1
 
