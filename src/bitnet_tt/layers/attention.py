@@ -1610,12 +1610,20 @@ class MultiHeadAttention:
         xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
         # 2. Create QKV heads with HEIGHT_SHARDED output
-        # The two-arg reshape ensures the tensor works with HEIGHT_SHARDED
+        # For Blackhole, we need explicit sharded memory config (not L1_HEIGHT_SHARDED_MEMORY_CONFIG)
+        # Based on tt_transformers model_config.py line 921-929
+        qkv_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
         q_heads_1bqd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
+            memory_config=qkv_shard_config,
         )
         ttnn.deallocate(xqkv_fused)
 
@@ -1678,9 +1686,14 @@ class MultiHeadAttention:
             ttnn.deallocate(cur_pos_tensor)
 
         # 7. Convert to HEIGHT_SHARDED for nlp_concat_heads_decode
-        attn_output_sharded = ttnn.to_memory_config(
-            attn_output_1bqd, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+        sdpa_output_shard_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
         )
+        attn_output_sharded = ttnn.to_memory_config(attn_output_1bqd, sdpa_output_shard_config)
         ttnn.deallocate(attn_output_1bqd)
 
         # 8. Concat heads using fused op
