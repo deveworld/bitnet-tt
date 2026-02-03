@@ -297,8 +297,7 @@ class TextGenerator:
 
         if use_optimized is None:
             use_optimized = (
-                self.enable_trace
-                and kv_cache is not None
+                kv_cache is not None
                 and len(kv_cache) > 0
                 and kv_cache[0] is not None
                 and hasattr(kv_cache[0], "_preallocated")
