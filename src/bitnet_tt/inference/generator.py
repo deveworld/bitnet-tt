@@ -131,7 +131,7 @@ class TextGenerator:
         self,
         model: "BitNetModel",
         tokenizer: Any = None,
-        enable_trace: bool = True,
+        enable_trace: bool = False,
         batch_size: int = 1,
     ) -> None:
         self.model = model
@@ -141,13 +141,10 @@ class TextGenerator:
         self.batch_size = batch_size
         self.enable_trace = enable_trace
 
-        # Trace state
         self._trace_id: Optional[int] = None
         self._trace_inputs: Optional[list] = None
         self._trace_output: Optional[ttnn.Tensor] = None
 
-        # Initialize RotarySetup for optimized RoPE (tt_transformers pattern)
-        # This pre-computes and uploads cos/sin matrices ONCE
         self.rotary_setup = RotarySetup(
             device=self.device,
             head_dim=self.config.head_dim,
@@ -156,10 +153,12 @@ class TextGenerator:
             batch_size=batch_size,
         )
 
-        # Pre-allocate KV caches for all layers
         self._preallocated_kv_caches: Optional[list[KVCache]] = None
 
-        # Load default tokenizer if not provided
+        self._embedding_weight_host: Optional[torch.Tensor] = None
+        if enable_trace:
+            self._embedding_weight_host = ttnn.to_torch(model.embed_tokens.weight)
+
         if self.tokenizer is None:
             self._load_default_tokenizer()
 
@@ -169,21 +168,27 @@ class TextGenerator:
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T")
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
         except ImportError:
             print("Warning: transformers not installed. Cannot load tokenizer.")
             self.tokenizer = None
 
-    def _preallocate_kv_caches(self, use_paged: bool = False) -> list[KVCache]:
+    def _preallocate_kv_caches(
+        self, use_paged: bool = False, max_seq_len: int | None = None
+    ) -> list[KVCache]:
         """
         Pre-allocate KV caches for all layers.
 
         Args:
             use_paged: If True, use 32-padded heads for paged_update_cache (Trace compatible)
+            max_seq_len: Optional max sequence length override
         """
         caches = []
+        max_seq_len = max_seq_len or self.config.max_position_embeddings
         for layer_idx in range(self.config.num_layers):
             cache = KVCache(
-                max_seq_len=self.config.max_position_embeddings,
+                max_seq_len=max_seq_len,
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
                 head_dim=self.config.head_dim,
@@ -192,7 +197,7 @@ class TextGenerator:
             cache.preallocate(
                 batch_size=self.batch_size,
                 num_kv_heads=self.config.num_key_value_heads,
-                max_seq_len=self.config.max_position_embeddings,
+                max_seq_len=max_seq_len,
                 head_dim=self.config.head_dim,
                 device=self.device,
                 use_paged=use_paged,
@@ -218,6 +223,7 @@ class TextGenerator:
         tokens: NDArray[np.int64],
         kv_cache: Optional[list[KVCache]] = None,
         use_preallocated: bool = False,
+        max_seq_len: int | None = None,
     ) -> tuple[ttnn.Tensor, list[KVCache]]:
         """
         Process prompt tokens (prefill phase).
@@ -226,6 +232,7 @@ class TextGenerator:
             tokens: Input token IDs (batch, seq_len)
             kv_cache: Optional existing KV cache
             use_preallocated: Use pre-allocated KV caches for optimized decode
+            max_seq_len: Optional max sequence length override
 
         Returns:
             (logits, updated_kv_cache)
@@ -233,7 +240,8 @@ class TextGenerator:
         if use_preallocated and kv_cache is None:
             if self._preallocated_kv_caches is None:
                 self._preallocated_kv_caches = self._preallocate_kv_caches(
-                    use_paged=self.enable_trace
+                    use_paged=True,  # Always use paged cache for in-place updates
+                    max_seq_len=max_seq_len,
                 )
             for cache in self._preallocated_kv_caches:
                 cache.seq_len_cached = 0
@@ -299,12 +307,22 @@ class TextGenerator:
                 and kv_cache[0]._use_paged
             )
 
-        # Get rot_mats for optimized decode path
         rot_mats = None
         transformation_mat = None
+        current_pos_tensor = None
+        cos_sin_tensors = None
+
         if use_optimized:
             rot_mats = self.get_rot_mats_decode(current_pos)
             transformation_mat = self.get_transformation_mat()
+            current_pos_tensor = ttnn.from_torch(
+                torch.tensor([current_pos], dtype=torch.int32),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            cos_sin_tensors = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
 
         logits, kv_cache = self.model(
             input_tensor,
@@ -314,7 +332,15 @@ class TextGenerator:
             current_pos=current_pos,
             rot_mats=rot_mats,
             transformation_mat=transformation_mat,
+            current_pos_tensor=current_pos_tensor,
+            cos_sin_tensors=cos_sin_tensors,
         )
+
+        if current_pos_tensor is not None:
+            ttnn.deallocate(current_pos_tensor)
+        if cos_sin_tensors is not None:
+            ttnn.deallocate(cos_sin_tensors[0])
+            ttnn.deallocate(cos_sin_tensors[1])
         ttnn.deallocate(input_tensor)
         return logits, kv_cache
 
@@ -330,15 +356,17 @@ class TextGenerator:
         This compiles the decode graph once and reuses it for all subsequent
         decode steps, eliminating compilation overhead (2-3x speedup).
 
-        Key fix for RoPE in trace mode:
-        - Pre-compute cos/sin OUTSIDE the trace as device tensors
-        - Update them via copy_host_to_device_tensor before each trace execution
-        - Pass cos_sin_tensors to the model instead of relying on embedding lookup
+        Key fixes for trace mode:
+        1. Embedding OUTSIDE trace: ttnn.embedding does write operations incompatible with trace
+        2. Pre-compute cos/sin OUTSIDE trace as device tensors
+        3. Pass inputs_embeds to model instead of input_ids during trace
 
         Returns:
             (trace_id, output_tensor, dict of trace input tensors)
         """
         input_tensor = numpy_int_to_ttnn(token, self.device)
+
+        inputs_embeds = self.model.embed_tokens(input_tensor)
 
         pos_tensor_int32 = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
@@ -354,9 +382,25 @@ class TextGenerator:
         rot_mats = self.get_rot_mats_decode(current_pos)
         transformation_mat = self.get_transformation_mat()
 
+        saved_seq_len = [cache.seq_len_cached for cache in kv_cache]
+        _, _ = self.model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=kv_cache,
+            use_cache=True,
+            mode="decode",
+            current_pos=current_pos,
+            current_pos_tensor=pos_tensor_int32,
+            rot_mats=rot_mats,
+            transformation_mat=transformation_mat,
+            cos_sin_tensors=cos_sin_tensors,
+        )
+        for cache, saved_len in zip(kv_cache, saved_seq_len):
+            cache.seq_len_cached = saved_len
+        ttnn.synchronize_device(self.device)
+
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
         logits, _ = self.model(
-            input_tensor,
+            inputs_embeds=inputs_embeds,
             past_key_values=kv_cache,
             use_cache=True,
             mode="decode",
@@ -371,6 +415,7 @@ class TextGenerator:
 
         trace_inputs = {
             "input": input_tensor,
+            "embeds": inputs_embeds,
             "pos_int32": pos_tensor_int32,
             "cos": cos_device,
             "sin": sin_device,
@@ -385,18 +430,25 @@ class TextGenerator:
         """
         Execute the captured decode trace with new input.
 
-        Updates trace inputs via copy_host_to_device_tensor:
-        1. Input token
+        Updates trace inputs:
+        1. Recompute embedding on HOST and copy to device tensor
         2. Position tensor (int32) for KV cache
-        3. Pre-computed cos/sin tensors for RoPE (key fix for trace mode)
+        3. Pre-computed cos/sin tensors for RoPE
         """
         if token.dtype != np.int32:
             token = token.astype(np.int32)
-        torch_token = torch.from_numpy(token)
-        new_input = ttnn.from_torch(
-            torch_token, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=None
+
+        token_idx = token.flatten()[0]
+        embed_vec = (
+            self._embedding_weight_host[token_idx].unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
         )
-        ttnn.copy_host_to_device_tensor(new_input, self._trace_inputs["input"])
+        new_embeds_host = ttnn.from_torch(
+            embed_vec,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        ttnn.copy_host_to_device_tensor(new_embeds_host, self._trace_inputs["embeds"])
 
         new_pos_int32 = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
@@ -493,19 +545,21 @@ class TextGenerator:
         # Reset trace for new generation
         self.reset_trace()
 
-        # Phase 1: Prefill - process all prompt tokens
-        # Use pre-allocated cache when trace enabled (required for paged KV cache)
         use_prealloc = use_optimized or self.enable_trace
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_prealloc)
+        padded_seq_len = ((seq_len + max_new_tokens + 31) // 32) * 32
+        max_seq_len = min(self.config.max_position_embeddings, padded_seq_len)
+        logits, kv_cache = self.prefill_forward(
+            input_ids, use_preallocated=use_prealloc, max_seq_len=max_seq_len
+        )
 
-        # Sample first token
         next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
         ttnn.deallocate(logits)
 
         generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
 
-        # Check EOS
-        if self._is_eos(next_token[0]):
+        eos_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
+        finished = next_token == eos_id if eos_id is not None else np.zeros(batch_size, dtype=bool)
+        if eos_id is not None and finished.all():
             return generated
 
         # Phase 2: Decode - generate remaining tokens
@@ -516,7 +570,33 @@ class TextGenerator:
             # Decode forward with trace capture if enabled
             if self.enable_trace:
                 if self._trace_id is None:
-                    # First decode step: capture trace
+                    # First decode step: run WITHOUT trace to write real KV data
+                    # This prevents warmup from corrupting the cache position
+                    logits, kv_cache = self.decode_forward(
+                        generated[:, -1:],
+                        current_pos,
+                        kv_cache,
+                        use_optimized=True,  # Use optimized path with paged cache
+                    )
+
+                    next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
+                    ttnn.deallocate(logits)
+
+                    if eos_id is not None:
+                        next_token = np.where(finished, eos_id, next_token)
+                        finished = np.logical_or(finished, next_token == eos_id)
+
+                    generated = np.concatenate(
+                        [generated, next_token.reshape(batch_size, 1)], axis=1
+                    )
+                    current_pos += 1
+
+                    if eos_id is not None and finished.all():
+                        break
+
+                    # Now capture trace at the NEXT position (current_pos is already incremented)
+                    # Warmup writes to current_pos, trace capture also writes to current_pos
+                    # Since we're at a fresh position, there's no corruption
                     self._trace_id, self._trace_output, self._trace_inputs = (
                         self._capture_decode_trace(
                             generated[:, -1:],
@@ -535,16 +615,18 @@ class TextGenerator:
                     kv_cache,
                 )
 
-            # Sample next token
             next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
-            # Don't deallocate trace output - it's reused across iterations
             if not self.enable_trace:
                 ttnn.deallocate(logits)
+
+            if eos_id is not None:
+                next_token = np.where(finished, eos_id, next_token)
+                finished = np.logical_or(finished, next_token == eos_id)
 
             generated = np.concatenate([generated, next_token.reshape(batch_size, 1)], axis=1)
             current_pos += 1
 
-            if self._is_eos(next_token[0]):
+            if eos_id is not None and finished.all():
                 break
 
         return generated
@@ -663,10 +745,13 @@ class TextGenerator:
         # Reset trace
         self.reset_trace()
 
-        # Phase 1: Prefill - use pre-allocated cache when trace enabled
         prefill_start = time.perf_counter()
         use_prealloc = use_optimized or self.enable_trace
-        logits, kv_cache = self.prefill_forward(input_ids, use_preallocated=use_prealloc)
+        padded_seq_len = ((seq_len + max_new_tokens + 31) // 32) * 32
+        max_seq_len = min(self.config.max_position_embeddings, padded_seq_len)
+        logits, kv_cache = self.prefill_forward(
+            input_ids, use_preallocated=use_prealloc, max_seq_len=max_seq_len
+        )
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
@@ -692,10 +777,40 @@ class TextGenerator:
         for step in range(max_new_tokens - 1):
             token_start = time.perf_counter()
 
-            # Decode forward with trace capture if enabled
             if self.enable_trace:
                 if self._trace_id is None:
-                    # First decode step: capture trace
+                    # First decode step: run WITHOUT trace to write real KV data
+                    # This prevents warmup from corrupting the cache position
+                    logits, kv_cache = self.decode_forward(
+                        generated[:, -1:],
+                        current_pos,
+                        kv_cache,
+                        use_optimized=True,
+                    )
+
+                    token_end = time.perf_counter()
+                    token_time = token_end - token_start
+                    stats.token_times.append(token_time)
+                    stats.generation_time += token_time
+
+                    next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
+                    ttnn.deallocate(logits)
+                    generated = np.concatenate(
+                        [generated, next_token.reshape(batch_size, 1)], axis=1
+                    )
+                    stats.generated_tokens += 1
+                    current_pos += 1
+
+                    current_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+                    new_text = current_text[prev_text_len:]
+                    prev_text_len = len(current_text)
+                    yield new_text, stats
+
+                    if self._is_eos(next_token[0]):
+                        break
+
+                    # Capture trace at the NEXT position (current_pos already incremented)
+                    token_start = time.perf_counter()
                     self._trace_id, self._trace_output, self._trace_inputs = (
                         self._capture_decode_trace(
                             generated[:, -1:],
@@ -705,7 +820,6 @@ class TextGenerator:
                     )
                     logits = self._trace_output
                 else:
-                    # Subsequent steps: execute captured trace
                     logits = self._execute_decode_trace(generated[:, -1:], current_pos)
             else:
                 logits, kv_cache = self.decode_forward(
@@ -720,7 +834,6 @@ class TextGenerator:
             stats.generation_time += token_time
 
             next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
-            # Don't deallocate trace output - it's reused across iterations
             if not self.enable_trace:
                 ttnn.deallocate(logits)
 
@@ -728,7 +841,6 @@ class TextGenerator:
             stats.generated_tokens += 1
             current_pos += 1
 
-            # Yield new text
             current_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
             new_text = current_text[prev_text_len:]
             prev_text_len = len(current_text)
