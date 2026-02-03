@@ -240,7 +240,7 @@ class TextGenerator:
         if use_preallocated and kv_cache is None:
             if self._preallocated_kv_caches is None:
                 self._preallocated_kv_caches = self._preallocate_kv_caches(
-                    use_paged=True,
+                    use_paged=self.enable_trace,
                     max_seq_len=max_seq_len,
                 )
             for cache in self._preallocated_kv_caches:
