@@ -40,14 +40,8 @@ class BitNetModel:
         self,
         config: BitNetConfig,
         device: ttnn.Device,
+        use_lofi_mlp: bool = False,
     ) -> None:
-        """
-        Initialize BitNet model.
-
-        Args:
-            config: Model configuration
-            device: TT-NN device
-        """
         self.config = config
         self.device = device
 
@@ -72,6 +66,7 @@ class BitNetModel:
                     rope_theta=config.rope_theta,
                     rms_norm_eps=config.rms_norm_eps,
                     layer_idx=layer_idx,
+                    use_lofi_mlp=use_lofi_mlp,
                 )
             )
 
@@ -141,7 +136,7 @@ class BitNetModel:
 
     def __call__(
         self,
-        input_ids: ttnn.Tensor,
+        input_ids: ttnn.Tensor | None = None,
         attention_mask: ttnn.Tensor | None = None,
         position_ids: NDArray[np.integer] | int | None = None,
         past_key_values: list[KVCache] | None = None,
@@ -154,12 +149,13 @@ class BitNetModel:
         pos_tensor: ttnn.Tensor | None = None,  # For backward compatibility / alias
         cos_sin_tensors: tuple[ttnn.Tensor, ttnn.Tensor]
         | None = None,  # Pre-computed cos/sin for trace
+        inputs_embeds: ttnn.Tensor | None = None,  # Pre-computed embeddings (for trace)
     ) -> tuple[ttnn.Tensor, Optional[list[KVCache]]]:
         """
         Forward pass with mode-aware optimization.
 
         Args:
-            input_ids: Token indices tensor of shape (batch, seq_len)
+            input_ids: Token indices tensor of shape (batch, seq_len). Can be None if inputs_embeds provided.
             attention_mask: Optional attention mask
             position_ids: Position indices for RoPE (int for decode mode)
             past_key_values: List of KV-Cache for each layer
@@ -170,6 +166,7 @@ class BitNetModel:
             transformation_mat: Transformation matrix for rotary_embedding_llama (for optimized decode)
             current_pos_tensor: Optional tensor containing current position (for trace)
             pos_tensor: Alias for current_pos_tensor
+            inputs_embeds: Pre-computed embeddings (for trace mode - bypasses embedding layer)
         Returns:
             Tuple of (logits tensor, updated KV-Cache list if use_cache else None)
         """
@@ -177,8 +174,13 @@ class BitNetModel:
         # current_pos_tensor (int32) is for KV cache paged_update_cache
         # They are NOT aliases - both may be used separately
 
-        # Get embeddings
-        hidden_states = self.embed_tokens(input_ids)
+        # Get embeddings - use pre-computed if provided (for trace mode)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif input_ids is not None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
 
         # Initialize cache list if using cache
         if use_cache and past_key_values is None:
@@ -275,15 +277,6 @@ class BitNetModel:
 def create_model(
     config: BitNetConfig,
     device: ttnn.Device,
+    use_lofi_mlp: bool = False,
 ) -> BitNetModel:
-    """
-    Create a BitNet model.
-
-    Args:
-        config: Model configuration
-        device: TT-NN device
-
-    Returns:
-        BitNetModel instance
-    """
-    return BitNetModel(config, device)
+    return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp)

@@ -201,7 +201,9 @@ class Linear:
     This quantizes weights to {-scale, 0, +scale} where scale = mean(|weight|).
     Quantization is pre-computed during load_weights() for efficiency.
 
-    Optimization: Uses HiFi2 compute kernel for ~2x matmul speedup.
+    Optimization: Uses configurable compute kernel fidelity:
+    - HiFi2 (default): ~2x speedup, good accuracy (BFP8)
+    - LoFi: ~3.6x speedup, lower accuracy (BFP4) - suitable for MLP layers
     """
 
     def __init__(
@@ -209,6 +211,7 @@ class Linear:
         in_features: int,
         out_features: int,
         device: ttnn.Device,
+        compute_fidelity: str = "hifi2",
     ) -> None:
         """
         Initialize Linear layer.
@@ -217,17 +220,20 @@ class Linear:
             in_features: Size of input features
             out_features: Size of output features
             device: TT-NN device
+            compute_fidelity: One of "hifi4", "hifi2" (default), "lofi"
         """
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
         self.weight: ttnn.Tensor | None = None
+        self._fidelity = compute_fidelity
 
         # Initialize compute kernel config for faster matmul
         self._compute_kernel_config = None
         try:
             from bitnet_tt.config import get_compute_kernel_config
-            self._compute_kernel_config = get_compute_kernel_config("hifi2")
+
+            self._compute_kernel_config = get_compute_kernel_config(compute_fidelity)
         except Exception:
             pass
 

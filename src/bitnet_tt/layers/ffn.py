@@ -26,6 +26,7 @@ class FeedForward:
     Key optimizations:
     - Pre-transposed weights (no transpose per forward)
     - Mode-aware memory configs (L1 for decode, DRAM for prefill)
+    - LoFi compute kernel for ~3.6x matmul speedup (configurable)
 
     Architecture (matching HuggingFace Transformers):
         gate = SquaredReLU(gate_proj(x))  # Plain linear
@@ -42,6 +43,7 @@ class FeedForward:
         device: ttnn.Device,
         eps: float = 1e-5,
         model_config: Optional[dict] = None,
+        use_lofi: bool = False,
     ) -> None:
         """
         Initialize FFN.
@@ -52,17 +54,22 @@ class FeedForward:
             device: TT-NN device
             eps: Epsilon for numerical stability
             model_config: Optional model config with memory configs
+            use_lofi: Use LoFi compute kernel for ~3.6x speedup (default: False)
         """
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.device = device
         self.eps = eps
         self.model_config = model_config or {}
+        self.use_lofi = use_lofi
+
+        # Compute fidelity: LoFi for speed, HiFi2 for accuracy
+        fidelity = "lofi" if use_lofi else "hifi2"
 
         # Projections (weights pre-transposed in Linear.load_weights)
-        self.gate_proj = Linear(hidden_size, intermediate_size, device)
-        self.up_proj = Linear(hidden_size, intermediate_size, device)
-        self.down_proj = Linear(intermediate_size, hidden_size, device)
+        self.gate_proj = Linear(hidden_size, intermediate_size, device, compute_fidelity=fidelity)
+        self.up_proj = Linear(hidden_size, intermediate_size, device, compute_fidelity=fidelity)
+        self.down_proj = Linear(intermediate_size, hidden_size, device, compute_fidelity=fidelity)
 
         # Sub-norm applied after gate*up, before down_proj
         self.ffn_sub_norm = RMSNorm(intermediate_size, device, eps)

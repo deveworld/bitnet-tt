@@ -43,6 +43,7 @@ class TransformerBlock:
         rope_theta: float = 10000.0,
         rms_norm_eps: float = 1e-6,
         layer_idx: int = 0,
+        use_lofi_mlp: bool = False,
     ) -> None:
         """
         Initialize transformer block.
@@ -57,6 +58,7 @@ class TransformerBlock:
             rope_theta: RoPE base frequency
             rms_norm_eps: RMSNorm epsilon
             layer_idx: Layer index for cache management
+            use_lofi_mlp: Use LoFi kernel for MLP (~3.6x speedup)
         """
         self.hidden_size = hidden_size
         self.device = device
@@ -86,6 +88,7 @@ class TransformerBlock:
             intermediate_size=intermediate_size,
             device=device,
             eps=rms_norm_eps,
+            use_lofi=use_lofi_mlp,
         )
 
     def load_weights(
