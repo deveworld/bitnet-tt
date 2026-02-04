@@ -1079,21 +1079,11 @@ class MultiHeadAttention:
         This avoids expanding all cached positions every decode step.
         """
         # Reshape to BKSD: [batch, heads, seq, head_dim]
-        # Optimization: reshape in ROW_MAJOR, then transpose in TILE_LAYOUT
-        query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.ROW_MAJOR_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.ROW_MAJOR_LAYOUT)
-
+        # reshape and transpose work directly in TILE_LAYOUT
         query = ttnn.reshape(query, (batch_size, seq_len, self.num_heads, self.head_dim))
         key = ttnn.reshape(key, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
         value = ttnn.reshape(value, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
 
-        # Convert to TILE before transpose (transpose may be faster in TILE_LAYOUT)
-        query = ttnn.to_layout(query, ttnn.TILE_LAYOUT)
-        key = ttnn.to_layout(key, ttnn.TILE_LAYOUT)
-        value = ttnn.to_layout(value, ttnn.TILE_LAYOUT)
-
-        # Use transpose(1, 2) instead of permute - may be more efficient
         query = ttnn.transpose(query, 1, 2)
         key = ttnn.transpose(key, 1, 2)
         value = ttnn.transpose(value, 1, 2)
@@ -1151,9 +1141,8 @@ class MultiHeadAttention:
         )
 
         if use_decode_sdpa:
-            q_rm = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
-            q_1bkd = ttnn.permute(q_rm, (2, 0, 1, 3))
-            q_1bkd = ttnn.to_layout(q_1bkd, ttnn.TILE_LAYOUT)
+            # permute works directly in TILE_LAYOUT - no layout conversion needed
+            q_1bkd = ttnn.permute(query, (2, 0, 1, 3))
 
             attn_output = ttnn.transformer.scaled_dot_product_attention_decode(
                 q_1bkd,
@@ -1163,9 +1152,8 @@ class MultiHeadAttention:
                 scale=self.scale,
             )
 
-            attn_rm = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
-            attn_bksd = ttnn.permute(attn_rm, (1, 2, 0, 3))
-            attn_output = ttnn.to_layout(attn_bksd, ttnn.TILE_LAYOUT)
+            # permute works directly in TILE_LAYOUT - no layout conversion needed
+            attn_output = ttnn.permute(attn_output, (1, 2, 0, 3))
         else:
             is_causal = mode == "prefill"
             attn_output = ttnn.transformer.scaled_dot_product_attention(
@@ -1178,9 +1166,7 @@ class MultiHeadAttention:
             )
 
         attn_output = ttnn.transpose(attn_output, 1, 2)
-        attn_output = ttnn.to_layout(attn_output, ttnn.ROW_MAJOR_LAYOUT)
         attn_output = ttnn.reshape(attn_output, (batch_size, seq_len, self.hidden_size))
-        attn_output = ttnn.to_layout(attn_output, ttnn.TILE_LAYOUT)
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
