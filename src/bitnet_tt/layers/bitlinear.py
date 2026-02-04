@@ -17,6 +17,7 @@ def numpy_to_ttnn(
     array: NDArray[np.floating],
     device: ttnn.Device,
     layout: ttnn.Layout = ttnn.TILE_LAYOUT,
+    memory_config: ttnn.MemoryConfig | None = None,
 ) -> ttnn.Tensor:
     """
     Convert numpy array to ttnn tensor.
@@ -25,17 +26,22 @@ def numpy_to_ttnn(
         array: NumPy array (should be float32)
         device: TT-NN device
         layout: Tensor layout (default: TILE_LAYOUT)
+        memory_config: Memory configuration (default: DRAM interleaved)
 
     Returns:
         ttnn.Tensor on device
     """
-    # Ensure float32 for compatibility
     if array.dtype != np.float32:
         array = array.astype(np.float32)
 
-    # Convert via torch (ttnn.Tensor doesn't support bfloat16 from numpy)
     torch_tensor = torch.from_numpy(array)
-    tensor = ttnn.from_torch(torch_tensor, dtype=ttnn.bfloat16, layout=layout, device=device)
+    tensor = ttnn.from_torch(
+        torch_tensor,
+        dtype=ttnn.bfloat16,
+        layout=layout,
+        device=device,
+        memory_config=memory_config or ttnn.DRAM_MEMORY_CONFIG,
+    )
     return tensor
 
 
