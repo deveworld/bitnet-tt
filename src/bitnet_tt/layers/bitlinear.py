@@ -98,6 +98,7 @@ class BitLinear:
         out_features: int,
         device: ttnn.Device,
         eps: float = 1e-5,
+        skip_activation_quant: bool = False,
     ) -> None:
         """
         Initialize BitLinear layer.
@@ -107,11 +108,13 @@ class BitLinear:
             out_features: Size of output features
             device: TT-NN device
             eps: Epsilon for numerical stability
+            skip_activation_quant: Skip activation quantization for speed
         """
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
         self.eps = eps
+        self.skip_activation_quant = skip_activation_quant
 
         # Weights (will be loaded later)
         self.weight: ttnn.Tensor | None = None
@@ -165,6 +168,11 @@ class BitLinear:
 
         # 1. RMSNorm
         x_norm = ttnn.rms_norm(x, epsilon=self.eps, weight=self.norm_weight)
+
+        if self.skip_activation_quant:
+            # Fast path: skip activation quantization
+            weight_scaled = ttnn.multiply(self.weight, self.weight_scale)
+            return ttnn.matmul(x_norm, weight_scaled)
 
         # 2. Activation quantization (simulated in bfloat16)
         # Compute max absolute value per token
