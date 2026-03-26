@@ -786,22 +786,20 @@ class Batch32Generator:
                 v_prefill = model_cache.value_cache
                 created_compact = False
                 if k_prefill.shape[1] == num_q_heads:
-                    # Prefill stores GQA-expanded KV heads. Collapse them back to
-                    # real KV heads on host, then upload only the compact tensor.
-                    k_torch = ttnn.to_torch(k_prefill)[:, ::num_kv_groups, :, :].contiguous()
-                    v_torch = ttnn.to_torch(v_prefill)[:, ::num_kv_groups, :, :].contiguous()
-                    k_compact = ttnn.from_torch(
-                        k_torch,
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.device,
+                    # Prefill stores GQA-expanded KV heads. The repeated heads are
+                    # contiguous, so keep only the first head from each group on-device.
+                    k_compact = ttnn.slice(
+                        k_prefill,
+                        (0, 0, 0, 0),
+                        k_prefill.shape,
+                        (1, num_kv_groups, 1, 1),
                         memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
-                    v_compact = ttnn.from_torch(
-                        v_torch,
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.device,
+                    v_compact = ttnn.slice(
+                        v_prefill,
+                        (0, 0, 0, 0),
+                        v_prefill.shape,
+                        (1, num_kv_groups, 1, 1),
                         memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     )
                     created_compact = True
