@@ -853,22 +853,18 @@ class Batch32Generator:
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
         # Avoid allocating new device buffers while a trace is active.
-        logits_torch = ttnn.to_torch(logits).float()
-        last_logits = logits_torch[0, -1, :]
-        logits_np = last_logits.numpy()
+        last_logits = ttnn.to_torch(logits)[0, -1, :].float()
 
         if temperature != 1.0:
-            logits_np = logits_np / temperature
+            last_logits = last_logits / temperature
 
         if top_k is not None and top_k > 0:
-            top_k_indices = np.argpartition(logits_np, -top_k)[-top_k:]
-            top_k_logits = logits_np[top_k_indices]
-            probs = np.exp(top_k_logits - np.max(top_k_logits))
-            probs = probs / probs.sum()
-            sampled_idx = np.random.choice(len(top_k_indices), p=probs)
-            return int(top_k_indices[sampled_idx])
-        else:
-            return int(np.argmax(logits_np))
+            top_k_values, top_k_indices = torch.topk(last_logits, k=top_k)
+            probs = torch.softmax(top_k_values, dim=-1)
+            sampled_idx = torch.multinomial(probs, 1)
+            return int(top_k_indices[sampled_idx].item())
+
+        return int(torch.argmax(last_logits).item())
 
     def generate(
         self,
