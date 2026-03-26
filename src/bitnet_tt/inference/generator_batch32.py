@@ -896,6 +896,7 @@ class Batch32Generator:
         # Sample first token
         next_token = self._sample_token(logits, temperature, top_k)
         generated_ids = list(input_ids[0]) + [next_token]
+        ttnn.deallocate(logits)
 
         if next_token == self.tokenizer.eos_token_id:
             return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -903,6 +904,14 @@ class Batch32Generator:
         # Decode loop
         current_pos = seq_len
         trace_captured = False
+
+        if self.enable_trace and len(generated_ids) - input_ids.shape[1] < max_new_tokens:
+            self._capture_trace(next_token, current_pos)
+            trace_captured = True
+
+            next_token = self._sample_token(self._trace_output, temperature, top_k)
+            generated_ids.append(next_token)
+            current_pos += 1
 
         try:
             while len(generated_ids) - input_ids.shape[1] < max_new_tokens:
@@ -917,19 +926,6 @@ class Batch32Generator:
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
                 current_pos += 1
-
-                if (
-                    self.enable_trace
-                    and not trace_captured
-                    and next_token != self.tokenizer.eos_token_id
-                    and len(generated_ids) - input_ids.shape[1] < max_new_tokens
-                ):
-                    self._capture_trace(next_token, current_pos)
-                    trace_captured = True
-
-                    next_token = self._sample_token(self._trace_output, temperature, top_k)
-                    generated_ids.append(next_token)
-                    current_pos += 1
 
                 if logits_owned:
                     ttnn.deallocate(logits)
@@ -980,6 +976,7 @@ class Batch32Generator:
         next_token = self._sample_token(logits, temperature, top_k)
         generated_ids = list(input_ids[0]) + [next_token]
         stats.generated_tokens = 1
+        ttnn.deallocate(logits)
 
         # Yield first token
         current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -993,6 +990,28 @@ class Batch32Generator:
         current_pos = seq_len
         prev_text_len = len(current_text)
         trace_captured = False
+
+        if self.enable_trace and stats.generated_tokens < max_new_tokens:
+            capture_start = time.perf_counter()
+            self._capture_trace(next_token, current_pos)
+            trace_captured = True
+            stats.trace_captured = True
+            capture_time = time.perf_counter() - capture_start
+            stats.token_times.append(capture_time)
+            stats.generation_time += capture_time
+
+            next_token = self._sample_token(self._trace_output, temperature, top_k)
+            generated_ids.append(next_token)
+            stats.generated_tokens += 1
+            current_pos += 1
+
+            current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            new_text = current_text[prev_text_len:]
+            prev_text_len = len(current_text)
+            yield new_text, stats
+
+            if next_token == self.tokenizer.eos_token_id:
+                return
 
         try:
             while stats.generated_tokens < max_new_tokens:
@@ -1014,25 +1033,6 @@ class Batch32Generator:
                 generated_ids.append(next_token)
                 stats.generated_tokens += 1
                 current_pos += 1
-
-                if (
-                    self.enable_trace
-                    and not trace_captured
-                    and next_token != self.tokenizer.eos_token_id
-                    and stats.generated_tokens < max_new_tokens
-                ):
-                    capture_start = time.perf_counter()
-                    self._capture_trace(next_token, current_pos)
-                    trace_captured = True
-                    stats.trace_captured = True
-                    capture_time = time.perf_counter() - capture_start
-                    stats.token_times.append(capture_time)
-                    stats.generation_time += capture_time
-
-                    next_token = self._sample_token(self._trace_output, temperature, top_k)
-                    generated_ids.append(next_token)
-                    stats.generated_tokens += 1
-                    current_pos += 1
 
                 current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 new_text = current_text[prev_text_len:]
