@@ -1293,26 +1293,15 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
-        # 7. Convert to sharded for nlp_concat_heads_decode
-        # TT pattern: L1_HEIGHT_SHARDED_MEMORY_CONFIG
-        attn_output_sharded = ttnn.to_memory_config(
-            attn_output_1bkd, ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
-        )
+        # 7. Convert SDPA output back to the standard decode layout. The fully
+        # sharded concat path is not stable for BitNet's 20-head configuration,
+        # so fall back to the same reshape pattern used by the working BKSD path.
+        attn_output = ttnn.permute(attn_output_1bkd, (1, 2, 0, 3))
         ttnn.deallocate(attn_output_1bkd)
+        attn_output = ttnn.transpose(attn_output, 1, 2)
+        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
 
-        # 8. Concat heads
-        attn_output_concat = ttnn.experimental.nlp_concat_heads_decode(
-            attn_output_sharded,
-            num_heads=self.num_heads,
-        )
-        ttnn.deallocate(attn_output_sharded)
-
-        # 9. Convert from sharded to interleaved for RMS norm
-        attn_output = ttnn.sharded_to_interleaved(attn_output_concat, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(attn_output_concat)
-
-        # 10. Apply sub-norm and output projection
-        # TT pattern: nlp_concat_heads_decode output goes directly to matmul(wo)
+        # 8. Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
         output = self.o_proj(attn_output)
 
