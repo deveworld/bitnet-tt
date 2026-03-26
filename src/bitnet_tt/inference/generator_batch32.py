@@ -384,6 +384,7 @@ class Batch32Generator:
         self._trace_id: Optional[int] = None
         self._trace_inputs: Optional[dict] = None
         self._trace_output: Optional[ttnn.Tensor] = None
+        self._trace_capture_pos: Optional[int] = None
         self._decode_inputs: Optional[dict] = None
         self._embed_host_cache: dict[int, ttnn.Tensor] = {}
         self._pos_host_cache: dict[int, ttnn.Tensor] = {}
@@ -556,6 +557,7 @@ class Batch32Generator:
             return
 
         if any(cache.max_seq_len < max_seq_len for cache in self._kv_caches):
+            self._release_trace()
             for cache in self._kv_caches:
                 ttnn.deallocate(cache.key_cache)
                 ttnn.deallocate(cache.value_cache)
@@ -658,10 +660,12 @@ class Batch32Generator:
             self._decode_inputs = self._allocate_decode_inputs()
         return self._decode_inputs
 
-    def _capture_trace(self, token_id: int, current_pos: int) -> None:
-        """Capture Metal Trace for decode loop."""
+    def _capture_trace(self, token_id: int, current_pos: int) -> bool:
+        """Capture Metal Trace for decode loop. Returns True if a new trace was captured."""
+        if self._trace_id is not None and self._trace_capture_pos == current_pos:
+            return False
         if self._trace_id is not None:
-            return
+            self._release_trace()
 
         self._trace_inputs = self._allocate_decode_inputs()
         self._copy_decode_inputs(self._trace_inputs, token_id, current_pos)
@@ -693,6 +697,8 @@ class Batch32Generator:
 
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
+        self._trace_capture_pos = current_pos
+        return True
 
     def _execute_trace(
         self,
@@ -738,6 +744,7 @@ class Batch32Generator:
             self._trace_inputs = None
 
         self._trace_output = None
+        self._trace_capture_pos = None
 
     def _release_decode_inputs(self) -> None:
         """Release reusable non-trace decode input tensors."""
@@ -919,10 +926,14 @@ class Batch32Generator:
         trace_captured = False
 
         if self.enable_trace and len(generated_ids) - input_ids.shape[1] < max_new_tokens:
-            self._capture_trace(next_token, current_pos)
+            captured_new_trace = self._capture_trace(next_token, current_pos)
             trace_captured = True
-
-            next_token = self._sample_token(self._trace_output, temperature, top_k)
+            trace_logits = (
+                self._trace_output
+                if captured_new_trace
+                else self._execute_trace(next_token, current_pos)
+            )
+            next_token = self._sample_token(trace_logits, temperature, top_k)
             generated_ids.append(next_token)
             current_pos += 1
 
@@ -947,8 +958,6 @@ class Batch32Generator:
                     break
 
         finally:
-            if self.enable_trace:
-                self._release_trace()
             self._release_decode_inputs()
             self._clear_host_decode_cache()
 
@@ -1006,14 +1015,18 @@ class Batch32Generator:
 
         if self.enable_trace and stats.generated_tokens < max_new_tokens:
             capture_start = time.perf_counter()
-            self._capture_trace(next_token, current_pos)
+            captured_new_trace = self._capture_trace(next_token, current_pos)
             trace_captured = True
             stats.trace_captured = True
-            capture_time = time.perf_counter() - capture_start
-            stats.token_times.append(capture_time)
-            stats.generation_time += capture_time
+            if captured_new_trace:
+                trace_logits = self._trace_output
+            else:
+                trace_logits = self._execute_trace(next_token, current_pos)
+            trace_time = time.perf_counter() - capture_start
+            stats.token_times.append(trace_time)
+            stats.generation_time += trace_time
 
-            next_token = self._sample_token(self._trace_output, temperature, top_k)
+            next_token = self._sample_token(trace_logits, temperature, top_k)
             generated_ids.append(next_token)
             stats.generated_tokens += 1
             current_pos += 1
@@ -1059,8 +1072,6 @@ class Batch32Generator:
                     break
 
         finally:
-            if self.enable_trace:
-                self._release_trace()
             self._release_decode_inputs()
             self._clear_host_decode_cache()
 
