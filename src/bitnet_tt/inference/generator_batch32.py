@@ -368,6 +368,7 @@ class Batch32Generator:
         self._trace_id: Optional[int] = None
         self._trace_inputs: Optional[dict] = None
         self._trace_output: Optional[ttnn.Tensor] = None
+        self._decode_inputs: Optional[dict] = None
 
         # Batch-32 RoPE setup
         self.rotary_setup = Batch32RotarySetup(
@@ -523,10 +524,10 @@ class Batch32Generator:
         for cache in self._kv_caches:
             cache.seq_len_cached = seq_len
 
-    def _setup_trace_inputs(self) -> dict:
-        """Pre-allocate trace input tensors on device."""
+    def _allocate_decode_inputs(self) -> dict:
+        """Pre-allocate persistent decode input tensors on device."""
         embed_shape = (1, PADDED_BATCH, self.config.hidden_size)
-        pos_shape = (32,)
+        pos_shape = (PADDED_BATCH,)
 
         embeds = ttnn.from_torch(
             torch.zeros(embed_shape, dtype=torch.bfloat16),
@@ -553,8 +554,8 @@ class Batch32Generator:
             "sin": sin,
         }
 
-    def _copy_trace_inputs(self, embed_vec: torch.Tensor, current_pos: int) -> None:
-        """Update persistent trace inputs with the next decode step values."""
+    def _copy_decode_inputs(self, inputs: dict, embed_vec: torch.Tensor, current_pos: int) -> None:
+        """Update persistent decode inputs with the next token and position."""
         embed_padded = torch.zeros((1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16)
         embed_padded[0, 0, :] = embed_vec.squeeze()
 
@@ -564,7 +565,8 @@ class Batch32Generator:
             layout=ttnn.TILE_LAYOUT,
             device=None,
         )
-        ttnn.copy_host_to_device_tensor(embed_host, self._trace_inputs["embeds"])
+        ttnn.copy_host_to_device_tensor(embed_host, inputs["embeds"])
+        ttnn.deallocate(embed_host)
 
         pos_host = ttnn.from_torch(
             torch.full((PADDED_BATCH,), current_pos, dtype=torch.int32),
@@ -572,19 +574,28 @@ class Batch32Generator:
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=None,
         )
-        ttnn.copy_host_to_device_tensor(pos_host, self._trace_inputs["pos_tensor"])
+        ttnn.copy_host_to_device_tensor(pos_host, inputs["pos_tensor"])
+        ttnn.deallocate(pos_host)
 
         cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
-        ttnn.copy_host_to_device_tensor(cos_host, self._trace_inputs["cos"])
-        ttnn.copy_host_to_device_tensor(sin_host, self._trace_inputs["sin"])
+        ttnn.copy_host_to_device_tensor(cos_host, inputs["cos"])
+        ttnn.copy_host_to_device_tensor(sin_host, inputs["sin"])
+        ttnn.deallocate(cos_host)
+        ttnn.deallocate(sin_host)
+
+    def _ensure_decode_inputs(self) -> dict:
+        """Lazily allocate reusable non-trace decode inputs."""
+        if self._decode_inputs is None:
+            self._decode_inputs = self._allocate_decode_inputs()
+        return self._decode_inputs
 
     def _capture_trace(self, embed_vec: torch.Tensor, current_pos: int) -> None:
         """Capture Metal Trace for decode loop."""
         if self._trace_id is not None:
             return
 
-        self._trace_inputs = self._setup_trace_inputs()
-        self._copy_trace_inputs(embed_vec, current_pos)
+        self._trace_inputs = self._allocate_decode_inputs()
+        self._copy_decode_inputs(self._trace_inputs, embed_vec, current_pos)
         saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
 
         warmup_logits = self._decode_step_batch32(
@@ -620,13 +631,31 @@ class Batch32Generator:
         current_pos: int,
     ) -> ttnn.Tensor:
         """Execute captured trace with new inputs."""
-        self._copy_trace_inputs(embed_vec, current_pos)
+        self._copy_decode_inputs(self._trace_inputs, embed_vec, current_pos)
 
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(self.device)
         self._set_kv_cache_length(current_pos + 1)
 
         return self._trace_output
+
+    def _execute_decode_untraced(
+        self,
+        embed_vec: torch.Tensor,
+        current_pos: int,
+    ) -> ttnn.Tensor:
+        """Run one decode step using reusable device inputs without trace capture."""
+        decode_inputs = self._ensure_decode_inputs()
+        self._copy_decode_inputs(decode_inputs, embed_vec, current_pos)
+        logits = self._decode_step_batch32(
+            decode_inputs["embeds"],
+            current_pos,
+            decode_inputs["pos_tensor"],
+            decode_inputs["cos"],
+            decode_inputs["sin"],
+        )
+        self._set_kv_cache_length(current_pos + 1)
+        return logits
 
     def _release_trace(self) -> None:
         """Release trace resources."""
@@ -640,6 +669,13 @@ class Batch32Generator:
             self._trace_inputs = None
 
         self._trace_output = None
+
+    def _release_decode_inputs(self) -> None:
+        """Release reusable non-trace decode input tensors."""
+        if self._decode_inputs is not None:
+            for tensor in self._decode_inputs.values():
+                ttnn.deallocate(tensor)
+            self._decode_inputs = None
 
     def _prefill_batch32(
         self,
@@ -833,34 +869,7 @@ class Batch32Generator:
                     logits = self._execute_trace(embed_vec, current_pos)
                     logits_owned = False
                 else:
-                    # Shape: [1, 32, hidden] - NOT [32, 1, hidden] to avoid layout conversion hang
-                    embed_padded = torch.zeros(
-                        (1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16
-                    )
-                    embed_padded[0, 0, :] = embed_vec.squeeze()
-
-                    embeds = ttnn.from_torch(
-                        embed_padded,
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.device,
-                    )
-
-                    pos_tensor = ttnn.from_torch(
-                        torch.tensor([current_pos] * 32, dtype=torch.int32),
-                        dtype=ttnn.int32,
-                        layout=ttnn.ROW_MAJOR_LAYOUT,
-                        device=self.device,
-                    )
-                    cos, sin = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
-
-                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor, cos, sin)
-                    self._set_kv_cache_length(current_pos + 1)
-
-                    ttnn.deallocate(embeds)
-                    ttnn.deallocate(pos_tensor)
-                    ttnn.deallocate(cos)
-                    ttnn.deallocate(sin)
+                    logits = self._execute_decode_untraced(embed_vec, current_pos)
 
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
@@ -891,6 +900,7 @@ class Batch32Generator:
         finally:
             if self.enable_trace:
                 self._release_trace()
+            self._release_decode_inputs()
 
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -954,33 +964,7 @@ class Batch32Generator:
                     logits = self._execute_trace(embed_vec, current_pos)
                     logits_owned = False
                 else:
-                    embed_padded = torch.zeros(
-                        (1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16
-                    )
-                    embed_padded[0, 0, :] = embed_vec.squeeze()
-
-                    embeds = ttnn.from_torch(
-                        embed_padded,
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.device,
-                    )
-
-                    pos_tensor = ttnn.from_torch(
-                        torch.tensor([current_pos] * 32, dtype=torch.int32),
-                        dtype=ttnn.int32,
-                        layout=ttnn.ROW_MAJOR_LAYOUT,
-                        device=self.device,
-                    )
-                    cos, sin = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
-
-                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor, cos, sin)
-                    self._set_kv_cache_length(current_pos + 1)
-
-                    ttnn.deallocate(embeds)
-                    ttnn.deallocate(pos_tensor)
-                    ttnn.deallocate(cos)
-                    ttnn.deallocate(sin)
+                    logits = self._execute_decode_untraced(embed_vec, current_pos)
 
                 token_time = time.perf_counter() - token_start
                 stats.token_times.append(token_time)
@@ -1027,17 +1011,22 @@ class Batch32Generator:
         finally:
             if self.enable_trace:
                 self._release_trace()
+            self._release_decode_inputs()
 
     def reset(self) -> None:
         """Reset generator state."""
         if self._trace_id is not None:
             try:
-                ttnn.release_trace(self.device, self._trace_id)
+                self._release_trace()
             except Exception:
-                pass
-        self._trace_id = None
-        self._trace_inputs = None
-        self._trace_output = None
+                self._trace_id = None
+                self._trace_inputs = None
+                self._trace_output = None
+
+        try:
+            self._release_decode_inputs()
+        except Exception:
+            self._decode_inputs = None
 
         if self._kv_caches is not None:
             for cache in self._kv_caches:
