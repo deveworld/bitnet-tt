@@ -6,6 +6,50 @@ and cleanup.
 """
 
 from contextlib import contextmanager
+import json
+import os
+
+
+def _parse_bool_env_value(value: str | None, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _prime_ttnn_config_overrides() -> None:
+    """
+    Apply TTNN config overrides before importing ttnn.
+
+    TTNN reads TTNN_CONFIG_OVERRIDES during module import, so setting
+    enable_model_cache afterwards is too late for cross-process reuse.
+    """
+    raw_overrides = os.environ.get("TTNN_CONFIG_OVERRIDES")
+    overrides: dict[str, object]
+    if raw_overrides:
+        try:
+            overrides = json.loads(raw_overrides)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(overrides, dict):
+            return
+    else:
+        overrides = {}
+
+    if "enable_model_cache" not in overrides:
+        overrides["enable_model_cache"] = _parse_bool_env_value(
+            os.getenv("BITNET_TT_ENABLE_MODEL_CACHE"),
+            default=True,
+        )
+
+    os.environ["TTNN_CONFIG_OVERRIDES"] = json.dumps(overrides)
+
+
+_prime_ttnn_config_overrides()
 
 # Try to import ttnn, fall back to mock for development
 try:
