@@ -26,6 +26,7 @@ import torch
 import ttnn
 from numpy.typing import NDArray
 
+from bitnet_tt.config import get_compute_kernel_config
 from bitnet_tt.layers.attention import KVCache
 
 if TYPE_CHECKING:
@@ -370,12 +371,14 @@ class Batch32Generator:
         model: "BitNetModel",
         tokenizer: Any = None,
         enable_trace: bool = True,
+        decode_matmul_fidelity: str = "hifi2",
     ):
         self.model = model
         self.device = model.device
         self.config = model.config
         self.tokenizer = tokenizer
         self.enable_trace = enable_trace
+        self.decode_matmul_fidelity = decode_matmul_fidelity
 
         # Trace state
         self._trace_id: Optional[int] = None
@@ -384,6 +387,11 @@ class Batch32Generator:
         self._decode_inputs: Optional[dict] = None
         self._embed_host_cache: dict[int, ttnn.Tensor] = {}
         self._pos_host_cache: dict[int, ttnn.Tensor] = {}
+        self._decode_matmul_kernel_config = None
+        try:
+            self._decode_matmul_kernel_config = get_compute_kernel_config(decode_matmul_fidelity)
+        except Exception:
+            self._decode_matmul_kernel_config = None
 
         # Batch-32 RoPE setup
         self.rotary_setup = Batch32RotarySetup(
@@ -485,7 +493,14 @@ class Batch32Generator:
 
             # Fused QKV matmul
             attention = layer.self_attn
-            qkv_fused = ttnn.matmul(normed_1bkd, attention.qkv_fused_weight)
+            if self._decode_matmul_kernel_config is not None:
+                qkv_fused = ttnn.matmul(
+                    normed_1bkd,
+                    attention.qkv_fused_weight,
+                    compute_kernel_config=self._decode_matmul_kernel_config,
+                )
+            else:
+                qkv_fused = ttnn.matmul(normed_1bkd, attention.qkv_fused_weight)
             attn_output_proj, _ = attention._forward_decode_1bkd(
                 qkv_fused,
                 kv_cache,
@@ -533,7 +548,14 @@ class Batch32Generator:
             [0, 0, 0],
             [1, 1, self.config.hidden_size],
         )
-        logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
+        if self._decode_matmul_kernel_config is not None:
+            logits = ttnn.matmul(
+                hidden_single,
+                self.model.lm_head_weight,
+                compute_kernel_config=self._decode_matmul_kernel_config,
+            )
+        else:
+            logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
         ttnn.deallocate(hidden_single)
 
         return logits
