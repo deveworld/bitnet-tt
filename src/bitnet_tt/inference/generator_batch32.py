@@ -864,11 +864,13 @@ class Batch32Generator:
 
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
-                decode_pos = current_pos
                 current_pos += 1
 
                 if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
-                    self._capture_trace(embed_vec, decode_pos)
+                    trace_embed_vec = (
+                        self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
+                    )
+                    self._capture_trace(trace_embed_vec, current_pos)
                     trace_captured = True
 
                 if logits_owned:
@@ -978,11 +980,13 @@ class Batch32Generator:
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
                 stats.generated_tokens += 1
-                decode_pos = current_pos
                 current_pos += 1
 
                 if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
-                    self._capture_trace(embed_vec, decode_pos)
+                    trace_embed_vec = (
+                        self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
+                    )
+                    self._capture_trace(trace_embed_vec, current_pos)
                     trace_captured = True
                     stats.trace_captured = True
 
