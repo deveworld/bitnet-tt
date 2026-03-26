@@ -24,6 +24,7 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.layers.bitlinear import Linear, RMSNorm
+from bitnet_tt.utils.rope import precompute_freqs_cis
 
 
 @dataclass
@@ -720,24 +721,6 @@ class KVCache:
         self.seq_len_cached = prefill_seq_len
         # Keep _preallocated=True since we're using the preallocated buffer
 
-
-def precompute_freqs_cis(
-    dim: int,
-    max_seq_len: int,
-    theta: float = 10000.0,
-) -> Tuple[NDArray[np.floating], NDArray[np.floating]]:
-    """Precompute cosine and sine frequencies for RoPE."""
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
-    t = np.arange(max_seq_len, dtype=np.float32)
-    freqs = np.outer(t, freqs)
-    emb = np.concatenate([freqs, freqs], axis=-1)
-
-    cos = np.cos(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
-    sin = np.sin(emb).astype(np.float32).reshape(1, 1, max_seq_len, dim)
-
-    return cos, sin
-
-
 class MultiHeadAttention:
     """
     Optimized TT-NN Multi-Head Attention with GQA, RoPE, and KV-Cache.
@@ -1135,8 +1118,8 @@ class MultiHeadAttention:
         use_decode_sdpa = (
             mode == "decode"
             and past_key_value is not None
-            and hasattr(past_key_value, "_use_paged")
-            and past_key_value._use_paged
+            and hasattr(past_key_value, "_preallocated")
+            and past_key_value._preallocated
             and current_pos_tensor is not None
         )
 
@@ -1268,10 +1251,20 @@ class MultiHeadAttention:
         q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bkd)
 
+        # Limit the visible cache length to a 32-token tile multiple. The
+        # decode kernel derives its K chunk size from the cache sequence length,
+        # so exposing the full over-allocated cache (for example 36 tokens)
+        # makes TT-NN choose a non-tile chunk size and fail.
+        active_seq_len = current_pos + 1
+        padded_seq_len = ((active_seq_len + 31) // 32) * 32
+        padded_seq_len = min(padded_seq_len, past_key_value.key_cache.shape[2])
+        key_cache_for_sdpa = past_key_value.key_cache[:, :, :padded_seq_len, :]
+        value_cache_for_sdpa = past_key_value.value_cache[:, :, :padded_seq_len, :]
+
         attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
             q_heads_dram,
-            past_key_value.key_cache,
-            past_key_value.value_cache,
+            key_cache_for_sdpa,
+            value_cache_for_sdpa,
             cur_pos_tensor=pos_tensor_local,
             scale=self.scale,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
