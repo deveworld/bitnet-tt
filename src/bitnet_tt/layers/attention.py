@@ -1344,7 +1344,7 @@ class MultiHeadAttention:
             (
                 past_key_value.key_cache.shape[0],
                 self.num_kv_heads,
-                past_key_value.key_cache.shape[2],
+                padded_seq_len,
                 past_key_value.key_cache.shape[3],
             ),
         )
@@ -1354,7 +1354,7 @@ class MultiHeadAttention:
             (
                 past_key_value.value_cache.shape[0],
                 self.num_kv_heads,
-                past_key_value.value_cache.shape[2],
+                padded_seq_len,
                 past_key_value.value_cache.shape[3],
             ),
         )
