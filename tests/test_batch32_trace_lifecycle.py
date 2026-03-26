@@ -200,3 +200,33 @@ def test_capture_trace_warms_again_when_cache_shape_changes(monkeypatch) -> None
     assert captured is True
     assert decode_calls == ["decode", "decode"]
     assert (8, 512) in generator._warmed_trace_keys
+
+
+def test_release_trace_keeps_inputs_until_explicit_cleanup(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    released_traces = []
+    deallocated = []
+
+    generator.device = object()
+    generator._trace_id = 42
+    generator._trace_inputs = {
+        "embeds": object(),
+        "pos_tensor": object(),
+    }
+    generator._trace_output = object()
+    generator._trace_capture_pos = 8
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "release_trace", lambda *_args: released_traces.append(True))
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda tensor: deallocated.append(tensor))
+
+    Batch32Generator._release_trace(generator)
+
+    assert released_traces == [True]
+    assert generator._trace_id is None
+    assert generator._trace_inputs is not None
+    assert deallocated == []
+
+    Batch32Generator._release_trace_inputs(generator)
+
+    assert len(deallocated) == 2
+    assert generator._trace_inputs is None

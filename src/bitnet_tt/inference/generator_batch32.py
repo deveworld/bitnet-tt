@@ -661,6 +661,12 @@ class Batch32Generator:
             self._decode_inputs = self._allocate_decode_inputs()
         return self._decode_inputs
 
+    def _ensure_trace_inputs(self) -> dict:
+        """Lazily allocate reusable trace input tensors."""
+        if self._trace_inputs is None:
+            self._trace_inputs = self._allocate_decode_inputs()
+        return self._trace_inputs
+
     def _capture_trace(self, token_id: int, current_pos: int) -> bool:
         """Capture Metal Trace for decode loop. Returns True if a new trace was captured."""
         if self._trace_id is not None and self._trace_capture_pos == current_pos:
@@ -668,7 +674,7 @@ class Batch32Generator:
         if self._trace_id is not None:
             self._release_trace()
 
-        self._trace_inputs = self._allocate_decode_inputs()
+        self._trace_inputs = self._ensure_trace_inputs()
         self._copy_decode_inputs(self._trace_inputs, token_id, current_pos)
         cache_key = (
             current_pos,
@@ -745,13 +751,15 @@ class Batch32Generator:
             ttnn.release_trace(self.device, self._trace_id)
             self._trace_id = None
 
+        self._trace_output = None
+        self._trace_capture_pos = None
+
+    def _release_trace_inputs(self) -> None:
+        """Release reusable trace input tensors."""
         if self._trace_inputs is not None:
             for tensor in self._trace_inputs.values():
                 ttnn.deallocate(tensor)
             self._trace_inputs = None
-
-        self._trace_output = None
-        self._trace_capture_pos = None
 
     def _release_decode_inputs(self) -> None:
         """Release reusable non-trace decode input tensors."""
@@ -1104,6 +1112,11 @@ class Batch32Generator:
             self._release_decode_inputs()
         except Exception:
             self._decode_inputs = None
+
+        try:
+            self._release_trace_inputs()
+        except Exception:
+            self._trace_inputs = None
 
         try:
             self._clear_host_decode_cache()
