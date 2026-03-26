@@ -23,6 +23,7 @@ import torch
 import ttnn
 from numpy.typing import NDArray
 
+from bitnet_tt.config import get_compute_kernel_config
 from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_weight
 from bitnet_tt.utils.rope import precompute_freqs_cis
 
@@ -838,6 +839,43 @@ class MultiHeadAttention:
 
         # Store core grid for dynamic sharding
         self.core_grid = device.compute_with_storage_grid_size()
+        self._sdpa_decode_compute_kernel_config = None
+        self._sdpa_decode_program_cache: dict[int, ttnn.SDPAProgramConfig] = {}
+        try:
+            self._sdpa_decode_compute_kernel_config = get_compute_kernel_config("hifi2")
+        except Exception:
+            self._sdpa_decode_compute_kernel_config = None
+
+    def _get_decode_k_chunk_size(self, active_seq_len: int, padded_seq_len: int) -> int:
+        """Match TT decode chunk sizing closely enough to avoid slow fallbacks."""
+        if active_seq_len <= 128:
+            chunk_size = 32
+        elif active_seq_len <= 1024:
+            chunk_size = 128
+        else:
+            chunk_size = 512
+
+        max_power_divisor = 1
+        while padded_seq_len % (max_power_divisor * 2) == 0:
+            max_power_divisor *= 2
+
+        return min(chunk_size, max_power_divisor)
+
+    def _get_sdpa_decode_program_config(self, active_seq_len: int, padded_seq_len: int):
+        """Build and cache SDPA decode program configs keyed by visible cache length."""
+        k_chunk_size = self._get_decode_k_chunk_size(active_seq_len, padded_seq_len)
+        cached = self._sdpa_decode_program_cache.get(k_chunk_size)
+        if cached is not None:
+            return cached
+
+        program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.core_grid,
+            q_chunk_size=32,
+            k_chunk_size=k_chunk_size,
+            exp_approx_mode=False,
+        )
+        self._sdpa_decode_program_cache[k_chunk_size] = program_config
+        return program_config
 
     def _get_rot_transformation_mat(self) -> torch.Tensor:
         """
@@ -1299,6 +1337,7 @@ class MultiHeadAttention:
         active_seq_len = current_pos + 1
         padded_seq_len = ((active_seq_len + 31) // 32) * 32
         padded_seq_len = min(padded_seq_len, past_key_value.key_cache.shape[2])
+        sdpa_program_config = self._get_sdpa_decode_program_config(active_seq_len, padded_seq_len)
         key_cache_for_sdpa = ttnn.slice(
             past_key_value.key_cache,
             (0, 0, 0, 0),
@@ -1326,6 +1365,8 @@ class MultiHeadAttention:
             value_cache_for_sdpa,
             cur_pos_tensor=pos_tensor_local,
             scale=self.scale,
+            program_config=sdpa_program_config,
+            compute_kernel_config=self._sdpa_decode_compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(q_heads_dram)
