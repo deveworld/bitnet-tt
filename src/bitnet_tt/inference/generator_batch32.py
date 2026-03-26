@@ -549,6 +549,21 @@ class Batch32Generator:
         for cache in self._kv_caches:
             cache.seq_len_cached = seq_len
 
+    def _ensure_kv_caches(self, max_seq_len: int) -> None:
+        """Reuse existing batch-32 caches when they are already large enough."""
+        if self._kv_caches is None:
+            self._kv_caches = self._allocate_kv_caches(max_seq_len)
+            return
+
+        if any(cache.max_seq_len < max_seq_len for cache in self._kv_caches):
+            for cache in self._kv_caches:
+                ttnn.deallocate(cache.key_cache)
+                ttnn.deallocate(cache.value_cache)
+            self._kv_caches = self._allocate_kv_caches(max_seq_len)
+            return
+
+        self._set_kv_cache_length(0)
+
     def _allocate_decode_inputs(self) -> dict:
         """Pre-allocate persistent decode input tensors on device."""
         embed_shape = (1, 1, PADDED_BATCH, self.config.hidden_size)
@@ -886,7 +901,7 @@ class Batch32Generator:
 
         # Allocate caches
         max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
-        self._kv_caches = self._allocate_kv_caches(max_seq_len)
+        self._ensure_kv_caches(max_seq_len)
 
         # Prefill
         logits, seq_len = self._prefill_batch32(input_ids)
@@ -963,7 +978,7 @@ class Batch32Generator:
 
         # Allocate caches
         max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
-        self._kv_caches = self._allocate_kv_caches(max_seq_len)
+        self._ensure_kv_caches(max_seq_len)
 
         # Prefill
         prefill_start = time.perf_counter()
