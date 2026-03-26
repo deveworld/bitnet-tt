@@ -825,7 +825,7 @@ class Batch32Generator:
         trace_captured = False
 
         try:
-            for i in range(max_new_tokens - 1):
+            while len(generated_ids) - input_ids.shape[1] < max_new_tokens:
                 embed_vec = self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
                 logits_owned = True
 
@@ -866,12 +866,21 @@ class Batch32Generator:
                 generated_ids.append(next_token)
                 current_pos += 1
 
-                if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
+                if (
+                    self.enable_trace
+                    and not trace_captured
+                    and next_token != self.tokenizer.eos_token_id
+                    and len(generated_ids) - input_ids.shape[1] < max_new_tokens
+                ):
                     trace_embed_vec = (
                         self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
                     )
                     self._capture_trace(trace_embed_vec, current_pos)
                     trace_captured = True
+
+                    next_token = self._sample_token(self._trace_output, temperature, top_k)
+                    generated_ids.append(next_token)
+                    current_pos += 1
 
                 if logits_owned:
                     ttnn.deallocate(logits)
@@ -935,7 +944,7 @@ class Batch32Generator:
         trace_captured = False
 
         try:
-            for i in range(max_new_tokens - 1):
+            while stats.generated_tokens < max_new_tokens:
                 token_start = time.perf_counter()
 
                 embed_vec = self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
@@ -982,13 +991,27 @@ class Batch32Generator:
                 stats.generated_tokens += 1
                 current_pos += 1
 
-                if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
+                if (
+                    self.enable_trace
+                    and not trace_captured
+                    and next_token != self.tokenizer.eos_token_id
+                    and stats.generated_tokens < max_new_tokens
+                ):
+                    capture_start = time.perf_counter()
                     trace_embed_vec = (
                         self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
                     )
                     self._capture_trace(trace_embed_vec, current_pos)
                     trace_captured = True
                     stats.trace_captured = True
+                    capture_time = time.perf_counter() - capture_start
+                    stats.token_times.append(capture_time)
+                    stats.generation_time += capture_time
+
+                    next_token = self._sample_token(self._trace_output, temperature, top_k)
+                    generated_ids.append(next_token)
+                    stats.generated_tokens += 1
+                    current_pos += 1
 
                 current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 new_text = current_text[prev_text_len:]
