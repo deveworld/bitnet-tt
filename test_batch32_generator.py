@@ -18,7 +18,6 @@ from bitnet_tt.inference.generator_batch32 import (
     Batch32RotarySetup,
     Batch32KVCache,
     PADDED_BATCH,
-    create_height_sharded_config,
 )
 
 
@@ -33,7 +32,7 @@ def test_batch32_rotary_setup():
             rope_theta=500000.0,
         )
 
-        cos_s, sin_s = rotary.get_sharded_cos_sin(position=0)
+        cos_s, sin_s = rotary.create_cos_sin_device_tensors(position=0)
         print(f"cos_s shape: {cos_s.shape}, memory: {cos_s.memory_config()}")
         print(f"sin_s shape: {sin_s.shape}, memory: {sin_s.memory_config()}")
 
@@ -80,62 +79,35 @@ def test_batch32_decode_step():
 
         print(f"Model loaded: {config.num_layers} layers")
 
-        layer0 = model.layers[0]
+        generator = Batch32Generator(model, enable_trace=False)
+        generator._kv_caches = generator._allocate_kv_caches(max_seq_len=256)
 
-        rotary = Batch32RotarySetup(
+        embed_padded = torch.zeros((1, PADDED_BATCH, config.hidden_size), dtype=torch.bfloat16)
+        embed_padded[0, 0, :] = generator._embedding_weight_host[1234]
+        embeds = ttnn.from_torch(
+            embed_padded,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
             device=device,
-            head_dim=config.head_dim,
-            max_seq_len=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
         )
-
-        token_padded = torch.zeros((PADDED_BATCH, 1), dtype=torch.int64)
-        token_padded[0, 0] = 1234
-
-        token_tt = ttnn.from_torch(
-            token_padded,
-            dtype=ttnn.uint32,
+        pos_tensor = ttnn.from_torch(
+            torch.zeros((PADDED_BATCH,), dtype=torch.int32),
+            dtype=ttnn.int32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=device,
         )
+        cos_s, sin_s = generator.rotary_setup.create_cos_sin_device_tensors(position=0)
 
-        embeds = model.embed_tokens(token_tt)
-        print(f"Embeddings shape: {embeds.shape}")
+        logits = generator._decode_step_batch32(embeds, 0, pos_tensor, cos_s, sin_s)
+        print(f"Decode logits shape: {logits.shape}")
 
-        hidden = layer0.input_layernorm(embeds)
+        ttnn.deallocate(logits)
+        ttnn.deallocate(embeds)
+        ttnn.deallocate(pos_tensor)
+        ttnn.deallocate(cos_s)
+        ttnn.deallocate(sin_s)
 
-        hidden_rm = ttnn.to_layout(hidden, ttnn.ROW_MAJOR_LAYOUT)
-        hidden_1bkd = ttnn.reshape(hidden_rm, (1, 1, PADDED_BATCH, config.hidden_size))
-        hidden_1bkd = ttnn.to_layout(hidden_1bkd, ttnn.TILE_LAYOUT)
-        print(f"Hidden 1BKD shape: {hidden_1bkd.shape}")
-
-        attention = layer0.self_attn
-        qkv_fused = ttnn.matmul(hidden_1bkd, attention.qkv_fused_weight)
-        print(f"Fused QKV shape: {qkv_fused.shape}")
-
-        q_heads, k_heads, v_heads = ttnn.experimental.nlp_create_qkv_heads_decode(
-            qkv_fused,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
-        )
-        print(f"Q heads shape: {q_heads.shape}")
-        print(f"K heads shape: {k_heads.shape}")
-        print(f"V heads shape: {v_heads.shape}")
-
-        cos_s, sin_s = rotary.get_sharded_cos_sin(position=0)
-        trans_mat = rotary.get_sharded_trans_mat()
-
-        q_rot = ttnn.experimental.rotary_embedding_llama(
-            q_heads, cos_s, sin_s, trans_mat, is_decode_mode=True
-        )
-        k_rot = ttnn.experimental.rotary_embedding_llama(
-            k_heads, cos_s, sin_s, trans_mat, is_decode_mode=True
-        )
-        print(f"Q rotated shape: {q_rot.shape}")
-        print(f"K rotated shape: {k_rot.shape}")
-
-        print("SUCCESS: Decode step through layer 0 works!")
+        print("SUCCESS: Decode step through full batch-32 pipeline works!")
         return True
 
 

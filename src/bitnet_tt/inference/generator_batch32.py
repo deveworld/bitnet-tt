@@ -28,13 +28,17 @@ from numpy.typing import NDArray
 
 from bitnet_tt.layers.attention import KVCache
 
-
 if TYPE_CHECKING:
     from bitnet_tt.model.bitnet import BitNetModel
 
 
 PADDED_BATCH = 32
 TILE_SIZE = 32
+
+
+def round_up_to_tile(value: int, tile: int = TILE_SIZE) -> int:
+    """Round an integer up to the next tile multiple."""
+    return ((value + tile - 1) // tile) * tile
 
 
 @dataclass
@@ -128,7 +132,7 @@ class Batch32RotarySetup:
     RoPE setup optimized for batch-32 HEIGHT_SHARDED decode.
 
     Key difference from standard RotarySetup:
-    - cos/sin are sharded to HEIGHT_SHARDED after embedding lookup
+    - cos/sin are materialized directly as HEIGHT_SHARDED decode inputs
     - Transformation matrix is also sharded
     - All outputs compatible with rotary_embedding_llama is_decode_mode=True
     """
@@ -159,35 +163,9 @@ class Batch32RotarySetup:
         sin_half = sin[:, : head_dim // 2]
         cos_interleaved = torch.stack([cos_half, cos_half], dim=-1).flatten(-2)
         sin_interleaved = torch.stack([sin_half, sin_half], dim=-1).flatten(-2)
+        self._cos_interleaved_host = cos_interleaved.to(torch.bfloat16)
+        self._sin_interleaved_host = sin_interleaved.to(torch.bfloat16)
 
-        self.cos_matrix = ttnn.from_torch(
-            cos_interleaved,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        self.sin_matrix = ttnn.from_torch(
-            sin_interleaved,
-            device=device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        positions = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-
-        cos = emb.cos()
-        sin = emb.sin()
-
-        # Interleaved format for rotary_embedding_llama
-        cos_half = cos[:, : head_dim // 2]
-        sin_half = sin[:, : head_dim // 2]
-        cos_interleaved = torch.stack([cos_half, cos_half], dim=-1).flatten(-2)
-        sin_interleaved = torch.stack([sin_half, sin_half], dim=-1).flatten(-2)
-
-        # Upload as embedding matrices [max_seq_len, head_dim]
         self.cos_matrix = ttnn.from_torch(
             cos_interleaved,
             device=device,
@@ -220,45 +198,55 @@ class Batch32RotarySetup:
 
         self.cos_sin_config = create_height_sharded_config(TILE_SIZE, head_dim)
 
-    def get_sharded_cos_sin(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """
-        Get HEIGHT_SHARDED cos/sin for decode at given position.
+    def _get_cos_sin_torch(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build interleaved cos/sin tensors for one decode position."""
+        if position < 0 or position >= self.max_seq_len:
+            raise ValueError(
+                f"Position {position} is out of range for max_seq_len={self.max_seq_len}"
+            )
 
-        Pattern from tt-transformers/rope.py:
-        1. Embedding lookup for position
-        2. Reshape to [1, batch, 1, head_dim]
-        3. Shard to HEIGHT_SHARDED
-        """
-        # Create position indices for all 32 batch elements (same position)
-        rot_idxs = ttnn.from_torch(
-            torch.full((1, PADDED_BATCH), position, dtype=torch.int32),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
+        cos_row = self._cos_interleaved_host[position : position + 1]
+        sin_row = self._sin_interleaved_host[position : position + 1]
+
+        cos = cos_row.expand(PADDED_BATCH, -1).unsqueeze(0).unsqueeze(2).contiguous()
+        sin = sin_row.expand(PADDED_BATCH, -1).unsqueeze(0).unsqueeze(2).contiguous()
+        return cos, sin
+
+    def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """Create HEIGHT_SHARDED device tensors for one decode position."""
+        cos_torch, sin_torch = self._get_cos_sin_torch(position)
+        cos_device = ttnn.from_torch(
+            cos_torch,
             device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=self.cos_sin_config,
         )
+        sin_device = ttnn.from_torch(
+            sin_torch,
+            device=self.device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=self.cos_sin_config,
+        )
+        return cos_device, sin_device
 
-        # Embedding lookup: [1, batch, head_dim]
-        cos = ttnn.embedding(rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(rot_idxs, self.sin_matrix, layout=ttnn.TILE_LAYOUT)
-
-        # Reshape: [1, batch, head_dim] -> [1, batch, 1, head_dim] -> [1, 1, batch, head_dim]
-        cos = ttnn.unsqueeze_to_4D(cos)  # [1, 1, batch, head_dim]
-        sin = ttnn.unsqueeze_to_4D(sin)
-
-        # Transpose: [1, 1, batch, head_dim] -> [1, batch, 1, head_dim]
-        cos = ttnn.transpose(cos, 1, 2)
-        sin = ttnn.transpose(sin, 1, 2)
-
-        # Shard to HEIGHT_SHARDED
-        cos_sharded = ttnn.to_memory_config(cos, self.cos_sin_config)
-        sin_sharded = ttnn.to_memory_config(sin, self.cos_sin_config)
-
-        ttnn.deallocate(rot_idxs)
-        ttnn.deallocate(cos)
-        ttnn.deallocate(sin)
-
-        return cos_sharded, sin_sharded
+    def get_cos_sin_host_tensor(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """Create host tensors that can be copied into persistent trace inputs."""
+        cos_torch, sin_torch = self._get_cos_sin_torch(position)
+        cos_host = ttnn.from_torch(
+            cos_torch,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        sin_host = ttnn.from_torch(
+            sin_torch,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        return cos_host, sin_host
 
     def get_sharded_trans_mat(self) -> ttnn.Tensor:
         """Get HEIGHT_SHARDED transformation matrix."""
@@ -388,12 +376,19 @@ class Batch32Generator:
             max_seq_len=self.config.max_position_embeddings,
             rope_theta=self.config.rope_theta,
         )
+        self._transformation_mat = self.rotary_setup.get_sharded_trans_mat()
+        self._sdpa_output_sharded_config = create_sdpa_output_sharded_config(
+            self.config.num_attention_heads,
+            self.config.head_dim,
+        )
+        for layer in self.model.layers:
+            layer.self_attn.transformation_mat_decode = self._transformation_mat
 
         # Store embedding weight on host for trace execution
         self._embedding_weight_host = ttnn.to_torch(model.embed_tokens.weight)
 
         # KV caches (allocated per generation)
-        self._kv_caches: Optional[list[Batch32KVCache]] = None
+        self._kv_caches: Optional[list[KVCache]] = None
 
         if self.tokenizer is None:
             self._load_default_tokenizer()
@@ -410,15 +405,25 @@ class Batch32Generator:
             print("Warning: transformers not installed. Cannot load tokenizer.")
             self.tokenizer = None
 
-    def _allocate_kv_caches(self, max_seq_len: int) -> list[Batch32KVCache]:
-        """Allocate batch-32 KV caches for all layers."""
+    def _allocate_kv_caches(self, max_seq_len: int) -> list[KVCache]:
+        """Allocate paged KV caches for all layers using virtual batch=32."""
+        max_seq_len = round_up_to_tile(max_seq_len)
         caches = []
         for _ in range(self.config.num_layers):
-            cache = Batch32KVCache(
+            cache = KVCache(
                 max_seq_len=max_seq_len,
+                batch_size=PADDED_BATCH,
                 num_kv_heads=self.config.num_key_value_heads,
                 head_dim=self.config.head_dim,
                 device=self.device,
+            )
+            cache.preallocate(
+                batch_size=PADDED_BATCH,
+                num_kv_heads=self.config.num_key_value_heads,
+                max_seq_len=max_seq_len,
+                head_dim=self.config.head_dim,
+                device=self.device,
+                use_paged=True,
             )
             caches.append(cache)
         return caches
@@ -428,6 +433,8 @@ class Batch32Generator:
         token_embeds: ttnn.Tensor,
         current_pos: int,
         current_pos_tensor: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
     ) -> ttnn.Tensor:
         """
         Single decode step using batch-32 HEIGHT_SHARDED pipeline.
@@ -435,27 +442,27 @@ class Batch32Generator:
         This is the core optimized decode that can be traced.
 
         Args:
-            token_embeds: [1, 1, 32, hidden_size] token embeddings
-            current_pos: Current position (int)
+            token_embeds: [1, 32, hidden_size] token embeddings (seq=32 virtual batch)
+            current_pos: Current decode position
             current_pos_tensor: INT32 tensor for KV cache update
+            cos: HEIGHT_SHARDED cos tensor [1, 32, 1, head_dim]
+            sin: HEIGHT_SHARDED sin tensor [1, 32, 1, head_dim]
 
         Returns:
-            logits: [32, 1, vocab_size]
+            logits: [1, 1, vocab_size]
         """
         hidden = token_embeds
-
-        # Get sharded RoPE tensors
-        cos_s, sin_s = self.rotary_setup.get_sharded_cos_sin(current_pos)
-        trans_mat = self.rotary_setup.get_sharded_trans_mat()
 
         for layer_idx in range(self.config.num_layers):
             layer = self.model.layers[layer_idx]
             kv_cache = self._kv_caches[layer_idx]
+            prev_hidden = hidden
 
             # Input LayerNorm
             normed = layer.input_layernorm(hidden)
 
-            # Reshape for fused QKV: [1, 1, 32, hidden]
+            # Reshape for fused QKV: [1, 32, hidden] -> [1, 1, 32, hidden]
+            # Use [1, 32, hidden] instead of [32, 1, hidden] to avoid layout conversion hang
             normed_rm = ttnn.to_layout(normed, ttnn.ROW_MAJOR_LAYOUT)
             normed_1bkd = ttnn.reshape(normed_rm, (1, 1, PADDED_BATCH, self.config.hidden_size))
             normed_1bkd = ttnn.to_layout(normed_1bkd, ttnn.TILE_LAYOUT)
@@ -463,87 +470,62 @@ class Batch32Generator:
             # Fused QKV matmul
             attention = layer.self_attn
             qkv_fused = ttnn.matmul(normed_1bkd, attention.qkv_fused_weight)
-
-            # Split into Q/K/V heads (outputs HEIGHT_SHARDED)
-            q_heads, k_heads, v_heads = ttnn.experimental.nlp_create_qkv_heads_decode(
+            attn_output_proj, _ = attention._forward_decode_1bkd(
                 qkv_fused,
-                num_heads=self.config.num_attention_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
+                kv_cache,
+                current_pos,
+                (cos, sin),
+                PADDED_BATCH,
+                current_pos_tensor=current_pos_tensor,
             )
+            ttnn.deallocate(normed)
 
-            # RoPE (requires HEIGHT_SHARDED inputs)
-            q_rot = ttnn.experimental.rotary_embedding_llama(
-                q_heads, cos_s, sin_s, trans_mat, is_decode_mode=True
+            attn_output_rm = ttnn.to_layout(attn_output_proj, ttnn.ROW_MAJOR_LAYOUT)
+            attn_output_3d = ttnn.reshape(
+                attn_output_rm,
+                (1, PADDED_BATCH, self.config.hidden_size),
             )
-            k_rot = ttnn.experimental.rotary_embedding_llama(
-                k_heads, cos_s, sin_s, trans_mat, is_decode_mode=True
-            )
-
-            # Update KV cache
-            kv_cache.update(k_rot, v_heads, current_pos_tensor)
-            kv_cache.seq_len_cached = current_pos + 1
-
-            # Get full cache for attention
-            k_cache, v_cache = kv_cache.get_for_attention(current_pos + 1)
-
-            # SDPA decode outputs to DRAM [1, batch, heads, head_dim]
-            attn_output_dram = ttnn.transformer.scaled_dot_product_attention_decode(
-                q_rot,
-                k_cache,
-                v_cache,
-                cur_pos_tensor=current_pos_tensor,
-                scale=1.0 / (self.config.head_dim**0.5),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-
-            # Convert to HEIGHT_SHARDED for nlp_concat_heads_decode
-            sdpa_sharded_config = create_sdpa_output_sharded_config(
-                self.config.num_attention_heads, self.config.head_dim
-            )
-            attn_output = ttnn.to_memory_config(attn_output_dram, sdpa_sharded_config)
-            ttnn.deallocate(attn_output_dram)
-
-            # Concat heads (output is WIDTH_SHARDED)
-            attn_output = ttnn.experimental.nlp_concat_heads_decode(
-                attn_output, num_heads=self.config.num_attention_heads
-            )
-
-            # Convert to interleaved for LayerNorm compatibility
-            attn_output = ttnn.to_memory_config(attn_output, ttnn.DRAM_MEMORY_CONFIG)
-
-            # Attn sub-norm + output projection
-            attn_output = layer.self_attn.attn_sub_norm(attn_output)
-            attn_output = layer.self_attn.o_proj(attn_output)
+            attn_output_3d = ttnn.to_layout(attn_output_3d, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(attn_output_proj)
+            ttnn.deallocate(attn_output_rm)
 
             # Residual
-            hidden = ttnn.add(hidden, attn_output)
+            hidden_attn = ttnn.add(hidden, attn_output_3d)
+            ttnn.deallocate(attn_output_3d)
 
             # FFN
-            residual = hidden
-            hidden = layer.post_attention_layernorm(hidden)
-            hidden = layer.mlp(hidden, mode="decode")
-            hidden = ttnn.add(residual, hidden)
+            residual = hidden_attn
+            hidden_normed = layer.post_attention_layernorm(hidden_attn)
+            hidden_mlp = layer.mlp(hidden_normed, mode="decode")
+            hidden = ttnn.add(residual, hidden_mlp)
+            ttnn.deallocate(hidden_normed)
+            ttnn.deallocate(hidden_mlp)
+            ttnn.deallocate(residual)
+            if layer_idx > 0:
+                ttnn.deallocate(prev_hidden)
 
             # Cleanup intermediate tensors
             ttnn.deallocate(normed_rm)
             ttnn.deallocate(normed_1bkd)
-            ttnn.deallocate(qkv_fused)
-
-        # Cleanup RoPE tensors
-        ttnn.deallocate(cos_s)
-        ttnn.deallocate(sin_s)
-        ttnn.deallocate(trans_mat)
 
         # Final norm + LM head
         hidden = self.model.norm(hidden)
-        logits = ttnn.matmul(hidden, self.model.lm_head_weight)
+        logits_full = ttnn.matmul(hidden, self.model.lm_head_weight)
+        logits = logits_full[:, :1, :]
+        ttnn.deallocate(logits_full)
 
         return logits
 
+    def _set_kv_cache_length(self, seq_len: int) -> None:
+        """Keep batch-32 KV cache metadata aligned with the most recent decode position."""
+        if self._kv_caches is None:
+            return
+        for cache in self._kv_caches:
+            cache.seq_len_cached = seq_len
+
     def _setup_trace_inputs(self) -> dict:
         """Pre-allocate trace input tensors on device."""
-        embed_shape = (PADDED_BATCH, 1, self.config.hidden_size)
+        embed_shape = (1, PADDED_BATCH, self.config.hidden_size)
         pos_shape = (32,)
 
         embeds = ttnn.from_torch(
@@ -562,14 +544,61 @@ class Batch32Generator:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
-        return {"embeds": embeds, "pos_tensor": pos_tensor}
+        cos, sin = self.rotary_setup.create_cos_sin_device_tensors(position=0)
 
-    def _capture_trace(self, current_pos: int) -> None:
+        return {
+            "embeds": embeds,
+            "pos_tensor": pos_tensor,
+            "cos": cos,
+            "sin": sin,
+        }
+
+    def _copy_trace_inputs(self, embed_vec: torch.Tensor, current_pos: int) -> None:
+        """Update persistent trace inputs with the next decode step values."""
+        embed_padded = torch.zeros((1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16)
+        embed_padded[0, 0, :] = embed_vec.squeeze()
+
+        embed_host = ttnn.from_torch(
+            embed_padded,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+        )
+        ttnn.copy_host_to_device_tensor(embed_host, self._trace_inputs["embeds"])
+
+        pos_host = ttnn.from_torch(
+            torch.full((PADDED_BATCH,), current_pos, dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,
+        )
+        ttnn.copy_host_to_device_tensor(pos_host, self._trace_inputs["pos_tensor"])
+
+        cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
+        ttnn.copy_host_to_device_tensor(cos_host, self._trace_inputs["cos"])
+        ttnn.copy_host_to_device_tensor(sin_host, self._trace_inputs["sin"])
+
+    def _capture_trace(self, embed_vec: torch.Tensor, current_pos: int) -> None:
         """Capture Metal Trace for decode loop."""
         if self._trace_id is not None:
             return
 
         self._trace_inputs = self._setup_trace_inputs()
+        self._copy_trace_inputs(embed_vec, current_pos)
+        saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
+
+        warmup_logits = self._decode_step_batch32(
+            self._trace_inputs["embeds"],
+            current_pos,
+            self._trace_inputs["pos_tensor"],
+            self._trace_inputs["cos"],
+            self._trace_inputs["sin"],
+        )
+        self._set_kv_cache_length(current_pos + 1)
+        ttnn.deallocate(warmup_logits)
+        for cache, saved_len in zip(self._kv_caches or [], saved_seq_len):
+            cache.seq_len_cached = saved_len
+        ttnn.synchronize_device(self.device)
 
         self._trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
 
@@ -577,9 +606,13 @@ class Batch32Generator:
             self._trace_inputs["embeds"],
             current_pos,
             self._trace_inputs["pos_tensor"],
+            self._trace_inputs["cos"],
+            self._trace_inputs["sin"],
         )
+        self._set_kv_cache_length(current_pos + 1)
 
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
+        ttnn.synchronize_device(self.device)
 
     def _execute_trace(
         self,
@@ -587,21 +620,11 @@ class Batch32Generator:
         current_pos: int,
     ) -> ttnn.Tensor:
         """Execute captured trace with new inputs."""
-        embed_padded = torch.zeros((PADDED_BATCH, 1, self.config.hidden_size), dtype=torch.bfloat16)
-        embed_padded[0, :, :] = embed_vec
-
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(embed_padded, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
-            self._trace_inputs["embeds"],
-        )
-
-        pos_data = torch.tensor([current_pos] * 32, dtype=torch.int32)
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(pos_data, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT),
-            self._trace_inputs["pos_tensor"],
-        )
+        self._copy_trace_inputs(embed_vec, current_pos)
 
         ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(self.device)
+        self._set_kv_cache_length(current_pos + 1)
 
         return self._trace_output
 
@@ -658,6 +681,10 @@ class Batch32Generator:
         model_kv_caches: list,
         seq_len: int,
     ) -> None:
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
+        num_kv_groups = num_q_heads // num_kv_heads
+
         for layer_idx, model_cache in enumerate(model_kv_caches):
             if model_cache is None:
                 continue
@@ -670,11 +697,26 @@ class Batch32Generator:
 
                 k_torch = ttnn.to_torch(k_prefill)
                 v_torch = ttnn.to_torch(v_prefill)
+                if k_torch.shape[1] == num_q_heads:
+                    k_torch = k_torch[:, ::num_kv_groups, :, :].contiguous()
+                elif k_torch.shape[1] != num_kv_heads:
+                    raise ValueError(
+                        f"Unexpected prefill K head count: {k_torch.shape[1]} "
+                        f"(expected {num_q_heads} or {num_kv_heads})"
+                    )
+
+                if v_torch.shape[1] == num_q_heads:
+                    v_torch = v_torch[:, ::num_kv_groups, :, :].contiguous()
+                elif v_torch.shape[1] != num_kv_heads:
+                    raise ValueError(
+                        f"Unexpected prefill V head count: {v_torch.shape[1]} "
+                        f"(expected {num_q_heads} or {num_kv_heads})"
+                    )
 
                 k_padded = torch.zeros(
                     (
                         PADDED_BATCH,
-                        self.config.num_key_value_heads,
+                        batch32_cache.key_cache.shape[1],
                         batch32_cache.max_seq_len,
                         self.config.head_dim,
                     ),
@@ -719,10 +761,9 @@ class Batch32Generator:
         temperature: float = 1.0,
         top_k: Optional[int] = 50,
     ) -> int:
-        """Sample next token from logits (batch[0] only)."""
-        # Get logits for batch[0], last position
+        """Sample next token from the last logical position of batch element 0."""
         logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        last_logits = logits_rm[0, -1:, :]  # [1, vocab]
+        last_logits = logits_rm[:1, -1:, :]
         logits_np = ttnn.to_torch(last_logits).float().numpy().flatten()
 
         if temperature != 1.0:
@@ -765,7 +806,7 @@ class Batch32Generator:
         input_ids = inputs["input_ids"]
 
         # Allocate caches
-        max_seq_len = input_ids.shape[1] + max_new_tokens + 32
+        max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
         self._kv_caches = self._allocate_kv_caches(max_seq_len)
 
         # Prefill
@@ -785,14 +826,17 @@ class Batch32Generator:
         try:
             for i in range(max_new_tokens - 1):
                 embed_vec = self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
+                logits_owned = True
 
                 if self.enable_trace and trace_captured:
                     logits = self._execute_trace(embed_vec, current_pos)
+                    logits_owned = False
                 else:
+                    # Shape: [1, 32, hidden] - NOT [32, 1, hidden] to avoid layout conversion hang
                     embed_padded = torch.zeros(
-                        (PADDED_BATCH, 1, self.config.hidden_size), dtype=torch.bfloat16
+                        (1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16
                     )
-                    embed_padded[0, :, :] = embed_vec
+                    embed_padded[0, 0, :] = embed_vec.squeeze()
 
                     embeds = ttnn.from_torch(
                         embed_padded,
@@ -807,21 +851,26 @@ class Batch32Generator:
                         layout=ttnn.ROW_MAJOR_LAYOUT,
                         device=self.device,
                     )
+                    cos, sin = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
 
-                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor)
+                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor, cos, sin)
+                    self._set_kv_cache_length(current_pos + 1)
 
                     ttnn.deallocate(embeds)
                     ttnn.deallocate(pos_tensor)
-
-                    if self.enable_trace and i == 0:
-                        self._capture_trace(current_pos + 1)
-                        trace_captured = True
+                    ttnn.deallocate(cos)
+                    ttnn.deallocate(sin)
 
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
+                decode_pos = current_pos
                 current_pos += 1
 
-                if not (self.enable_trace and trace_captured):
+                if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
+                    self._capture_trace(embed_vec, decode_pos)
+                    trace_captured = True
+
+                if logits_owned:
                     ttnn.deallocate(logits)
 
                 if next_token == self.tokenizer.eos_token_id:
@@ -856,7 +905,7 @@ class Batch32Generator:
         stats.prompt_tokens = input_ids.shape[1]
 
         # Allocate caches
-        max_seq_len = input_ids.shape[1] + max_new_tokens + 32
+        max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
         self._kv_caches = self._allocate_kv_caches(max_seq_len)
 
         # Prefill
@@ -887,14 +936,16 @@ class Batch32Generator:
                 token_start = time.perf_counter()
 
                 embed_vec = self._embedding_weight_host[next_token].unsqueeze(0).unsqueeze(0)
+                logits_owned = True
 
                 if self.enable_trace and trace_captured:
                     logits = self._execute_trace(embed_vec, current_pos)
+                    logits_owned = False
                 else:
                     embed_padded = torch.zeros(
-                        (PADDED_BATCH, 1, self.config.hidden_size), dtype=torch.bfloat16
+                        (1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16
                     )
-                    embed_padded[0, :, :] = embed_vec
+                    embed_padded[0, 0, :] = embed_vec.squeeze()
 
                     embeds = ttnn.from_torch(
                         embed_padded,
@@ -909,15 +960,15 @@ class Batch32Generator:
                         layout=ttnn.ROW_MAJOR_LAYOUT,
                         device=self.device,
                     )
+                    cos, sin = self.rotary_setup.create_cos_sin_device_tensors(current_pos)
 
-                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor)
+                    logits = self._decode_step_batch32(embeds, current_pos, pos_tensor, cos, sin)
+                    self._set_kv_cache_length(current_pos + 1)
 
                     ttnn.deallocate(embeds)
                     ttnn.deallocate(pos_tensor)
-
-                    if self.enable_trace and i == 0:
-                        self._capture_trace(current_pos + 1)
-                        trace_captured = True
+                    ttnn.deallocate(cos)
+                    ttnn.deallocate(sin)
 
                 token_time = time.perf_counter() - token_start
                 stats.token_times.append(token_time)
@@ -926,14 +977,20 @@ class Batch32Generator:
                 next_token = self._sample_token(logits, temperature, top_k)
                 generated_ids.append(next_token)
                 stats.generated_tokens += 1
+                decode_pos = current_pos
                 current_pos += 1
+
+                if self.enable_trace and i == 0 and next_token != self.tokenizer.eos_token_id:
+                    self._capture_trace(embed_vec, decode_pos)
+                    trace_captured = True
+                    stats.trace_captured = True
 
                 current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 new_text = current_text[prev_text_len:]
                 prev_text_len = len(current_text)
                 yield new_text, stats
 
-                if not (self.enable_trace and trace_captured):
+                if logits_owned:
                     ttnn.deallocate(logits)
 
                 if next_token == self.tokenizer.eos_token_id:
