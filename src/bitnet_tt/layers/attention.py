@@ -23,7 +23,7 @@ import torch
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.bitlinear import Linear, RMSNorm
+from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_weight
 from bitnet_tt.utils.rope import precompute_freqs_cis
 
 
@@ -721,6 +721,24 @@ class KVCache:
         self.seq_len_cached = prefill_seq_len
         # Keep _preallocated=True since we're using the preallocated buffer
 
+
+def build_fused_qkv_weight(
+    q_weight: NDArray[np.floating],
+    k_weight: NDArray[np.floating],
+    v_weight: NDArray[np.floating],
+) -> NDArray[np.float32]:
+    """
+    Build a single pre-transposed QKV matrix from separately quantized weights.
+
+    Preserving per-projection quantization avoids changing BitLinear behavior
+    while reducing three projection matmuls to one.
+    """
+    q_t = quantize_and_transpose_weight(q_weight)
+    k_t = quantize_and_transpose_weight(k_weight)
+    v_t = quantize_and_transpose_weight(v_weight)
+    return np.concatenate([q_t, k_t, v_t], axis=1)
+
+
 class MultiHeadAttention:
     """
     Optimized TT-NN Multi-Head Attention with GQA, RoPE, and KV-Cache.
@@ -904,16 +922,7 @@ class MultiHeadAttention:
         if attn_sub_norm_weight is not None:
             self.attn_sub_norm.load_weights(attn_sub_norm_weight)
 
-        # Create fused QKV weight for optimized decode
-        # Concatenate Q, K, V weights: [hidden_size, qkv_dim]
-        # Original weights are [out_features, in_features], transposed for matmul
-        # Q: [num_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_heads * head_dim]
-        # K: [num_kv_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_kv_heads * head_dim]
-        # V: [num_kv_heads * head_dim, hidden_size] -> transposed: [hidden_size, num_kv_heads * head_dim]
-        q_t = q_weight.T.astype(np.float32)  # [hidden_size, num_heads * head_dim]
-        k_t = k_weight.T.astype(np.float32)  # [hidden_size, num_kv_heads * head_dim]
-        v_t = v_weight.T.astype(np.float32)  # [hidden_size, num_kv_heads * head_dim]
-        qkv_fused = np.concatenate([q_t, k_t, v_t], axis=1)  # [hidden_size, qkv_dim]
+        qkv_fused = build_fused_qkv_weight(q_weight, k_weight, v_weight)
 
         self.qkv_fused_weight = ttnn.from_torch(
             torch.from_numpy(qkv_fused),
@@ -922,6 +931,34 @@ class MultiHeadAttention:
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+
+    def _split_fused_qkv(
+        self,
+        xqkv_fused: ttnn.Tensor,
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
+        """Split a fused QKV projection along the feature axis."""
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        rank = len(xqkv_fused.shape)
+
+        q_start = [0] * rank
+        q_end = list(xqkv_fused.shape)
+        q_end[-1] = q_dim
+        query = ttnn.slice(xqkv_fused, q_start, q_end)
+
+        k_start = [0] * rank
+        k_start[-1] = q_dim
+        k_end = list(xqkv_fused.shape)
+        k_end[-1] = q_dim + kv_dim
+        key = ttnn.slice(xqkv_fused, k_start, k_end)
+
+        v_start = [0] * rank
+        v_start[-1] = q_dim + kv_dim
+        v_end = list(xqkv_fused.shape)
+        value = ttnn.slice(xqkv_fused, v_start, v_end)
+
+        ttnn.deallocate(xqkv_fused)
+        return query, key, value
 
     def __call__(
         self,
@@ -999,10 +1036,14 @@ class MultiHeadAttention:
         #         cos_sin_tensors=cos_sin_tensors,
         #     )
 
-        # Standard path: separate QKV projections
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        # Standard path: fused QKV projection when available, otherwise separate projections.
+        if self.qkv_fused_weight is not None:
+            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
+            query, key, value = self._split_fused_qkv(xqkv_fused)
+        else:
+            query = self.q_proj(hidden_states)
+            key = self.k_proj(hidden_states)
+            value = self.v_proj(hidden_states)
 
         # NOTE: 1BKD path disabled - rotary_embedding_llama requires HEIGHT_SHARDED inputs
         # which cannot be properly created for batch=1. TT's 1BKD optimizations are designed

@@ -16,7 +16,23 @@ import numpy as np
 import ttnn
 from numpy.typing import NDArray
 
-from bitnet_tt.layers.bitlinear import Linear, RMSNorm
+from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_weight
+
+
+def build_fused_gate_up_weight(
+    gate_weight: NDArray[np.floating],
+    up_weight: NDArray[np.floating],
+) -> NDArray[np.float32]:
+    """
+    Build a single pre-transposed gate+up matrix from separately quantized weights.
+
+    BitNet quantizes each projection independently. Concatenating after
+    quantization preserves that behavior while reducing decode matmul dispatches
+    from two projections to one.
+    """
+    gate_weight_t = quantize_and_transpose_weight(gate_weight)
+    up_weight_t = quantize_and_transpose_weight(up_weight)
+    return np.concatenate([gate_weight_t, up_weight_t], axis=1)
 
 
 class FeedForward:
@@ -27,6 +43,7 @@ class FeedForward:
     - Pre-transposed weights (no transpose per forward)
     - Mode-aware memory configs (L1 for decode, DRAM for prefill)
     - LoFi compute kernel for ~3.6x matmul speedup (configurable)
+    - Fused gate+up projection to reduce decode dispatch overhead
 
     Architecture (matching HuggingFace Transformers):
         gate = SquaredReLU(gate_proj(x))  # Plain linear
@@ -66,9 +83,13 @@ class FeedForward:
         # Compute fidelity: LoFi for speed, HiFi2 for accuracy
         fidelity = "lofi" if use_lofi else "hifi2"
 
-        # Projections (weights pre-transposed in Linear.load_weights)
-        self.gate_proj = Linear(hidden_size, intermediate_size, device, compute_fidelity=fidelity)
-        self.up_proj = Linear(hidden_size, intermediate_size, device, compute_fidelity=fidelity)
+        # Fuse gate+up into one matmul while preserving per-matrix quantization.
+        self.gate_up_proj = Linear(
+            hidden_size,
+            intermediate_size * 2,
+            device,
+            compute_fidelity=fidelity,
+        )
         self.down_proj = Linear(intermediate_size, hidden_size, device, compute_fidelity=fidelity)
 
         # Sub-norm applied after gate*up, before down_proj
@@ -90,8 +111,8 @@ class FeedForward:
             down_weight: Down projection weight
             ffn_sub_norm_weight: Sub-norm weight (applied after gate*up, before down_proj)
         """
-        self.gate_proj.load_weights(gate_weight)
-        self.up_proj.load_weights(up_weight)
+        fused_gate_up = build_fused_gate_up_weight(gate_weight, up_weight)
+        self.gate_up_proj.load_pretransposed_weight(fused_gate_up)
         self.down_proj.load_weights(down_weight)
 
         if ffn_sub_norm_weight is not None:
@@ -108,13 +129,22 @@ class FeedForward:
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
+        gate_up = self.gate_up_proj(x)
+
+        split_start = [0] * len(gate_up.shape)
+        gate_end = list(gate_up.shape)
+        gate_end[-1] = self.intermediate_size
+        gate = ttnn.slice(gate_up, split_start, gate_end)
+
+        up_start = [0] * len(gate_up.shape)
+        up_start[-1] = self.intermediate_size
+        up_end = list(gate_up.shape)
+        up = ttnn.slice(gate_up, up_start, up_end)
+        ttnn.deallocate(gate_up)
+
         # Gate with squared ReLU
-        gate = self.gate_proj(x)
         gate = ttnn.relu(gate)
         gate = ttnn.multiply(gate, gate)  # Squared ReLU
-
-        # Up projection
-        up = self.up_proj(x)
 
         # Element-wise multiplication
         hidden = ttnn.multiply(gate, up)

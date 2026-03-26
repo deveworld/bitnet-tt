@@ -71,6 +71,24 @@ def numpy_int_to_ttnn(
     return tensor
 
 
+def quantize_weight_like_hf(weight: NDArray[np.floating]) -> NDArray[np.float32]:
+    """
+    Quantize a linear weight using the HuggingFace BitLinear rule.
+
+    The returned values stay in float32 so they can be consumed by the current
+    TT-NN matmul path without requiring a dedicated ternary kernel.
+    """
+    weight_fp32 = weight.astype(np.float32)
+    scale = np.abs(weight_fp32).mean()
+    s = 1.0 / max(scale, 1e-5)
+    return np.clip(np.round(weight_fp32 * s), -1, 1).astype(np.float32) / s
+
+
+def quantize_and_transpose_weight(weight: NDArray[np.floating]) -> NDArray[np.float32]:
+    """Quantize a weight matrix and pre-transpose it to (in, out)."""
+    return quantize_weight_like_hf(weight).T.copy()
+
+
 def ttnn_to_numpy(tensor: ttnn.Tensor) -> NDArray[np.floating]:
     """
     Convert ttnn tensor back to numpy array.
@@ -264,19 +282,16 @@ class Linear:
         Args:
             weight: Weight array of shape (out_features, in_features)
         """
-        weight = weight.astype(np.float32)
+        self.load_pretransposed_weight(quantize_and_transpose_weight(weight))
 
-        # Pre-compute ternary quantization (matching HF BitLinear weight_quant)
-        # s = 1 / mean(|weight|), result = round(weight * s).clamp(-1, 1) / s
-        scale = np.abs(weight).mean()
-        s = 1.0 / max(scale, 1e-5)
-        weight_quant = np.clip(np.round(weight * s), -1, 1) / s
+    def load_pretransposed_weight(self, weight_t: NDArray[np.floating]) -> None:
+        """
+        Load a weight that is already quantized and transposed to (in, out).
 
-        # Pre-transpose: (out, in) -> (in, out) to avoid runtime transpose
-        weight_t = weight_quant.T.copy()
-
-        # Store pre-quantized and pre-transposed weights
-        self.weight = numpy_to_ttnn(weight_t, self.device)
+        This lets higher-level fused layers concatenate separately quantized
+        blocks and still reuse the standard TT matmul path.
+        """
+        self.weight = numpy_to_ttnn(weight_t.astype(np.float32), self.device)
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         """
