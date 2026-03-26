@@ -526,9 +526,15 @@ class Batch32Generator:
 
         # Final norm + LM head
         hidden = self.model.norm(hidden)
-        logits_full = ttnn.matmul(hidden, self.model.lm_head_weight)
-        logits = logits_full[:, :1, :]
-        ttnn.deallocate(logits_full)
+        # Only batch row 0 contributes to user-visible output. Running the LM
+        # head on all 32 padded rows adds unnecessary decode work.
+        hidden_single = ttnn.slice(
+            hidden,
+            [0, 0, 0],
+            [1, 1, self.config.hidden_size],
+        )
+        logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
+        ttnn.deallocate(hidden_single)
 
         return logits
 
