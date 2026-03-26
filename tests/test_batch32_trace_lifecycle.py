@@ -121,3 +121,43 @@ def test_generate_streaming_releases_leftover_trace_before_and_after_run(monkeyp
     assert counters["clear_host_decode_cache"] == 1
     assert counters["prefill"] == 1
     assert counters["decode_untraced"] == 1
+
+
+def test_capture_trace_skips_warmup_for_previously_compiled_position(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    decode_calls = []
+
+    generator.device = object()
+    generator._trace_id = None
+    generator._trace_inputs = None
+    generator._trace_output = None
+    generator._trace_capture_pos = None
+    generator._warmed_trace_positions = {8}
+    generator._kv_caches = []
+
+    generator._allocate_decode_inputs = lambda: {
+        "embeds": object(),
+        "pos_tensor": object(),
+        "cos": object(),
+        "sin": object(),
+    }
+    generator._copy_decode_inputs = lambda *_args: None
+    generator._set_kv_cache_length = lambda _seq_len: None
+    generator._release_trace = lambda: None
+
+    def decode_step(*_args):
+        decode_calls.append("decode")
+        return object()
+
+    monkeypatch.setattr(generator, "_decode_step_batch32", decode_step)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "begin_trace_capture", lambda *_args, **_kwargs: 77)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "end_trace_capture", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "synchronize_device", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+
+    captured = generator._capture_trace(token_id=7, current_pos=8)
+
+    assert captured is True
+    assert decode_calls == ["decode"]
+    assert generator._trace_id == 77
+    assert generator._trace_capture_pos == 8

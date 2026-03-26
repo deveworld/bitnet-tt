@@ -385,6 +385,7 @@ class Batch32Generator:
         self._trace_inputs: Optional[dict] = None
         self._trace_output: Optional[ttnn.Tensor] = None
         self._trace_capture_pos: Optional[int] = None
+        self._warmed_trace_positions: set[int] = set()
         self._decode_inputs: Optional[dict] = None
         self._embed_host_cache: dict[int, ttnn.Tensor] = {}
         self._pos_host_cache: dict[int, ttnn.Tensor] = {}
@@ -669,20 +670,21 @@ class Batch32Generator:
 
         self._trace_inputs = self._allocate_decode_inputs()
         self._copy_decode_inputs(self._trace_inputs, token_id, current_pos)
-        saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
+        if current_pos not in self._warmed_trace_positions:
+            saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
 
-        warmup_logits = self._decode_step_batch32(
-            self._trace_inputs["embeds"],
-            current_pos,
-            self._trace_inputs["pos_tensor"],
-            self._trace_inputs["cos"],
-            self._trace_inputs["sin"],
-        )
-        self._set_kv_cache_length(current_pos + 1)
-        ttnn.deallocate(warmup_logits)
-        for cache, saved_len in zip(self._kv_caches or [], saved_seq_len):
-            cache.seq_len_cached = saved_len
-        ttnn.synchronize_device(self.device)
+            warmup_logits = self._decode_step_batch32(
+                self._trace_inputs["embeds"],
+                current_pos,
+                self._trace_inputs["pos_tensor"],
+                self._trace_inputs["cos"],
+                self._trace_inputs["sin"],
+            )
+            self._set_kv_cache_length(current_pos + 1)
+            ttnn.deallocate(warmup_logits)
+            for cache, saved_len in zip(self._kv_caches or [], saved_seq_len):
+                cache.seq_len_cached = saved_len
+            ttnn.synchronize_device(self.device)
 
         self._trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
 
@@ -698,6 +700,7 @@ class Batch32Generator:
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
         self._trace_capture_pos = current_pos
+        self._warmed_trace_positions.add(current_pos)
         return True
 
     def _execute_trace(
