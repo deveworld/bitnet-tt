@@ -466,7 +466,7 @@ class Batch32Generator:
         This is the core optimized decode that can be traced.
 
         Args:
-            token_embeds: [1, 32, hidden_size] token embeddings (seq=32 virtual batch)
+            token_embeds: [1, 1, 32, hidden_size] token embeddings in 1BKD format
             current_pos: Current decode position
             current_pos_tensor: INT32 tensor for KV cache update
             cos: HEIGHT_SHARDED cos tensor [1, 32, 1, head_dim]
@@ -485,22 +485,16 @@ class Batch32Generator:
             # Input LayerNorm
             normed = layer.input_layernorm(hidden)
 
-            # Reshape for fused QKV: [1, 32, hidden] -> [1, 1, 32, hidden]
-            # Use [1, 32, hidden] instead of [32, 1, hidden] to avoid layout conversion hang
-            normed_rm = ttnn.to_layout(normed, ttnn.ROW_MAJOR_LAYOUT)
-            normed_1bkd = ttnn.reshape(normed_rm, (1, 1, PADDED_BATCH, self.config.hidden_size))
-            normed_1bkd = ttnn.to_layout(normed_1bkd, ttnn.TILE_LAYOUT)
-
             # Fused QKV matmul
             attention = layer.self_attn
             if self._decode_matmul_kernel_config is not None:
                 qkv_fused = ttnn.matmul(
-                    normed_1bkd,
+                    normed,
                     attention.qkv_fused_weight,
                     compute_kernel_config=self._decode_matmul_kernel_config,
                 )
             else:
-                qkv_fused = ttnn.matmul(normed_1bkd, attention.qkv_fused_weight)
+                qkv_fused = ttnn.matmul(normed, attention.qkv_fused_weight)
             attn_output_proj, _ = attention._forward_decode_1bkd(
                 qkv_fused,
                 kv_cache,
@@ -511,18 +505,15 @@ class Batch32Generator:
             )
             ttnn.deallocate(normed)
 
-            attn_output_rm = ttnn.to_layout(attn_output_proj, ttnn.ROW_MAJOR_LAYOUT)
-            attn_output_3d = ttnn.reshape(
-                attn_output_rm,
-                (1, PADDED_BATCH, self.config.hidden_size),
+            attn_output_1bkd = ttnn.reshape(
+                attn_output_proj,
+                (1, 1, PADDED_BATCH, self.config.hidden_size),
             )
-            attn_output_3d = ttnn.to_layout(attn_output_3d, ttnn.TILE_LAYOUT)
             ttnn.deallocate(attn_output_proj)
-            ttnn.deallocate(attn_output_rm)
 
             # Residual
-            hidden_attn = ttnn.add(hidden, attn_output_3d)
-            ttnn.deallocate(attn_output_3d)
+            hidden_attn = ttnn.add(hidden, attn_output_1bkd)
+            ttnn.deallocate(attn_output_1bkd)
 
             # FFN
             residual = hidden_attn
@@ -535,18 +526,14 @@ class Batch32Generator:
             if layer_idx > 0:
                 ttnn.deallocate(prev_hidden)
 
-            # Cleanup intermediate tensors
-            ttnn.deallocate(normed_rm)
-            ttnn.deallocate(normed_1bkd)
-
         # Final norm + LM head
         hidden = self.model.norm(hidden)
         # Only batch row 0 contributes to user-visible output. Running the LM
         # head on all 32 padded rows adds unnecessary decode work.
         hidden_single = ttnn.slice(
             hidden,
-            [0, 0, 0],
-            [1, 1, self.config.hidden_size],
+            [0, 0, 0, 0],
+            [1, 1, 1, self.config.hidden_size],
         )
         if self._decode_matmul_kernel_config is not None:
             logits = ttnn.matmul(
@@ -557,6 +544,7 @@ class Batch32Generator:
         else:
             logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
         ttnn.deallocate(hidden_single)
+        logits = ttnn.reshape(logits, (1, 1, self.config.vocab_size))
 
         return logits
 
@@ -569,7 +557,7 @@ class Batch32Generator:
 
     def _allocate_decode_inputs(self) -> dict:
         """Pre-allocate persistent decode input tensors on device."""
-        embed_shape = (1, PADDED_BATCH, self.config.hidden_size)
+        embed_shape = (1, 1, PADDED_BATCH, self.config.hidden_size)
         pos_shape = (PADDED_BATCH,)
 
         embeds = ttnn.from_torch(
@@ -603,8 +591,10 @@ class Batch32Generator:
         if cached is not None:
             return cached
 
-        embed_padded = torch.zeros((1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16)
-        embed_padded[0, 0, :] = self._embedding_weight_host[token_id]
+        embed_padded = torch.zeros(
+            (1, 1, PADDED_BATCH, self.config.hidden_size), dtype=torch.bfloat16
+        )
+        embed_padded[0, 0, 0, :] = self._embedding_weight_host[token_id]
         embed_host = ttnn.from_torch(
             embed_padded,
             dtype=ttnn.bfloat16,

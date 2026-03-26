@@ -82,8 +82,8 @@ def test_batch32_decode_step():
         generator = Batch32Generator(model, enable_trace=False)
         generator._kv_caches = generator._allocate_kv_caches(max_seq_len=256)
 
-        embed_padded = torch.zeros((1, PADDED_BATCH, config.hidden_size), dtype=torch.bfloat16)
-        embed_padded[0, 0, :] = generator._embedding_weight_host[1234]
+        embed_padded = torch.zeros((1, 1, PADDED_BATCH, config.hidden_size), dtype=torch.bfloat16)
+        embed_padded[0, 0, 0, :] = generator._embedding_weight_host[1234]
         embeds = ttnn.from_torch(
             embed_padded,
             dtype=ttnn.bfloat16,
