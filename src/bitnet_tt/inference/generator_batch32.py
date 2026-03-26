@@ -902,6 +902,9 @@ class Batch32Generator:
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
 
+        if self._trace_id is not None:
+            self._release_trace()
+
         # Tokenize
         inputs = self.tokenizer(prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
@@ -958,6 +961,7 @@ class Batch32Generator:
                     break
 
         finally:
+            self._release_trace()
             self._release_decode_inputs()
             self._clear_host_decode_cache()
 
@@ -977,6 +981,9 @@ class Batch32Generator:
         """
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
+
+        if self._trace_id is not None:
+            self._release_trace()
 
         stats = GenerationStats()
 
@@ -1072,6 +1079,7 @@ class Batch32Generator:
                     break
 
         finally:
+            self._release_trace()
             self._release_decode_inputs()
             self._clear_host_decode_cache()
 
