@@ -155,10 +155,6 @@ class TextGenerator:
 
         self._preallocated_kv_caches: Optional[list[KVCache]] = None
 
-        self._embedding_weight_host: Optional[torch.Tensor] = None
-        if enable_trace:
-            self._embedding_weight_host = ttnn.to_torch(model.embed_tokens.weight)
-
         if self.tokenizer is None:
             self._load_default_tokenizer()
 
@@ -200,6 +196,10 @@ class TextGenerator:
                 max_seq_len=max_seq_len,
                 head_dim=self.config.head_dim,
                 device=self.device,
+                # Non-paged decode updates the cache with raw KV heads, so the
+                # preallocated cache must match num_key_value_heads. Paged trace
+                # mode handles its own 32-head padding internally.
+                num_heads=None,
                 use_paged=use_paged,
             )
             caches.append(cache)
@@ -272,6 +272,132 @@ class TextGenerator:
                 cache._gqa_expanded = True
 
         return logits, kv_cache
+
+    def _ensure_preallocated_kv_caches(
+        self,
+        *,
+        use_paged: bool,
+        max_seq_len: int,
+    ) -> list[KVCache]:
+        """Allocate or refresh preallocated KV caches for the requested decode mode."""
+        needs_realloc = self._preallocated_kv_caches is None
+        if not needs_realloc and self._preallocated_kv_caches:
+            sample_cache = self._preallocated_kv_caches[0]
+            needs_realloc = (
+                getattr(sample_cache, "_use_paged", False) != use_paged
+                or sample_cache.max_seq_len != max_seq_len
+            )
+        if needs_realloc:
+            self._preallocated_kv_caches = self._preallocate_kv_caches(
+                use_paged=use_paged,
+                max_seq_len=max_seq_len,
+            )
+        return self._preallocated_kv_caches
+
+    def _transfer_prefill_to_preallocated_cache(
+        self,
+        model_kv_caches: list[KVCache],
+        seq_len: int,
+        max_seq_len: int,
+        *,
+        use_paged: bool,
+    ) -> list[KVCache]:
+        """
+        Convert regular prefill KV caches into decode-optimized preallocated caches.
+
+        Regular prefill stores GQA-expanded heads for concat-style decode.
+        Optimized decode wants base KV heads, optionally padded to 32 for paged mode.
+        """
+        preallocated_caches = self._ensure_preallocated_kv_caches(
+            use_paged=use_paged,
+            max_seq_len=max_seq_len,
+        )
+
+        num_q_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
+        num_kv_groups = num_q_heads // num_kv_heads
+
+        for layer_idx, model_cache in enumerate(model_kv_caches):
+            if model_cache is None or model_cache.key_cache is None:
+                continue
+
+            target_cache = preallocated_caches[layer_idx]
+            k_torch = ttnn.to_torch(model_cache.key_cache)
+            v_torch = ttnn.to_torch(model_cache.value_cache)
+
+            if k_torch.shape[1] == num_q_heads:
+                k_torch = k_torch[:, ::num_kv_groups, :, :].contiguous()
+            elif k_torch.shape[1] != num_kv_heads:
+                raise ValueError(
+                    f"Unexpected prefill K head count: {k_torch.shape[1]} "
+                    f"(expected {num_q_heads} or {num_kv_heads})"
+                )
+
+            if v_torch.shape[1] == num_q_heads:
+                v_torch = v_torch[:, ::num_kv_groups, :, :].contiguous()
+            elif v_torch.shape[1] != num_kv_heads:
+                raise ValueError(
+                    f"Unexpected prefill V head count: {v_torch.shape[1]} "
+                    f"(expected {num_q_heads} or {num_kv_heads})"
+                )
+
+            target_heads = target_cache.key_cache.shape[1]
+            k_padded = torch.zeros(
+                (
+                    target_cache.batch_size,
+                    target_heads,
+                    target_cache.max_seq_len,
+                    self.config.head_dim,
+                ),
+                dtype=torch.bfloat16,
+            )
+            v_padded = torch.zeros_like(k_padded)
+
+            actual_batch = min(k_torch.shape[0], target_cache.batch_size)
+            actual_heads = min(k_torch.shape[1], num_kv_heads)
+            actual_seq = min(k_torch.shape[2], seq_len)
+
+            k_padded[:actual_batch, :actual_heads, :actual_seq, :] = k_torch[
+                :actual_batch, :actual_heads, :actual_seq, :
+            ]
+            v_padded[:actual_batch, :actual_heads, :actual_seq, :] = v_torch[
+                :actual_batch, :actual_heads, :actual_seq, :
+            ]
+
+            ttnn.deallocate(target_cache.key_cache)
+            ttnn.deallocate(target_cache.value_cache)
+
+            target_cache.key_cache = ttnn.from_torch(
+                k_padded,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            target_cache.value_cache = ttnn.from_torch(
+                v_padded,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            target_cache.seq_len_cached = seq_len
+
+        return preallocated_caches
+
+    def _transfer_prefill_to_trace_cache(
+        self,
+        model_kv_caches: list[KVCache],
+        seq_len: int,
+        max_seq_len: int,
+    ) -> list[KVCache]:
+        """Convert regular prefill KV caches into paged caches for traced decode."""
+        return self._transfer_prefill_to_preallocated_cache(
+            model_kv_caches,
+            seq_len,
+            max_seq_len,
+            use_paged=True,
+        )
 
     def decode_forward(
         self,
@@ -430,24 +556,18 @@ class TextGenerator:
         Execute the captured decode trace with new input.
 
         Updates trace inputs:
-        1. Recompute embedding on HOST and copy to device tensor
+        1. Recompute embedding on device outside trace and copy to trace input
         2. Position tensor (int32) for KV cache
         3. Pre-computed cos/sin tensors for RoPE
         """
         if token.dtype != np.int32:
             token = token.astype(np.int32)
 
-        token_idx = token.flatten()[0]
-        embed_vec = (
-            self._embedding_weight_host[token_idx].unsqueeze(0).unsqueeze(0).to(torch.bfloat16)
-        )
-        new_embeds_host = ttnn.from_torch(
-            embed_vec,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=None,
-        )
-        ttnn.copy_host_to_device_tensor(new_embeds_host, self._trace_inputs["embeds"])
+        trace_input_ids = numpy_int_to_ttnn(token, self.device)
+        new_embeds_device = self.model.embed_tokens(trace_input_ids)
+        ttnn.copy(new_embeds_device, self._trace_inputs["embeds"])
+        ttnn.deallocate(new_embeds_device)
+        ttnn.deallocate(trace_input_ids)
 
         new_pos_int32 = ttnn.from_torch(
             torch.tensor([current_pos], dtype=torch.int32),
@@ -544,12 +664,21 @@ class TextGenerator:
         # Reset trace for new generation
         self.reset_trace()
 
-        use_prealloc = use_optimized or self.enable_trace
+        use_prealloc = False
         padded_seq_len = ((seq_len + max_new_tokens + 31) // 32) * 32
         max_seq_len = min(self.config.max_position_embeddings, padded_seq_len)
         logits, kv_cache = self.prefill_forward(
             input_ids, use_preallocated=use_prealloc, max_seq_len=max_seq_len
         )
+        if self.enable_trace:
+            kv_cache = self._transfer_prefill_to_trace_cache(kv_cache, seq_len, max_seq_len)
+        elif use_optimized:
+            kv_cache = self._transfer_prefill_to_preallocated_cache(
+                kv_cache,
+                seq_len,
+                max_seq_len,
+                use_paged=False,
+            )
 
         next_token = self._sample_next_token(logits, temperature, top_k, do_sample)
         ttnn.deallocate(logits)
@@ -745,12 +874,21 @@ class TextGenerator:
         self.reset_trace()
 
         prefill_start = time.perf_counter()
-        use_prealloc = use_optimized or self.enable_trace
+        use_prealloc = False
         padded_seq_len = ((seq_len + max_new_tokens + 31) // 32) * 32
         max_seq_len = min(self.config.max_position_embeddings, padded_seq_len)
         logits, kv_cache = self.prefill_forward(
             input_ids, use_preallocated=use_prealloc, max_seq_len=max_seq_len
         )
+        if self.enable_trace:
+            kv_cache = self._transfer_prefill_to_trace_cache(kv_cache, seq_len, max_seq_len)
+        elif use_optimized:
+            kv_cache = self._transfer_prefill_to_preallocated_cache(
+                kv_cache,
+                seq_len,
+                max_seq_len,
+                use_paged=False,
+            )
         prefill_end = time.perf_counter()
         stats.prompt_time = prefill_end - prefill_start
 
