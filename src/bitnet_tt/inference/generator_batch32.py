@@ -385,7 +385,7 @@ class Batch32Generator:
         self._trace_inputs: Optional[dict] = None
         self._trace_output: Optional[ttnn.Tensor] = None
         self._trace_capture_pos: Optional[int] = None
-        self._warmed_trace_positions: set[int] = set()
+        self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
         self._embed_host_cache: dict[int, ttnn.Tensor] = {}
         self._pos_host_cache: dict[int, ttnn.Tensor] = {}
@@ -670,7 +670,11 @@ class Batch32Generator:
 
         self._trace_inputs = self._allocate_decode_inputs()
         self._copy_decode_inputs(self._trace_inputs, token_id, current_pos)
-        if current_pos not in self._warmed_trace_positions:
+        cache_key = (
+            current_pos,
+            self._kv_caches[0].max_seq_len if self._kv_caches else 0,
+        )
+        if cache_key not in self._warmed_trace_keys:
             saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
 
             warmup_logits = self._decode_step_batch32(
@@ -700,7 +704,7 @@ class Batch32Generator:
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
         ttnn.synchronize_device(self.device)
         self._trace_capture_pos = current_pos
-        self._warmed_trace_positions.add(current_pos)
+        self._warmed_trace_keys.add(cache_key)
         return True
 
     def _execute_trace(
