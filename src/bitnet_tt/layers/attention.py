@@ -1334,13 +1334,15 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
-        # 7. Convert SDPA output back to the standard decode layout. The fully
-        # sharded concat path is not stable for BitNet's 20-head configuration,
-        # so fall back to the same reshape pattern used by the working BKSD path.
-        attn_output = ttnn.permute(attn_output_1bkd, (1, 2, 0, 3))
+        # 7. Keep SDPA output in 1BKD form to avoid extra decode-time
+        # permute/transpose churn between attention and the next layer.
+        padded_batch = ((batch_size + 31) // 32) * 32
+        attn_output = ttnn.reshape(
+            attn_output_1bkd,
+            (1, 1, batch_size, self.hidden_size),
+            (1, 1, padded_batch, self.hidden_size),
+        )
         ttnn.deallocate(attn_output_1bkd)
-        attn_output = ttnn.transpose(attn_output, 1, 2)
-        attn_output = ttnn.reshape(attn_output, (batch_size, 1, self.hidden_size))
 
         # 8. Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)

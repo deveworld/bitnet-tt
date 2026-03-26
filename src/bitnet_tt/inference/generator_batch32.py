@@ -505,15 +505,9 @@ class Batch32Generator:
             )
             ttnn.deallocate(normed)
 
-            attn_output_1bkd = ttnn.reshape(
-                attn_output_proj,
-                (1, 1, PADDED_BATCH, self.config.hidden_size),
-            )
-            ttnn.deallocate(attn_output_proj)
-
             # Residual
-            hidden_attn = ttnn.add(hidden, attn_output_1bkd)
-            ttnn.deallocate(attn_output_1bkd)
+            hidden_attn = ttnn.add(hidden, attn_output_proj)
+            ttnn.deallocate(attn_output_proj)
 
             # FFN
             residual = hidden_attn
