@@ -1258,8 +1258,26 @@ class MultiHeadAttention:
         active_seq_len = current_pos + 1
         padded_seq_len = ((active_seq_len + 31) // 32) * 32
         padded_seq_len = min(padded_seq_len, past_key_value.key_cache.shape[2])
-        key_cache_for_sdpa = past_key_value.key_cache[:, :, :padded_seq_len, :]
-        value_cache_for_sdpa = past_key_value.value_cache[:, :, :padded_seq_len, :]
+        key_cache_for_sdpa = ttnn.slice(
+            past_key_value.key_cache,
+            (0, 0, 0, 0),
+            (
+                past_key_value.key_cache.shape[0],
+                self.num_kv_heads,
+                padded_seq_len,
+                past_key_value.key_cache.shape[3],
+            ),
+        )
+        value_cache_for_sdpa = ttnn.slice(
+            past_key_value.value_cache,
+            (0, 0, 0, 0),
+            (
+                past_key_value.value_cache.shape[0],
+                self.num_kv_heads,
+                padded_seq_len,
+                past_key_value.value_cache.shape[3],
+            ),
+        )
 
         attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
             q_heads_dram,
@@ -1270,6 +1288,8 @@ class MultiHeadAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(q_heads_dram)
+        ttnn.deallocate(key_cache_for_sdpa)
+        ttnn.deallocate(value_cache_for_sdpa)
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
