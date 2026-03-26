@@ -762,9 +762,10 @@ class Batch32Generator:
         top_k: Optional[int] = 50,
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
-        logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        last_logits = logits_rm[:1, -1:, :]
-        logits_np = ttnn.to_torch(last_logits).float().numpy().flatten()
+        # Avoid allocating new device buffers while a trace is active.
+        logits_torch = ttnn.to_torch(logits).float()
+        last_logits = logits_torch[0, -1, :]
+        logits_np = last_logits.numpy()
 
         if temperature != 1.0:
             logits_np = logits_np / temperature
