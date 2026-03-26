@@ -784,65 +784,59 @@ class Batch32Generator:
             if hasattr(model_cache, "key_cache") and model_cache.key_cache is not None:
                 k_prefill = model_cache.key_cache
                 v_prefill = model_cache.value_cache
-
-                k_torch = ttnn.to_torch(k_prefill)
-                v_torch = ttnn.to_torch(v_prefill)
-                if k_torch.shape[1] == num_q_heads:
-                    k_torch = k_torch[:, ::num_kv_groups, :, :].contiguous()
-                elif k_torch.shape[1] != num_kv_heads:
+                created_compact = False
+                if k_prefill.shape[1] == num_q_heads:
+                    # Prefill stores GQA-expanded KV heads. Collapse them back to
+                    # real KV heads on host, then upload only the compact tensor.
+                    k_torch = ttnn.to_torch(k_prefill)[:, ::num_kv_groups, :, :].contiguous()
+                    v_torch = ttnn.to_torch(v_prefill)[:, ::num_kv_groups, :, :].contiguous()
+                    k_compact = ttnn.from_torch(
+                        k_torch,
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=self.device,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    )
+                    v_compact = ttnn.from_torch(
+                        v_torch,
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=self.device,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    )
+                    created_compact = True
+                elif k_prefill.shape[1] == num_kv_heads:
+                    k_compact = k_prefill
+                    v_compact = v_prefill
+                else:
                     raise ValueError(
-                        f"Unexpected prefill K head count: {k_torch.shape[1]} "
+                        f"Unexpected prefill K/V head count: {k_prefill.shape[1]} "
                         f"(expected {num_q_heads} or {num_kv_heads})"
                     )
 
-                if v_torch.shape[1] == num_q_heads:
-                    v_torch = v_torch[:, ::num_kv_groups, :, :].contiguous()
-                elif v_torch.shape[1] != num_kv_heads:
-                    raise ValueError(
-                        f"Unexpected prefill V head count: {v_torch.shape[1]} "
-                        f"(expected {num_q_heads} or {num_kv_heads})"
-                    )
+                if batch32_cache.key_cache.shape[1] > k_compact.shape[1]:
+                    pad_amount = batch32_cache.key_cache.shape[1] - k_compact.shape[1]
+                    k_upload = ttnn.pad(k_compact, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
+                    v_upload = ttnn.pad(v_compact, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
+                    padded_upload = True
+                else:
+                    k_upload = k_compact
+                    v_upload = v_compact
+                    padded_upload = False
 
-                k_padded = torch.zeros(
-                    (
-                        PADDED_BATCH,
-                        batch32_cache.key_cache.shape[1],
-                        batch32_cache.max_seq_len,
-                        self.config.head_dim,
-                    ),
-                    dtype=torch.bfloat16,
-                )
-                v_padded = torch.zeros_like(k_padded)
+                actual_batch = min(k_upload.shape[0], PADDED_BATCH)
+                for batch_idx in range(actual_batch):
+                    k_batch = k_upload[batch_idx : batch_idx + 1, :, :, :]
+                    v_batch = v_upload[batch_idx : batch_idx + 1, :, :, :]
+                    batch32_cache.key_cache = ttnn.fill_cache(batch32_cache.key_cache, k_batch, batch_idx)
+                    batch32_cache.value_cache = ttnn.fill_cache(batch32_cache.value_cache, v_batch, batch_idx)
 
-                actual_batch = min(k_torch.shape[0], PADDED_BATCH)
-                actual_heads = min(k_torch.shape[1], self.config.num_key_value_heads)
-                actual_seq = min(k_torch.shape[2], seq_len)
-
-                k_padded[:actual_batch, :actual_heads, :actual_seq, :] = k_torch[
-                    :actual_batch, :actual_heads, :actual_seq, :
-                ]
-                v_padded[:actual_batch, :actual_heads, :actual_seq, :] = v_torch[
-                    :actual_batch, :actual_heads, :actual_seq, :
-                ]
-
-                ttnn.deallocate(batch32_cache.key_cache)
-                ttnn.deallocate(batch32_cache.value_cache)
-
-                batch32_cache.key_cache = ttnn.from_torch(
-                    k_padded,
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    device=self.device,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-                batch32_cache.value_cache = ttnn.from_torch(
-                    v_padded,
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    device=self.device,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-
+                if padded_upload:
+                    ttnn.deallocate(k_upload)
+                    ttnn.deallocate(v_upload)
+                if created_compact:
+                    ttnn.deallocate(k_compact)
+                    ttnn.deallocate(v_compact)
                 batch32_cache.seq_len_cached = seq_len
 
     def _sample_token(
