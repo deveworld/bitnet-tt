@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import numpy as np
 
 import bitnet_tt.inference.generator_batch32 as generator_batch32_module
-from bitnet_tt.inference.generator_batch32 import Batch32Generator
+from bitnet_tt.inference.generator_batch32 import Batch32Generator, choose_trace_cache_seq_len
+
+
+def test_choose_trace_cache_seq_len_buckets_small_requests_together() -> None:
+    assert choose_trace_cache_seq_len(77) == 128
+    assert choose_trace_cache_seq_len(109) == 128
+    assert choose_trace_cache_seq_len(129) == 192
 
 
 class _FakeTokenizer:

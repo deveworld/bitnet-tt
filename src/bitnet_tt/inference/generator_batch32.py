@@ -35,11 +35,30 @@ if TYPE_CHECKING:
 
 PADDED_BATCH = 32
 TILE_SIZE = 32
+TRACE_CACHE_BUCKET = 64
+MIN_TRACE_CACHE_SEQ_LEN = 128
 
 
 def round_up_to_tile(value: int, tile: int = TILE_SIZE) -> int:
     """Round an integer up to the next tile multiple."""
     return ((value + tile - 1) // tile) * tile
+
+
+def choose_trace_cache_seq_len(
+    requested_seq_len: int,
+    bucket: int = TRACE_CACHE_BUCKET,
+    min_seq_len: int = MIN_TRACE_CACHE_SEQ_LEN,
+) -> int:
+    """
+    Bucket cache capacity so nearby requests reuse the same trace programs.
+
+    Small prompt sizes otherwise bounce between capacities like 96 and 128,
+    which forces another trace warmup/compile pass even though the active
+    decode length is nearly identical.
+    """
+    rounded = round_up_to_tile(requested_seq_len)
+    rounded = max(rounded, min_seq_len)
+    return round_up_to_tile(rounded, bucket)
 
 
 @dataclass
@@ -925,7 +944,7 @@ class Batch32Generator:
         input_ids = inputs["input_ids"]
 
         # Allocate caches
-        max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
+        max_seq_len = choose_trace_cache_seq_len(input_ids.shape[1] + max_new_tokens + 32)
         self._ensure_kv_caches(max_seq_len)
 
         # Prefill
@@ -1008,7 +1027,7 @@ class Batch32Generator:
         stats.prompt_tokens = input_ids.shape[1]
 
         # Allocate caches
-        max_seq_len = round_up_to_tile(input_ids.shape[1] + max_new_tokens + 32)
+        max_seq_len = choose_trace_cache_seq_len(input_ids.shape[1] + max_new_tokens + 32)
         self._ensure_kv_caches(max_seq_len)
 
         # Prefill
