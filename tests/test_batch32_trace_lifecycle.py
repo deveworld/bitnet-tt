@@ -129,6 +129,23 @@ def test_generate_streaming_releases_leftover_trace_before_and_after_run(monkeyp
     assert counters["decode_untraced"] == 1
 
 
+def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
+    generator, counters = _make_stub_generator(enable_trace=False)
+    requested = []
+
+    def record_requested(requested_seq_len: int, bucket: int = 64, min_seq_len: int = 128) -> int:
+        requested.append((requested_seq_len, bucket, min_seq_len))
+        return 128
+
+    monkeypatch.setattr(generator_batch32_module, "choose_trace_cache_seq_len", record_requested)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+
+    generator.generate("hello", max_new_tokens=32)
+
+    assert requested == [(35, 64, 128)]
+    assert counters["ensure_kv_caches"] == 1
+
+
 def test_capture_trace_skips_warmup_for_previously_compiled_position(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     decode_calls = []

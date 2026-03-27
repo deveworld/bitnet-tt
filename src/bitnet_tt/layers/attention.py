@@ -75,7 +75,7 @@ class KVCache:
             num_heads: Full head count for GQA expansion. If provided,
                        cache is pre-expanded to [batch, num_heads, max_seq, head_dim]
                        to avoid per-token GQA expansion during decode.
-            use_paged: If True, use 32 padded heads for paged_update_cache (Trace compatible)
+            use_paged: If True, allocate DRAM cache for paged_update_cache updates
         """
         self.batch_size = batch_size
         self.num_kv_heads = num_kv_heads
@@ -86,8 +86,9 @@ class KVCache:
 
         # Determine cache head count
         if use_paged:
-            # Padded to 32 heads for paged_update_cache (HEIGHT_SHARDED requirement)
-            cache_heads = 32
+            # Batch-32 decode already provides enough height for paged cache updates,
+            # so keep the cache compact in KV-head space and avoid per-token head slicing.
+            cache_heads = num_kv_heads
             self.num_heads = num_heads if num_heads is not None else num_kv_heads
             self._gqa_expanded = False
         elif num_heads is not None:
@@ -1330,34 +1331,41 @@ class MultiHeadAttention:
         q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(q_heads_1bkd)
 
-        # Limit the visible cache length to a 32-token tile multiple. The
-        # decode kernel derives its K chunk size from the cache sequence length,
-        # so exposing the full over-allocated cache (for example 36 tokens)
-        # makes TT-NN choose a non-tile chunk size and fail.
+        # Limit the visible cache length to a 32-token tile multiple. When the
+        # backing cache already matches that compact logical view, reuse it
+        # directly to avoid per-token K/V slice overhead in every layer.
         active_seq_len = current_pos + 1
         padded_seq_len = ((active_seq_len + 31) // 32) * 32
         padded_seq_len = min(padded_seq_len, past_key_value.key_cache.shape[2])
         sdpa_program_config = self._get_sdpa_decode_program_config(active_seq_len, padded_seq_len)
-        key_cache_for_sdpa = ttnn.slice(
-            past_key_value.key_cache,
-            (0, 0, 0, 0),
-            (
-                past_key_value.key_cache.shape[0],
-                self.num_kv_heads,
-                padded_seq_len,
-                past_key_value.key_cache.shape[3],
-            ),
+        can_reuse_full_cache = (
+            past_key_value.key_cache.shape[1] == self.num_kv_heads
+            and past_key_value.key_cache.shape[2] == padded_seq_len
         )
-        value_cache_for_sdpa = ttnn.slice(
-            past_key_value.value_cache,
-            (0, 0, 0, 0),
-            (
-                past_key_value.value_cache.shape[0],
-                self.num_kv_heads,
-                padded_seq_len,
-                past_key_value.value_cache.shape[3],
-            ),
-        )
+        if can_reuse_full_cache:
+            key_cache_for_sdpa = past_key_value.key_cache
+            value_cache_for_sdpa = past_key_value.value_cache
+        else:
+            key_cache_for_sdpa = ttnn.slice(
+                past_key_value.key_cache,
+                (0, 0, 0, 0),
+                (
+                    past_key_value.key_cache.shape[0],
+                    self.num_kv_heads,
+                    padded_seq_len,
+                    past_key_value.key_cache.shape[3],
+                ),
+            )
+            value_cache_for_sdpa = ttnn.slice(
+                past_key_value.value_cache,
+                (0, 0, 0, 0),
+                (
+                    past_key_value.value_cache.shape[0],
+                    self.num_kv_heads,
+                    padded_seq_len,
+                    past_key_value.value_cache.shape[3],
+                ),
+            )
         attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
             q_heads_dram,
             key_cache_for_sdpa,
@@ -1369,8 +1377,9 @@ class MultiHeadAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(q_heads_dram)
-        ttnn.deallocate(key_cache_for_sdpa)
-        ttnn.deallocate(value_cache_for_sdpa)
+        if not can_reuse_full_cache:
+            ttnn.deallocate(key_cache_for_sdpa)
+            ttnn.deallocate(value_cache_for_sdpa)
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 

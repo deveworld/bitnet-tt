@@ -37,6 +37,7 @@ PADDED_BATCH = 32
 TILE_SIZE = 32
 TRACE_CACHE_BUCKET = 64
 MIN_TRACE_CACHE_SEQ_LEN = 128
+TRACE_CACHE_SLACK_TOKENS = 1
 
 
 def round_up_to_tile(value: int, tile: int = TILE_SIZE) -> int:
@@ -944,7 +945,9 @@ class Batch32Generator:
         input_ids = inputs["input_ids"]
 
         # Allocate caches
-        max_seq_len = choose_trace_cache_seq_len(input_ids.shape[1] + max_new_tokens + 32)
+        max_seq_len = choose_trace_cache_seq_len(
+            input_ids.shape[1] + max_new_tokens + TRACE_CACHE_SLACK_TOKENS
+        )
         self._ensure_kv_caches(max_seq_len)
 
         # Prefill
@@ -1027,7 +1030,9 @@ class Batch32Generator:
         stats.prompt_tokens = input_ids.shape[1]
 
         # Allocate caches
-        max_seq_len = choose_trace_cache_seq_len(input_ids.shape[1] + max_new_tokens + 32)
+        max_seq_len = choose_trace_cache_seq_len(
+            input_ids.shape[1] + max_new_tokens + TRACE_CACHE_SLACK_TOKENS
+        )
         self._ensure_kv_caches(max_seq_len)
 
         # Prefill
