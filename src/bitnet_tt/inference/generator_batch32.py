@@ -627,9 +627,9 @@ class Batch32Generator:
         self._cached_prefill_logits = None
         self._cached_prefill_cache_seq_len = 0
 
-    def _make_prefill_cache_key(self, input_ids: NDArray[np.int64], max_seq_len: int) -> tuple[int, ...]:
-        """Key prompt-prefill reuse by prompt tokens and allocated cache capacity."""
-        return (max_seq_len, *map(int, input_ids.reshape(-1)))
+    def _make_prefill_cache_key(self, input_ids: NDArray[np.int64]) -> tuple[int, ...]:
+        """Key prompt-prefill reuse by prompt tokens only."""
+        return tuple(map(int, input_ids.reshape(-1)))
 
     def _try_reuse_prefill(
         self,
@@ -640,15 +640,18 @@ class Batch32Generator:
         if (
             self._cached_prefill_logits is None
             or self._cached_prefill_key is None
-            or self._cached_prefill_cache_seq_len != max_seq_len
             or self._kv_caches is None
+            or len(self._kv_caches) == 0
         ):
             return None
 
-        if any(cache.max_seq_len < max_seq_len for cache in self._kv_caches):
+        current_cache_capacity = min(cache.max_seq_len for cache in self._kv_caches)
+        if current_cache_capacity < max_seq_len:
+            return None
+        if self._cached_prefill_cache_seq_len != current_cache_capacity:
             return None
 
-        cache_key = self._make_prefill_cache_key(input_ids, max_seq_len)
+        cache_key = self._make_prefill_cache_key(input_ids)
         if cache_key != self._cached_prefill_key:
             return None
 
@@ -658,18 +661,19 @@ class Batch32Generator:
     def _cache_prefill(
         self,
         input_ids: NDArray[np.int64],
-        max_seq_len: int,
         logits: ttnn.Tensor,
         seq_len: int,
     ) -> None:
         """Keep the last prompt prefill around so repeat generations can skip prefill."""
-        cache_key = self._make_prefill_cache_key(input_ids, max_seq_len)
+        cache_key = self._make_prefill_cache_key(input_ids)
         if self._cached_prefill_logits is not None and self._cached_prefill_logits is not logits:
             ttnn.deallocate(self._cached_prefill_logits)
         self._cached_prefill_key = cache_key
         self._cached_prefill_seq_len = seq_len
         self._cached_prefill_logits = logits
-        self._cached_prefill_cache_seq_len = max_seq_len
+        self._cached_prefill_cache_seq_len = (
+            min(cache.max_seq_len for cache in self._kv_caches) if self._kv_caches else 0
+        )
 
     def _ensure_kv_caches(self, max_seq_len: int) -> None:
         """Reuse existing batch-32 caches when they are already large enough."""
@@ -1106,7 +1110,7 @@ class Batch32Generator:
         logits_owned = cached_prefill is None
         if cached_prefill is None:
             logits, seq_len = self._prefill_batch32(input_ids)
-            self._cache_prefill(input_ids, max_seq_len, logits, seq_len)
+            self._cache_prefill(input_ids, logits, seq_len)
             logits_owned = False
         else:
             logits, seq_len = cached_prefill
@@ -1191,7 +1195,7 @@ class Batch32Generator:
         logits_owned = cached_prefill is None
         if cached_prefill is None:
             logits, seq_len = self._prefill_batch32(input_ids)
-            self._cache_prefill(input_ids, max_seq_len, logits, seq_len)
+            self._cache_prefill(input_ids, logits, seq_len)
             logits_owned = False
         else:
             logits, seq_len = cached_prefill

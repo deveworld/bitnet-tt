@@ -82,6 +82,7 @@ def _make_stub_generator(enable_trace: bool = False) -> tuple[Batch32Generator, 
 
     def ensure_kv_caches(_max_seq_len: int) -> None:
         counters["ensure_kv_caches"] += 1
+        generator._kv_caches = [SimpleNamespace(max_seq_len=_max_seq_len, seq_len_cached=0)]
 
     def prefill_batch32(_input_ids):
         counters["prefill"] += 1
@@ -159,6 +160,25 @@ def test_generate_reuses_cached_prefill_for_identical_prompt(monkeypatch) -> Non
     assert second == "decoded"
     assert counters["prefill"] == 1
     assert counters["ensure_kv_caches"] == 2
+
+
+def test_try_reuse_prefill_allows_smaller_requests_on_existing_cache() -> None:
+    generator = object.__new__(Batch32Generator)
+    cached_logits = object()
+    input_ids = np.array([[11, 12]], dtype=np.int64)
+
+    generator._cached_prefill_key = (11, 12)
+    generator._cached_prefill_seq_len = 2
+    generator._cached_prefill_logits = cached_logits
+    generator._cached_prefill_cache_seq_len = 96
+    generator._kv_caches = [SimpleNamespace(max_seq_len=96, seq_len_cached=0)]
+    lengths = []
+    generator._set_kv_cache_length = lengths.append
+
+    reused = Batch32Generator._try_reuse_prefill(generator, input_ids, max_seq_len=64)
+
+    assert reused == (cached_logits, 2)
+    assert lengths == [2]
 
 
 def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
