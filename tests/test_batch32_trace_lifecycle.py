@@ -181,6 +181,40 @@ def test_try_reuse_prefill_allows_smaller_requests_on_existing_cache() -> None:
     assert lengths == [2]
 
 
+def test_prefill_batch32_uses_preallocated_caches(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    logits = object()
+    kv_caches = [SimpleNamespace(max_seq_len=96, seq_len_cached=0)]
+    calls = {}
+    lengths = []
+
+    generator.device = object()
+    generator._kv_caches = kv_caches
+    generator._set_kv_cache_length = lengths.append
+
+    def fake_model(**kwargs):
+        calls.update(kwargs)
+        return logits, kv_caches
+
+    generator.model = fake_model
+
+    fake_tokens_tt = object()
+    monkeypatch.setattr(generator_batch32_module.ttnn, "from_torch", lambda *args, **kwargs: fake_tokens_tt)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+
+    returned_logits, returned_seq_len = Batch32Generator._prefill_batch32(
+        generator, np.array([[11, 12, 13]], dtype=np.int64)
+    )
+
+    assert returned_logits is logits
+    assert returned_seq_len == 3
+    assert calls["past_key_values"] is kv_caches
+    assert calls["use_cache"] is True
+    assert calls["mode"] == "prefill"
+    assert calls["input_ids"] is fake_tokens_tt
+    assert lengths == [3]
+
+
 def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
     generator, counters = _make_stub_generator(enable_trace=False)
     requested = []
