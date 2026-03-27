@@ -5,6 +5,10 @@ This package provides an implementation of Microsoft's BitNet b1.58 architecture
 optimized for Tenstorrent's Blackhole accelerator using the TT-NN library.
 """
 
+from bitnet_tt._ttnn_config import prime_ttnn_config_overrides
+
+prime_ttnn_config_overrides()
+
 from bitnet_tt.config import BitNet2B4TConfig, BitNetConfig, BitNetMiniConfig
 from bitnet_tt.inference.generator import GenerationStats
 from bitnet_tt.layers.attention import KVCache
