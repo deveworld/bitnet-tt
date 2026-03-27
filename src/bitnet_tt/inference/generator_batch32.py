@@ -908,7 +908,7 @@ class Batch32Generator:
         tokens: NDArray[np.int64],
     ) -> Tuple[ttnn.Tensor, int]:
         """
-        Prefill phase using the pre-allocated batch32 caches directly.
+        Prefill phase - run with original batch size, then transfer to batch32 cache.
 
         Args:
             tokens: [1, seq_len] token IDs
@@ -925,13 +925,14 @@ class Batch32Generator:
             device=self.device,
         )
 
-        logits, _ = self.model(
+        logits, model_kv_caches = self.model(
             input_ids=tokens_tt,
-            past_key_values=self._kv_caches,
+            past_key_values=None,
             use_cache=True,
             mode="prefill",
         )
-        self._set_kv_cache_length(seq_len)
+
+        self._transfer_prefill_to_batch32_cache(model_kv_caches, seq_len)
 
         ttnn.deallocate(tokens_tt)
 
