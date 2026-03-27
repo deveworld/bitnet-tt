@@ -286,8 +286,9 @@ def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatc
         return torch.tensor([[[0.1, 0.9, 0.2]]], dtype=torch.float32)
 
     monkeypatch.setattr(generator_batch32_module.ttnn, "to_torch", fake_to_torch)
+    monkeypatch.setattr(torch, "multinomial", lambda probs, num_samples: torch.tensor([0], dtype=torch.int64))
 
-    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=2)
 
     assert token == 1
     assert generator._logits_host_tensor is host_tensor
@@ -315,12 +316,69 @@ def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
         return torch.tensor([[[0.1, 0.2, 0.8]]], dtype=torch.float32)
 
     monkeypatch.setattr(generator_batch32_module.ttnn, "to_torch", fake_to_torch)
+    monkeypatch.setattr(torch, "multinomial", lambda probs, num_samples: torch.tensor([0], dtype=torch.int64))
 
-    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=2)
 
     assert token == 2
     assert generator._supports_host_tensor_to_torch is True
     assert calls == [{"host_tensor": host_tensor}]
+
+
+def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    generator._logits_host_tensor = None
+    generator._logits_host_tensors = []
+    generator._supports_host_tensor_to_torch = None
+
+    class _FakeTensor:
+        def __init__(self, label: str):
+            self.label = label
+
+        def __getitem__(self, item):
+            return _FakeTensor(f"{self.label}[{item!r}]")
+
+        def __repr__(self) -> str:
+            return self.label
+
+    calls = []
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "ROW_MAJOR_LAYOUT", "row")
+    monkeypatch.setattr(generator_batch32_module.ttnn, "TILE_LAYOUT", "tile")
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "to_layout",
+        lambda tensor, layout: calls.append(("to_layout", repr(tensor), layout))
+        or _FakeTensor(f"{tensor.label}-{layout}"),
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "argmax",
+        lambda tensor, dim=-1: calls.append(("argmax", tensor, dim)) or "token_indices",
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "to_torch",
+        lambda tensor, **kwargs: calls.append(("to_torch", tensor, kwargs))
+        or torch.tensor([[[5]]], dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "deallocate",
+        lambda tensor: calls.append(("deallocate", tensor)),
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "allocate_tensor_on_host",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("host tensor should not be allocated")),
+    )
+
+    token = Batch32Generator._sample_token(generator, _FakeTensor("logits"), temperature=1.0, top_k=None)
+
+    assert token == 5
+    assert any(call[0] == "argmax" for call in calls)
+    assert generator._logits_host_tensors == []
 
 
 def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> None:
@@ -333,8 +391,6 @@ def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> 
 
     logits = SimpleNamespace(spec="new")
     new_host_tensor = object()
-    deallocated = []
-
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
         "allocate_tensor_on_host",
@@ -345,8 +401,9 @@ def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> 
         "to_torch",
         lambda tensor, **kwargs: torch.tensor([[[0.1, 0.7, 0.2]]], dtype=torch.float32),
     )
+    monkeypatch.setattr(torch, "multinomial", lambda probs, num_samples: torch.tensor([0], dtype=torch.int64))
 
-    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=2)
 
     assert token == 1
     assert generator._logits_host_tensor is new_host_tensor

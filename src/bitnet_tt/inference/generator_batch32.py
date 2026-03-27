@@ -74,6 +74,20 @@ def choose_single_user_cache_seq_len(requested_seq_len: int) -> int:
     )
 
 
+def _on_device_argmax_single(logits: ttnn.Tensor) -> int:
+    """Return the argmax token id while transferring only the final index."""
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    last_logits = logits_rm[:, -1:, :]
+    last_logits_tile = ttnn.to_layout(last_logits, ttnn.TILE_LAYOUT)
+    token_indices = ttnn.argmax(last_logits_tile, dim=-1)
+    token_id = int(ttnn.to_torch(token_indices).numpy().reshape(-1)[0])
+    ttnn.deallocate(logits_rm)
+    ttnn.deallocate(last_logits)
+    ttnn.deallocate(last_logits_tile)
+    ttnn.deallocate(token_indices)
+    return token_id
+
+
 @dataclass
 class GenerationStats:
     """Statistics for text generation."""
@@ -932,6 +946,9 @@ class Batch32Generator:
         top_k: Optional[int] = 50,
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
+        if temperature <= 0.0 or top_k is None or top_k <= 1:
+            return _on_device_argmax_single(logits)
+
         # Reuse a pinned host tensor to avoid per-token host allocations on the
         # logits copy path, which shows up directly in warmed batch32 wall time.
         host_tensor = None
