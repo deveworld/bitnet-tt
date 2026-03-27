@@ -2025,20 +2025,30 @@ class MultiHeadAttention:
                 past_key_value.value_cache = value
 
         kv_heads_slice = self.num_kv_heads
+        if past_key_value._use_paged and past_key_value.key_cache is not None:
+            # Use the compact batch-local K/V tensors for the prefill attention
+            # computation. The paged batch32 cache is only for future decode and
+            # has padded batch/head dimensions that do not match the prompt batch.
+            attn_key_source = key[:, :kv_heads_slice, :, :]
+            attn_value_source = value[:, :kv_heads_slice, :, :]
+        else:
+            attn_key_source = past_key_value.key_cache[:, :kv_heads_slice, :seq_len, :]
+            attn_value_source = past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :]
+
         if self.num_kv_groups > 1:
             key_expanded = ttnn.repeat_interleave(
-                past_key_value.key_cache[:, :kv_heads_slice, :seq_len, :],
+                attn_key_source,
                 self.num_kv_groups,
                 dim=1,
             )
             value_expanded = ttnn.repeat_interleave(
-                past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :],
+                attn_value_source,
                 self.num_kv_groups,
                 dim=1,
             )
         else:
-            key_expanded = past_key_value.key_cache[:, :kv_heads_slice, :seq_len, :]
-            value_expanded = past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :]
+            key_expanded = attn_key_source
+            value_expanded = attn_value_source
 
         # SDPA (causal attention for prefill)
         attn_output = ttnn.transformer.scaled_dot_product_attention(
@@ -2054,6 +2064,9 @@ class MultiHeadAttention:
         if self.num_kv_groups > 1:
             ttnn.deallocate(key_expanded)
             ttnn.deallocate(value_expanded)
+        if past_key_value._use_paged and past_key_value.key_cache is not None:
+            ttnn.deallocate(key)
+            ttnn.deallocate(value)
 
         # Reshape output: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         attn_output = ttnn.transpose(attn_output, 1, 2)
