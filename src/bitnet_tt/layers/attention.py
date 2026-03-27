@@ -1327,9 +1327,9 @@ class MultiHeadAttention:
         ttnn.deallocate(v_heads_1bkd)
 
         # 6. SDPA decode
-        # Q must be in DRAM when not sharded
-        q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(q_heads_1bkd)
+        # Keep Q in its native sharded form. The upstream tt-transformers decode
+        # path feeds rotary-applied 1BQD tensors directly into decode SDPA, and
+        # avoiding the per-layer Q->DRAM copy saves measurable steady-state time.
 
         # Limit the visible cache length to a 32-token tile multiple. When the
         # backing cache already matches that compact logical view, reuse it
@@ -1367,7 +1367,7 @@ class MultiHeadAttention:
                 ),
             )
         attn_output_1bkd = ttnn.transformer.scaled_dot_product_attention_decode(
-            q_heads_dram,
+            q_heads_1bkd,
             key_cache_for_sdpa,
             value_cache_for_sdpa,
             cur_pos_tensor=pos_tensor_local,
@@ -1376,7 +1376,7 @@ class MultiHeadAttention:
             compute_kernel_config=self._sdpa_decode_compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        ttnn.deallocate(q_heads_dram)
+        ttnn.deallocate(q_heads_1bkd)
         if not can_reuse_full_cache:
             ttnn.deallocate(key_cache_for_sdpa)
             ttnn.deallocate(value_cache_for_sdpa)
