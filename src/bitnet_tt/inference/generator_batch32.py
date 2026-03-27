@@ -933,7 +933,18 @@ class Batch32Generator:
         """Sample next token from the last logical position of batch element 0."""
         # Reuse a pinned host tensor to avoid per-token host allocations on the
         # logits copy path, which shows up directly in warmed batch32 wall time.
-        if self._logits_host_tensor is None:
+        needs_host_alloc = self._logits_host_tensor is None
+        if not needs_host_alloc:
+            try:
+                needs_host_alloc = self._logits_host_tensor.spec != logits.spec
+            except Exception:
+                needs_host_alloc = False
+        if needs_host_alloc:
+            if self._logits_host_tensor is not None:
+                try:
+                    ttnn.deallocate(self._logits_host_tensor)
+                except Exception:
+                    pass
             self._logits_host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
         if self._supports_host_tensor_to_torch is not False:
             try:

@@ -319,3 +319,33 @@ def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
     assert token == 2
     assert generator._supports_host_tensor_to_torch is True
     assert calls == [{"host_tensor": host_tensor}]
+
+
+def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    old_host_tensor = SimpleNamespace(spec="old")
+    generator._logits_host_tensor = old_host_tensor
+    generator._supports_host_tensor_to_torch = None
+
+    logits = SimpleNamespace(spec="new")
+    new_host_tensor = object()
+    deallocated = []
+
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "allocate_tensor_on_host",
+        lambda spec, _device: new_host_tensor if spec == "new" else None,
+    )
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda tensor: deallocated.append(tensor))
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "to_torch",
+        lambda tensor, **kwargs: torch.tensor([[[0.1, 0.7, 0.2]]], dtype=torch.float32),
+    )
+
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+
+    assert token == 1
+    assert deallocated == [old_host_tensor]
+    assert generator._logits_host_tensor is new_host_tensor
