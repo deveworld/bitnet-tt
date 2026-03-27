@@ -268,6 +268,7 @@ def test_release_trace_keeps_inputs_until_explicit_cleanup(monkeypatch) -> None:
 def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     generator.device = object()
+    generator._argmax_output_tensors = []
     generator._logits_host_tensor = None
     generator._logits_host_tensors = []
     generator._supports_host_tensor_to_torch = None
@@ -299,6 +300,7 @@ def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatc
 def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     generator.device = object()
+    generator._argmax_output_tensors = []
     generator._logits_host_tensor = None
     generator._logits_host_tensors = []
     generator._supports_host_tensor_to_torch = None
@@ -328,6 +330,7 @@ def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
 def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     generator.device = object()
+    generator._argmax_output_tensors = []
     generator._logits_host_tensor = None
     generator._logits_host_tensors = []
     generator._supports_host_tensor_to_torch = None
@@ -335,6 +338,7 @@ def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
     class _FakeTensor:
         def __init__(self, label: str):
             self.label = label
+            self.shape = (1, 1, 128256)
 
         def __getitem__(self, item):
             return _FakeTensor(f"{self.label}[{item!r}]")
@@ -381,9 +385,42 @@ def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
     assert generator._logits_host_tensors == []
 
 
+def test_sample_token_reuses_argmax_output_tensor_for_same_shape(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    generator._argmax_output_tensors = []
+    generator._logits_host_tensor = None
+    generator._logits_host_tensors = []
+    generator._supports_host_tensor_to_torch = None
+
+    logits = SimpleNamespace(shape=(1, 1, 128256))
+    cached_output = object()
+    calls = []
+
+    def fake_argmax(tensor, dim=-1, output_tensor=None):
+        calls.append(output_tensor)
+        return cached_output if output_tensor is None else output_tensor
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "argmax", fake_argmax)
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "to_torch",
+        lambda tensor, **kwargs: torch.tensor([[[3]]], dtype=torch.int32),
+    )
+
+    first = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+    second = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+
+    assert first == 3
+    assert second == 3
+    assert calls == [None, cached_output]
+    assert generator._argmax_output_tensors == [((1, 1, 128256), cached_output)]
+
+
 def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     generator.device = object()
+    generator._argmax_output_tensors = []
     old_host_tensor = SimpleNamespace(spec="old")
     generator._logits_host_tensor = old_host_tensor
     generator._logits_host_tensors = [("old", old_host_tensor)]

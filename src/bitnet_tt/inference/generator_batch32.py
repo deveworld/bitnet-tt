@@ -446,6 +446,7 @@ class Batch32Generator:
         self._trace_capture_pos: Optional[int] = None
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
+        self._argmax_output_tensors: list[tuple[tuple[int, ...], ttnn.Tensor]] = []
         self._logits_host_tensor: Optional[ttnn.Tensor] = None
         self._logits_host_tensors: list[tuple[Any, ttnn.Tensor]] = []
         self._supports_host_tensor_to_torch: Optional[bool] = None
@@ -954,7 +955,21 @@ class Batch32Generator:
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
         if temperature <= 0.0 or top_k is None or top_k <= 1:
-            return _on_device_argmax_single(logits)
+            shape_key = tuple(int(dim) for dim in logits.shape)
+            output_tensor = None
+            for cached_shape, cached_tensor in self._argmax_output_tensors:
+                if cached_shape == shape_key:
+                    output_tensor = cached_tensor
+                    break
+            try:
+                if output_tensor is None:
+                    output_tensor = ttnn.argmax(logits, dim=-1)
+                    self._argmax_output_tensors.append((shape_key, output_tensor))
+                else:
+                    ttnn.argmax(logits, dim=-1, output_tensor=output_tensor)
+                return int(ttnn.to_torch(output_tensor).numpy().reshape(-1)[0])
+            except Exception:
+                return _on_device_argmax_single(logits)
 
         # Reuse a pinned host tensor to avoid per-token host allocations on the
         # logits copy path, which shows up directly in warmed batch32 wall time.
@@ -1232,6 +1247,13 @@ class Batch32Generator:
                     ttnn.deallocate(tensor)
                 except Exception:
                     pass
+        if self._argmax_output_tensors:
+            for _shape, tensor in self._argmax_output_tensors:
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:
+                    pass
+        self._argmax_output_tensors = []
         self._logits_host_tensors = []
         self._logits_host_tensor = None
         self._supports_host_tensor_to_torch = None
