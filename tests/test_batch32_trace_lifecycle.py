@@ -162,6 +162,90 @@ def test_generate_reuses_cached_prefill_for_identical_prompt(monkeypatch) -> Non
     assert counters["ensure_kv_caches"] == 2
 
 
+def test_generate_extends_from_cached_prompt_prefix(monkeypatch) -> None:
+    class PrefixTokenizer:
+        eos_token_id = 99
+
+        def __call__(self, prompt: str, return_tensors: str = "np") -> dict:
+            mapping = {
+                "base": np.array([[11, 12]], dtype=np.int64),
+                "extended": np.array([[11, 12, 13]], dtype=np.int64),
+            }
+            return {"input_ids": mapping[prompt]}
+
+        def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+            return "decoded"
+
+    generator = object.__new__(Batch32Generator)
+    counters = {
+        "prefill": 0,
+        "ensure_kv_caches": 0,
+        "decode_untraced": 0,
+        "release_trace": 0,
+    }
+    token_sequence = iter([7, 7])
+
+    generator.tokenizer = PrefixTokenizer()
+    generator.enable_trace = False
+    generator._trace_id = 123
+    generator._trace_inputs = None
+    generator._trace_output = None
+    generator._trace_capture_pos = 2
+    generator._decode_inputs = None
+    generator._kv_caches = []
+    generator._cached_prefill_key = None
+    generator._cached_prefill_seq_len = 0
+    generator._cached_prefill_logits = None
+    generator._cached_prefill_cache_seq_len = 0
+
+    def release_trace() -> None:
+        counters["release_trace"] += 1
+        generator._trace_id = None
+
+    def ensure_kv_caches(max_seq_len: int) -> None:
+        counters["ensure_kv_caches"] += 1
+        generator._kv_caches = [SimpleNamespace(max_seq_len=max_seq_len, seq_len_cached=0)]
+
+    def prefill_batch32(_input_ids):
+        counters["prefill"] += 1
+        return object(), 2
+
+    def sample_token(_logits, _temperature, _top_k):
+        return next(token_sequence)
+
+    def execute_decode_untraced(_token_id: int, _current_pos: int):
+        counters["decode_untraced"] += 1
+        return object()
+
+    generator._release_trace = release_trace
+    generator._ensure_kv_caches = ensure_kv_caches
+    generator._prefill_batch32 = prefill_batch32
+    generator._sample_token = sample_token
+    generator._execute_decode_untraced = execute_decode_untraced
+    generator._try_reuse_prefill = Batch32Generator._try_reuse_prefill.__get__(generator, Batch32Generator)
+    generator._try_extend_prefill_from_cached_prefix = (
+        Batch32Generator._try_extend_prefill_from_cached_prefix.__get__(generator, Batch32Generator)
+    )
+    generator._cache_prefill = Batch32Generator._cache_prefill.__get__(generator, Batch32Generator)
+    generator._make_prefill_cache_key = Batch32Generator._make_prefill_cache_key.__get__(
+        generator, Batch32Generator
+    )
+    generator._set_kv_cache_length = lambda seq_len: setattr(
+        generator._kv_caches[0], "seq_len_cached", seq_len
+    )
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+
+    first = generator.generate("base", max_new_tokens=1)
+    second = generator.generate("extended", max_new_tokens=1)
+
+    assert first == "decoded"
+    assert second == "decoded"
+    assert counters["prefill"] == 1
+    assert counters["decode_untraced"] == 1
+    assert counters["release_trace"] == 1
+
+
 def test_try_reuse_prefill_allows_smaller_requests_on_existing_cache() -> None:
     generator = object.__new__(Batch32Generator)
     cached_logits = object()

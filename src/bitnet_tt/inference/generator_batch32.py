@@ -658,6 +658,54 @@ class Batch32Generator:
         self._set_kv_cache_length(self._cached_prefill_seq_len)
         return self._cached_prefill_logits, self._cached_prefill_seq_len
 
+    def _try_extend_prefill_from_cached_prefix(
+        self,
+        input_ids: NDArray[np.int64],
+        max_seq_len: int,
+    ) -> Optional[Tuple[ttnn.Tensor, int]]:
+        """Reuse the cached prompt prefix, then decode only the uncached suffix."""
+        if (
+            self._cached_prefill_logits is None
+            or self._cached_prefill_key is None
+            or self._kv_caches is None
+            or len(self._kv_caches) == 0
+        ):
+            return None
+
+        current_cache_capacity = min(cache.max_seq_len for cache in self._kv_caches)
+        if current_cache_capacity < max_seq_len:
+            return None
+        if self._cached_prefill_cache_seq_len != current_cache_capacity:
+            return None
+
+        prompt_tokens = tuple(map(int, input_ids.reshape(-1)))
+        cached_tokens = self._cached_prefill_key
+        prefix_len = 0
+        max_prefix = min(len(prompt_tokens), len(cached_tokens))
+        while prefix_len < max_prefix and prompt_tokens[prefix_len] == cached_tokens[prefix_len]:
+            prefix_len += 1
+
+        if prefix_len == 0 or prefix_len == len(prompt_tokens):
+            return None
+
+        if self._trace_id is not None:
+            self._release_trace()
+
+        self._set_kv_cache_length(prefix_len)
+        logits: Optional[ttnn.Tensor] = None
+        current_pos = prefix_len
+        for token_id in prompt_tokens[prefix_len:]:
+            if logits is not None:
+                ttnn.deallocate(logits)
+            logits = self._execute_decode_untraced(token_id, current_pos)
+            current_pos += 1
+
+        if logits is None:
+            return None
+
+        self._cache_prefill(input_ids, logits, len(prompt_tokens))
+        return logits, len(prompt_tokens)
+
     def _cache_prefill(
         self,
         input_ids: NDArray[np.int64],
@@ -1109,9 +1157,14 @@ class Batch32Generator:
         cached_prefill = self._try_reuse_prefill(input_ids, max_seq_len)
         logits_owned = cached_prefill is None
         if cached_prefill is None:
-            logits, seq_len = self._prefill_batch32(input_ids)
-            self._cache_prefill(input_ids, logits, seq_len)
-            logits_owned = False
+            cached_prefill = self._try_extend_prefill_from_cached_prefix(input_ids, max_seq_len)
+            if cached_prefill is None:
+                logits, seq_len = self._prefill_batch32(input_ids)
+                self._cache_prefill(input_ids, logits, seq_len)
+                logits_owned = False
+            else:
+                logits, seq_len = cached_prefill
+                logits_owned = False
         else:
             logits, seq_len = cached_prefill
 
@@ -1194,9 +1247,14 @@ class Batch32Generator:
         cached_prefill = self._try_reuse_prefill(input_ids, max_seq_len)
         logits_owned = cached_prefill is None
         if cached_prefill is None:
-            logits, seq_len = self._prefill_batch32(input_ids)
-            self._cache_prefill(input_ids, logits, seq_len)
-            logits_owned = False
+            cached_prefill = self._try_extend_prefill_from_cached_prefix(input_ids, max_seq_len)
+            if cached_prefill is None:
+                logits, seq_len = self._prefill_batch32(input_ids)
+                self._cache_prefill(input_ids, logits, seq_len)
+                logits_owned = False
+            else:
+                logits, seq_len = cached_prefill
+                logits_owned = False
         else:
             logits, seq_len = cached_prefill
         stats.prompt_time = time.perf_counter() - prefill_start
