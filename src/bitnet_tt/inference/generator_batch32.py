@@ -449,6 +449,10 @@ class Batch32Generator:
         self._argmax_output_tensors: list[tuple[tuple[int, ...], ttnn.Tensor]] = []
         self._logits_host_tensor: Optional[ttnn.Tensor] = None
         self._logits_host_tensors: list[tuple[Any, ttnn.Tensor]] = []
+        self._cached_prefill_key: Optional[tuple[int, ...]] = None
+        self._cached_prefill_seq_len: int = 0
+        self._cached_prefill_logits: Optional[ttnn.Tensor] = None
+        self._cached_prefill_cache_seq_len: int = 0
         self._supports_host_tensor_to_torch: Optional[bool] = None
         self._embed_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._pos_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
@@ -614,6 +618,59 @@ class Batch32Generator:
         for cache in self._kv_caches:
             cache.seq_len_cached = seq_len
 
+    def _clear_prefill_cache(self) -> None:
+        """Release cached prompt prefill state."""
+        if self._cached_prefill_logits is not None:
+            ttnn.deallocate(self._cached_prefill_logits)
+        self._cached_prefill_key = None
+        self._cached_prefill_seq_len = 0
+        self._cached_prefill_logits = None
+        self._cached_prefill_cache_seq_len = 0
+
+    def _make_prefill_cache_key(self, input_ids: NDArray[np.int64], max_seq_len: int) -> tuple[int, ...]:
+        """Key prompt-prefill reuse by prompt tokens and allocated cache capacity."""
+        return (max_seq_len, *map(int, input_ids.reshape(-1)))
+
+    def _try_reuse_prefill(
+        self,
+        input_ids: NDArray[np.int64],
+        max_seq_len: int,
+    ) -> Optional[Tuple[ttnn.Tensor, int]]:
+        """Reuse cached prompt logits and KV prefix when the prompt matches exactly."""
+        if (
+            self._cached_prefill_logits is None
+            or self._cached_prefill_key is None
+            or self._cached_prefill_cache_seq_len != max_seq_len
+            or self._kv_caches is None
+        ):
+            return None
+
+        if any(cache.max_seq_len < max_seq_len for cache in self._kv_caches):
+            return None
+
+        cache_key = self._make_prefill_cache_key(input_ids, max_seq_len)
+        if cache_key != self._cached_prefill_key:
+            return None
+
+        self._set_kv_cache_length(self._cached_prefill_seq_len)
+        return self._cached_prefill_logits, self._cached_prefill_seq_len
+
+    def _cache_prefill(
+        self,
+        input_ids: NDArray[np.int64],
+        max_seq_len: int,
+        logits: ttnn.Tensor,
+        seq_len: int,
+    ) -> None:
+        """Keep the last prompt prefill around so repeat generations can skip prefill."""
+        cache_key = self._make_prefill_cache_key(input_ids, max_seq_len)
+        if self._cached_prefill_logits is not None and self._cached_prefill_logits is not logits:
+            ttnn.deallocate(self._cached_prefill_logits)
+        self._cached_prefill_key = cache_key
+        self._cached_prefill_seq_len = seq_len
+        self._cached_prefill_logits = logits
+        self._cached_prefill_cache_seq_len = max_seq_len
+
     def _ensure_kv_caches(self, max_seq_len: int) -> None:
         """Reuse existing batch-32 caches when they are already large enough."""
         if self._kv_caches is None:
@@ -622,6 +679,7 @@ class Batch32Generator:
 
         if any(cache.max_seq_len < max_seq_len for cache in self._kv_caches):
             self._release_trace()
+            self._clear_prefill_cache()
             for cache in self._kv_caches:
                 ttnn.deallocate(cache.key_cache)
                 ttnn.deallocate(cache.value_cache)
@@ -1044,12 +1102,20 @@ class Batch32Generator:
         self._ensure_kv_caches(max_seq_len)
 
         # Prefill
-        logits, seq_len = self._prefill_batch32(input_ids)
+        cached_prefill = self._try_reuse_prefill(input_ids, max_seq_len)
+        logits_owned = cached_prefill is None
+        if cached_prefill is None:
+            logits, seq_len = self._prefill_batch32(input_ids)
+            self._cache_prefill(input_ids, max_seq_len, logits, seq_len)
+            logits_owned = False
+        else:
+            logits, seq_len = cached_prefill
 
         # Sample first token
         next_token = self._sample_token(logits, temperature, top_k)
         generated_ids = list(input_ids[0]) + [next_token]
-        ttnn.deallocate(logits)
+        if logits_owned:
+            ttnn.deallocate(logits)
 
         if next_token == self.tokenizer.eos_token_id:
             return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -1121,14 +1187,22 @@ class Batch32Generator:
 
         # Prefill
         prefill_start = time.perf_counter()
-        logits, seq_len = self._prefill_batch32(input_ids)
+        cached_prefill = self._try_reuse_prefill(input_ids, max_seq_len)
+        logits_owned = cached_prefill is None
+        if cached_prefill is None:
+            logits, seq_len = self._prefill_batch32(input_ids)
+            self._cache_prefill(input_ids, max_seq_len, logits, seq_len)
+            logits_owned = False
+        else:
+            logits, seq_len = cached_prefill
         stats.prompt_time = time.perf_counter() - prefill_start
 
         # Sample first token
         next_token = self._sample_token(logits, temperature, top_k)
         generated_ids = list(input_ids[0]) + [next_token]
         stats.generated_tokens = 1
-        ttnn.deallocate(logits)
+        if logits_owned:
+            ttnn.deallocate(logits)
 
         # Yield first token
         current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -1226,6 +1300,14 @@ class Batch32Generator:
             self._embed_host_cache.clear()
             self._pos_host_cache.clear()
             self.rotary_setup._host_cos_sin_cache.clear()
+
+        try:
+            self._clear_prefill_cache()
+        except Exception:
+            self._cached_prefill_key = None
+            self._cached_prefill_seq_len = 0
+            self._cached_prefill_logits = None
+            self._cached_prefill_cache_seq_len = 0
 
         if self._logits_host_tensors:
             for _spec, tensor in self._logits_host_tensors:

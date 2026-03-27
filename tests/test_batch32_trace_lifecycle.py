@@ -52,7 +52,7 @@ def _make_stub_generator(enable_trace: bool = False) -> tuple[Batch32Generator, 
         "execute_trace": 0,
     }
 
-    token_sequence = iter([7, _FakeTokenizer.eos_token_id])
+    token_sequence = iter([7, _FakeTokenizer.eos_token_id, 7, _FakeTokenizer.eos_token_id])
 
     generator.tokenizer = _FakeTokenizer()
     generator.enable_trace = enable_trace
@@ -62,6 +62,10 @@ def _make_stub_generator(enable_trace: bool = False) -> tuple[Batch32Generator, 
     generator._trace_capture_pos = 5
     generator._decode_inputs = None
     generator._kv_caches = []
+    generator._cached_prefill_key = None
+    generator._cached_prefill_seq_len = 0
+    generator._cached_prefill_logits = None
+    generator._cached_prefill_cache_seq_len = 0
 
     def release_trace() -> None:
         counters["release_trace"] += 1
@@ -107,6 +111,11 @@ def _make_stub_generator(enable_trace: bool = False) -> tuple[Batch32Generator, 
     generator._execute_decode_untraced = execute_decode_untraced
     generator._capture_trace = capture_trace
     generator._execute_trace = execute_trace
+    generator._try_reuse_prefill = Batch32Generator._try_reuse_prefill.__get__(generator, Batch32Generator)
+    generator._cache_prefill = Batch32Generator._cache_prefill.__get__(generator, Batch32Generator)
+    generator._make_prefill_cache_key = Batch32Generator._make_prefill_cache_key.__get__(
+        generator, Batch32Generator
+    )
 
     return generator, counters
 
@@ -137,6 +146,19 @@ def test_generate_streaming_keeps_reusable_trace_between_runs(monkeypatch) -> No
     assert counters["clear_host_decode_cache"] == 0
     assert counters["prefill"] == 1
     assert counters["decode_untraced"] == 1
+
+
+def test_generate_reuses_cached_prefill_for_identical_prompt(monkeypatch) -> None:
+    generator, counters = _make_stub_generator(enable_trace=False)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+
+    first = generator.generate("hello", max_new_tokens=2)
+    second = generator.generate("hello", max_new_tokens=2)
+
+    assert first == "decoded"
+    assert second == "decoded"
+    assert counters["prefill"] == 1
+    assert counters["ensure_kv_caches"] == 2
 
 
 def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
