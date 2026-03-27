@@ -118,8 +118,8 @@ def test_generate_releases_leftover_trace_before_and_after_run(monkeypatch) -> N
 
     assert output == "decoded"
     assert counters["release_trace"] == 2
-    assert counters["release_decode_inputs"] == 1
-    assert counters["clear_host_decode_cache"] == 1
+    assert counters["release_decode_inputs"] == 0
+    assert counters["clear_host_decode_cache"] == 0
     assert counters["prefill"] == 1
     assert counters["decode_untraced"] == 1
 
@@ -132,8 +132,8 @@ def test_generate_streaming_releases_leftover_trace_before_and_after_run(monkeyp
 
     assert len(chunks) == 2
     assert counters["release_trace"] == 2
-    assert counters["release_decode_inputs"] == 1
-    assert counters["clear_host_decode_cache"] == 1
+    assert counters["release_decode_inputs"] == 0
+    assert counters["clear_host_decode_cache"] == 0
     assert counters["prefill"] == 1
     assert counters["decode_untraced"] == 1
 

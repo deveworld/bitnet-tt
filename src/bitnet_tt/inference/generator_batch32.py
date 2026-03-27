@@ -18,6 +18,7 @@ Performance target: 30+ t/s (currently 186 t/s for attention-only benchmark)
 """
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Tuple
 
@@ -38,6 +39,8 @@ TILE_SIZE = 32
 TRACE_CACHE_BUCKET = 64
 MIN_TRACE_CACHE_SEQ_LEN = 128
 TRACE_CACHE_SLACK_TOKENS = 1
+MAX_DECODE_EMBED_CACHE = 128
+MAX_DECODE_POS_CACHE = 256
 
 
 def round_up_to_tile(value: int, tile: int = TILE_SIZE) -> int:
@@ -227,7 +230,7 @@ class Batch32RotarySetup:
         )
 
         self.cos_sin_config = create_height_sharded_config(TILE_SIZE, head_dim)
-        self._host_cos_sin_cache: dict[int, Tuple[ttnn.Tensor, ttnn.Tensor]] = {}
+        self._host_cos_sin_cache: OrderedDict[int, Tuple[ttnn.Tensor, ttnn.Tensor]] = OrderedDict()
 
     def _get_cos_sin_torch(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build interleaved cos/sin tensors for one decode position."""
@@ -266,6 +269,7 @@ class Batch32RotarySetup:
         """Create host tensors that can be copied into persistent trace inputs."""
         cached = self._host_cos_sin_cache.get(position)
         if cached is not None:
+            self._host_cos_sin_cache.move_to_end(position)
             return cached
 
         cos_torch, sin_torch = self._get_cos_sin_torch(position)
@@ -281,6 +285,11 @@ class Batch32RotarySetup:
             layout=ttnn.TILE_LAYOUT,
             device=None,
         )
+        while len(self._host_cos_sin_cache) >= MAX_DECODE_POS_CACHE:
+            _, (old_cos, old_sin) = self._host_cos_sin_cache.popitem(last=False)
+            ttnn.deallocate(old_cos)
+            ttnn.deallocate(old_sin)
+
         self._host_cos_sin_cache[position] = (cos_host, sin_host)
         return cos_host, sin_host
 
@@ -416,8 +425,8 @@ class Batch32Generator:
         self._trace_capture_pos: Optional[int] = None
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
-        self._embed_host_cache: dict[int, ttnn.Tensor] = {}
-        self._pos_host_cache: dict[int, ttnn.Tensor] = {}
+        self._embed_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
+        self._pos_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._decode_matmul_kernel_config = None
         try:
             self._decode_matmul_kernel_config = get_compute_kernel_config(decode_matmul_fidelity)
@@ -630,6 +639,7 @@ class Batch32Generator:
         """Get cached host tensor for one decoded token embedding."""
         cached = self._embed_host_cache.get(token_id)
         if cached is not None:
+            self._embed_host_cache.move_to_end(token_id)
             return cached
 
         embed_padded = torch.zeros(
@@ -642,6 +652,10 @@ class Batch32Generator:
             layout=ttnn.TILE_LAYOUT,
             device=None,
         )
+        while len(self._embed_host_cache) >= MAX_DECODE_EMBED_CACHE:
+            _, old_tensor = self._embed_host_cache.popitem(last=False)
+            ttnn.deallocate(old_tensor)
+
         self._embed_host_cache[token_id] = embed_host
         return embed_host
 
@@ -649,6 +663,7 @@ class Batch32Generator:
         """Get cached host tensor for one decode position."""
         cached = self._pos_host_cache.get(current_pos)
         if cached is not None:
+            self._pos_host_cache.move_to_end(current_pos)
             return cached
 
         pos_host = ttnn.from_torch(
@@ -657,6 +672,10 @@ class Batch32Generator:
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=None,
         )
+        while len(self._pos_host_cache) >= MAX_DECODE_POS_CACHE:
+            _, old_tensor = self._pos_host_cache.popitem(last=False)
+            ttnn.deallocate(old_tensor)
+
         self._pos_host_cache[current_pos] = pos_host
         return pos_host
 
@@ -1008,8 +1027,6 @@ class Batch32Generator:
 
         finally:
             self._release_trace()
-            self._release_decode_inputs()
-            self._clear_host_decode_cache()
 
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -1128,8 +1145,6 @@ class Batch32Generator:
 
         finally:
             self._release_trace()
-            self._release_decode_inputs()
-            self._clear_host_decode_cache()
 
     def reset(self) -> None:
         """Reset generator state."""
