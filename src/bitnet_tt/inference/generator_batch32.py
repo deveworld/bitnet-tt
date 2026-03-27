@@ -426,6 +426,7 @@ class Batch32Generator:
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
         self._logits_host_tensor: Optional[ttnn.Tensor] = None
+        self._logits_host_tensors: list[tuple[Any, ttnn.Tensor]] = []
         self._supports_host_tensor_to_torch: Optional[bool] = None
         self._embed_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._pos_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
@@ -933,24 +934,23 @@ class Batch32Generator:
         """Sample next token from the last logical position of batch element 0."""
         # Reuse a pinned host tensor to avoid per-token host allocations on the
         # logits copy path, which shows up directly in warmed batch32 wall time.
-        needs_host_alloc = self._logits_host_tensor is None
-        if not needs_host_alloc:
+        host_tensor = None
+        for cached_spec, cached_tensor in self._logits_host_tensors:
             try:
-                needs_host_alloc = self._logits_host_tensor.spec != logits.spec
+                if cached_spec == logits.spec:
+                    host_tensor = cached_tensor
+                    break
             except Exception:
-                needs_host_alloc = False
-        if needs_host_alloc:
-            if self._logits_host_tensor is not None:
-                try:
-                    ttnn.deallocate(self._logits_host_tensor)
-                except Exception:
-                    pass
-            self._logits_host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
+                continue
+        if host_tensor is None:
+            host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
+            self._logits_host_tensors.append((logits.spec, host_tensor))
+        self._logits_host_tensor = host_tensor
         if self._supports_host_tensor_to_torch is not False:
             try:
                 last_logits = ttnn.to_torch(
                     logits,
-                    host_tensor=self._logits_host_tensor,
+                    host_tensor=host_tensor,
                 )[0, -1, :].float()
                 self._supports_host_tensor_to_torch = True
             except TypeError:
@@ -1202,12 +1202,14 @@ class Batch32Generator:
             self._pos_host_cache.clear()
             self.rotary_setup._host_cos_sin_cache.clear()
 
-        if self._logits_host_tensor is not None:
-            try:
-                ttnn.deallocate(self._logits_host_tensor)
-            except Exception:
-                pass
-            self._logits_host_tensor = None
+        if self._logits_host_tensors:
+            for _spec, tensor in self._logits_host_tensors:
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:
+                    pass
+        self._logits_host_tensors = []
+        self._logits_host_tensor = None
         self._supports_host_tensor_to_torch = None
 
         if self._kv_caches is not None:
