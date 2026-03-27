@@ -7,6 +7,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
 import bitnet_tt.inference.generator_batch32 as generator_batch32_module
 from bitnet_tt.inference.generator_batch32 import (
@@ -262,3 +263,59 @@ def test_release_trace_keeps_inputs_until_explicit_cleanup(monkeypatch) -> None:
 
     assert len(deallocated) == 2
     assert generator._trace_inputs is None
+
+
+def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    generator._logits_host_tensor = None
+    generator._supports_host_tensor_to_torch = None
+
+    logits = SimpleNamespace(spec="spec")
+    host_tensor = object()
+    calls = []
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: host_tensor)
+
+    def fake_to_torch(tensor, **kwargs):
+        calls.append(kwargs)
+        assert tensor is logits
+        if "host_tensor" in kwargs:
+            raise TypeError("unexpected keyword argument 'host_tensor'")
+        return torch.tensor([[[0.1, 0.9, 0.2]]], dtype=torch.float32)
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "to_torch", fake_to_torch)
+
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+
+    assert token == 1
+    assert generator._logits_host_tensor is host_tensor
+    assert generator._supports_host_tensor_to_torch is False
+    assert calls == [{"host_tensor": host_tensor}, {}]
+
+
+def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    generator._logits_host_tensor = None
+    generator._supports_host_tensor_to_torch = None
+
+    logits = SimpleNamespace(spec="spec")
+    host_tensor = object()
+    calls = []
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: host_tensor)
+
+    def fake_to_torch(tensor, **kwargs):
+        calls.append(kwargs)
+        assert tensor is logits
+        assert kwargs == {"host_tensor": host_tensor}
+        return torch.tensor([[[0.1, 0.2, 0.8]]], dtype=torch.float32)
+
+    monkeypatch.setattr(generator_batch32_module.ttnn, "to_torch", fake_to_torch)
+
+    token = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
+
+    assert token == 2
+    assert generator._supports_host_tensor_to_torch is True
+    assert calls == [{"host_tensor": host_tensor}]

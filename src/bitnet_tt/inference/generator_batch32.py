@@ -426,6 +426,7 @@ class Batch32Generator:
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
         self._logits_host_tensor: Optional[ttnn.Tensor] = None
+        self._supports_host_tensor_to_torch: Optional[bool] = None
         self._embed_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._pos_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._decode_matmul_kernel_config = None
@@ -934,7 +935,20 @@ class Batch32Generator:
         # logits copy path, which shows up directly in warmed batch32 wall time.
         if self._logits_host_tensor is None:
             self._logits_host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
-        last_logits = ttnn.to_torch(logits, host_tensor=self._logits_host_tensor)[0, -1, :].float()
+        if self._supports_host_tensor_to_torch is not False:
+            try:
+                last_logits = ttnn.to_torch(
+                    logits,
+                    host_tensor=self._logits_host_tensor,
+                )[0, -1, :].float()
+                self._supports_host_tensor_to_torch = True
+            except TypeError:
+                # Older TTNN wheels expose copy_device_to_host_tensor but do not
+                # accept host_tensor in the Python to_torch wrapper yet.
+                self._supports_host_tensor_to_torch = False
+                last_logits = ttnn.to_torch(logits)[0, -1, :].float()
+        else:
+            last_logits = ttnn.to_torch(logits)[0, -1, :].float()
 
         if temperature != 1.0:
             last_logits = last_logits / temperature
@@ -1183,6 +1197,7 @@ class Batch32Generator:
             except Exception:
                 pass
             self._logits_host_tensor = None
+        self._supports_host_tensor_to_torch = None
 
         if self._kv_caches is not None:
             for cache in self._kv_caches:
