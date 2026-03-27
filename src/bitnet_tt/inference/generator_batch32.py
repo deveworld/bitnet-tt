@@ -425,6 +425,7 @@ class Batch32Generator:
         self._trace_capture_pos: Optional[int] = None
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
+        self._logits_host_tensor: Optional[ttnn.Tensor] = None
         self._embed_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._pos_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
         self._decode_matmul_kernel_config = None
@@ -929,8 +930,11 @@ class Batch32Generator:
         top_k: Optional[int] = 50,
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
-        # Avoid allocating new device buffers while a trace is active.
-        last_logits = ttnn.to_torch(logits)[0, -1, :].float()
+        # Reuse a pinned host tensor to avoid per-token host allocations on the
+        # logits copy path, which shows up directly in warmed batch32 wall time.
+        if self._logits_host_tensor is None:
+            self._logits_host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
+        last_logits = ttnn.to_torch(logits, host_tensor=self._logits_host_tensor)[0, -1, :].float()
 
         if temperature != 1.0:
             last_logits = last_logits / temperature
@@ -1172,6 +1176,13 @@ class Batch32Generator:
             self._embed_host_cache.clear()
             self._pos_host_cache.clear()
             self.rotary_setup._host_cos_sin_cache.clear()
+
+        if self._logits_host_tensor is not None:
+            try:
+                ttnn.deallocate(self._logits_host_tensor)
+            except Exception:
+                pass
+            self._logits_host_tensor = None
 
         if self._kv_caches is not None:
             for cache in self._kv_caches:
