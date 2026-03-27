@@ -9,13 +9,22 @@ from types import SimpleNamespace
 import numpy as np
 
 import bitnet_tt.inference.generator_batch32 as generator_batch32_module
-from bitnet_tt.inference.generator_batch32 import Batch32Generator, choose_trace_cache_seq_len
+from bitnet_tt.inference.generator_batch32 import (
+    Batch32Generator,
+    choose_single_user_cache_seq_len,
+    choose_trace_cache_seq_len,
+)
 
 
 def test_choose_trace_cache_seq_len_buckets_small_requests_together() -> None:
     assert choose_trace_cache_seq_len(77) == 128
     assert choose_trace_cache_seq_len(109) == 128
     assert choose_trace_cache_seq_len(129) == 192
+
+
+def test_choose_single_user_cache_seq_len_uses_exact_tile_capacity() -> None:
+    assert choose_single_user_cache_seq_len(35) == 64
+    assert choose_single_user_cache_seq_len(77) == 96
 
 
 class _FakeTokenizer:
@@ -142,7 +151,7 @@ def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
 
     generator.generate("hello", max_new_tokens=32)
 
-    assert requested == [(35, 64, 128)]
+    assert requested == [(35, 32, 0)]
     assert counters["ensure_kv_caches"] == 1
 
 

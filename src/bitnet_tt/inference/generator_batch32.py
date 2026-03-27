@@ -62,6 +62,15 @@ def choose_trace_cache_seq_len(
     return round_up_to_tile(rounded, bucket)
 
 
+def choose_single_user_cache_seq_len(requested_seq_len: int) -> int:
+    """Use exact tile-aligned capacity for single-user batch32 decode throughput."""
+    return choose_trace_cache_seq_len(
+        requested_seq_len,
+        bucket=TILE_SIZE,
+        min_seq_len=0,
+    )
+
+
 @dataclass
 class GenerationStats:
     """Statistics for text generation."""
@@ -945,7 +954,7 @@ class Batch32Generator:
         input_ids = inputs["input_ids"]
 
         # Allocate caches
-        max_seq_len = choose_trace_cache_seq_len(
+        max_seq_len = choose_single_user_cache_seq_len(
             input_ids.shape[1] + max_new_tokens + TRACE_CACHE_SLACK_TOKENS
         )
         self._ensure_kv_caches(max_seq_len)
@@ -1030,7 +1039,7 @@ class Batch32Generator:
         stats.prompt_tokens = input_ids.shape[1]
 
         # Allocate caches
-        max_seq_len = choose_trace_cache_seq_len(
+        max_seq_len = choose_single_user_cache_seq_len(
             input_ids.shape[1] + max_new_tokens + TRACE_CACHE_SLACK_TOKENS
         )
         self._ensure_kv_caches(max_seq_len)
