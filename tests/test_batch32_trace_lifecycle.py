@@ -111,28 +111,28 @@ def _make_stub_generator(enable_trace: bool = False) -> tuple[Batch32Generator, 
     return generator, counters
 
 
-def test_generate_releases_leftover_trace_before_and_after_run(monkeypatch) -> None:
+def test_generate_keeps_reusable_trace_between_runs(monkeypatch) -> None:
     generator, counters = _make_stub_generator(enable_trace=False)
     monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
 
     output = generator.generate("hello", max_new_tokens=2)
 
     assert output == "decoded"
-    assert counters["release_trace"] == 2
+    assert counters["release_trace"] == 0
     assert counters["release_decode_inputs"] == 0
     assert counters["clear_host_decode_cache"] == 0
     assert counters["prefill"] == 1
     assert counters["decode_untraced"] == 1
 
 
-def test_generate_streaming_releases_leftover_trace_before_and_after_run(monkeypatch) -> None:
+def test_generate_streaming_keeps_reusable_trace_between_runs(monkeypatch) -> None:
     generator, counters = _make_stub_generator(enable_trace=False)
     monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
 
     chunks = list(generator.generate_streaming("hello", max_new_tokens=2))
 
     assert len(chunks) == 2
-    assert counters["release_trace"] == 2
+    assert counters["release_trace"] == 0
     assert counters["release_decode_inputs"] == 0
     assert counters["clear_host_decode_cache"] == 0
     assert counters["prefill"] == 1

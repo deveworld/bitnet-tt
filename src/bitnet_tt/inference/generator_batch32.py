@@ -1033,9 +1033,6 @@ class Batch32Generator:
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
 
-        if self._trace_id is not None:
-            self._release_trace()
-
         # Tokenize
         inputs = self.tokenizer(prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
@@ -1073,28 +1070,24 @@ class Batch32Generator:
             generated_ids.append(next_token)
             current_pos += 1
 
-        try:
-            while len(generated_ids) - input_ids.shape[1] < max_new_tokens:
-                logits_owned = True
+        while len(generated_ids) - input_ids.shape[1] < max_new_tokens:
+            logits_owned = True
 
-                if self.enable_trace and trace_captured:
-                    logits = self._execute_trace(next_token, current_pos)
-                    logits_owned = False
-                else:
-                    logits = self._execute_decode_untraced(next_token, current_pos)
+            if self.enable_trace and trace_captured:
+                logits = self._execute_trace(next_token, current_pos)
+                logits_owned = False
+            else:
+                logits = self._execute_decode_untraced(next_token, current_pos)
 
-                next_token = self._sample_token(logits, temperature, top_k)
-                generated_ids.append(next_token)
-                current_pos += 1
+            next_token = self._sample_token(logits, temperature, top_k)
+            generated_ids.append(next_token)
+            current_pos += 1
 
-                if logits_owned:
-                    ttnn.deallocate(logits)
+            if logits_owned:
+                ttnn.deallocate(logits)
 
-                if next_token == self.tokenizer.eos_token_id:
-                    break
-
-        finally:
-            self._release_trace()
+            if next_token == self.tokenizer.eos_token_id:
+                break
 
         return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -1112,9 +1105,6 @@ class Batch32Generator:
         """
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
-
-        if self._trace_id is not None:
-            self._release_trace()
 
         stats = GenerationStats()
 
@@ -1179,40 +1169,36 @@ class Batch32Generator:
             if next_token == self.tokenizer.eos_token_id:
                 return
 
-        try:
-            while stats.generated_tokens < max_new_tokens:
-                token_start = time.perf_counter()
+        while stats.generated_tokens < max_new_tokens:
+            token_start = time.perf_counter()
 
-                logits_owned = True
+            logits_owned = True
 
-                if self.enable_trace and trace_captured:
-                    logits = self._execute_trace(next_token, current_pos)
-                    logits_owned = False
-                else:
-                    logits = self._execute_decode_untraced(next_token, current_pos)
+            if self.enable_trace and trace_captured:
+                logits = self._execute_trace(next_token, current_pos)
+                logits_owned = False
+            else:
+                logits = self._execute_decode_untraced(next_token, current_pos)
 
-                token_time = time.perf_counter() - token_start
-                stats.token_times.append(token_time)
-                stats.generation_time += token_time
+            token_time = time.perf_counter() - token_start
+            stats.token_times.append(token_time)
+            stats.generation_time += token_time
 
-                next_token = self._sample_token(logits, temperature, top_k)
-                generated_ids.append(next_token)
-                stats.generated_tokens += 1
-                current_pos += 1
+            next_token = self._sample_token(logits, temperature, top_k)
+            generated_ids.append(next_token)
+            stats.generated_tokens += 1
+            current_pos += 1
 
-                current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                new_text = current_text[prev_text_len:]
-                prev_text_len = len(current_text)
-                yield new_text, stats
+            current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            new_text = current_text[prev_text_len:]
+            prev_text_len = len(current_text)
+            yield new_text, stats
 
-                if logits_owned:
-                    ttnn.deallocate(logits)
+            if logits_owned:
+                ttnn.deallocate(logits)
 
-                if next_token == self.tokenizer.eos_token_id:
-                    break
-
-        finally:
-            self._release_trace()
+            if next_token == self.tokenizer.eos_token_id:
+                break
 
     def reset(self) -> None:
         """Reset generator state."""
