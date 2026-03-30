@@ -28,7 +28,7 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.config import get_compute_kernel_config
-from bitnet_tt.layers.attention import KVCache
+from bitnet_tt.layers.attention import KVCache, fill_cache_range
 
 if TYPE_CHECKING:
     from bitnet_tt.model.bitnet import BitNetModel
@@ -1043,11 +1043,10 @@ class Batch32Generator:
                     padded_upload = False
 
                 actual_batch = min(k_upload.shape[0], PADDED_BATCH)
-                for batch_idx in range(actual_batch):
-                    k_batch = k_upload[batch_idx : batch_idx + 1, :, :, :]
-                    v_batch = v_upload[batch_idx : batch_idx + 1, :, :, :]
-                    batch32_cache.key_cache = ttnn.fill_cache(batch32_cache.key_cache, k_batch, batch_idx)
-                    batch32_cache.value_cache = ttnn.fill_cache(batch32_cache.value_cache, v_batch, batch_idx)
+                k_upload_actual = k_upload[:actual_batch, :, :, :]
+                v_upload_actual = v_upload[:actual_batch, :, :, :]
+                batch32_cache.key_cache = fill_cache_range(batch32_cache.key_cache, k_upload_actual, 0)
+                batch32_cache.value_cache = fill_cache_range(batch32_cache.value_cache, v_upload_actual, 0)
 
                 if padded_upload:
                     ttnn.deallocate(k_upload)

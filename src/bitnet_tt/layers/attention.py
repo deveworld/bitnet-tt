@@ -28,6 +28,33 @@ from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_w
 from bitnet_tt.utils.rope import precompute_freqs_cis
 
 
+def fill_cache_range(
+    cache_tensor: ttnn.Tensor,
+    input_tensor: ttnn.Tensor,
+    batch_start: int = 0,
+) -> ttnn.Tensor:
+    """
+    Fill a contiguous batch range in KV cache.
+
+    Newer TT-NN runtimes can ingest the full batch range in one call. Older
+    runtimes only support batch=1 and need the conservative per-batch loop.
+    """
+    input_batch = int(input_tensor.shape[0])
+    if input_batch <= 1:
+        return ttnn.fill_cache(cache_tensor, input_tensor, batch_start)
+
+    try:
+        return ttnn.fill_cache(cache_tensor, input_tensor, batch_start)
+    except RuntimeError as exc:
+        if "Input tensor batch size must be 1" not in str(exc):
+            raise
+
+    for batch_idx in range(input_batch):
+        batch_tensor = input_tensor[batch_idx : batch_idx + 1, :, :, :]
+        cache_tensor = ttnn.fill_cache(cache_tensor, batch_tensor, batch_start + batch_idx)
+    return cache_tensor
+
+
 @dataclass
 class KVCache:
     """
@@ -169,20 +196,14 @@ class KVCache:
                     value_states, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0
                 )
 
-                for batch_idx in range(key_padded.shape[0]):
-                    k_batch = key_padded[batch_idx : batch_idx + 1, :, :, :]
-                    v_batch = value_padded[batch_idx : batch_idx + 1, :, :, :]
-                    self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
-                    self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
+                self.key_cache = fill_cache_range(self.key_cache, key_padded, 0)
+                self.value_cache = fill_cache_range(self.value_cache, value_padded, 0)
 
                 ttnn.deallocate(key_padded)
                 ttnn.deallocate(value_padded)
             else:
-                for batch_idx in range(key_states.shape[0]):
-                    k_batch = key_states[batch_idx : batch_idx + 1, :, :, :]
-                    v_batch = value_states[batch_idx : batch_idx + 1, :, :, :]
-                    self.key_cache = ttnn.fill_cache(self.key_cache, k_batch, batch_idx)
-                    self.value_cache = ttnn.fill_cache(self.value_cache, v_batch, batch_idx)
+                self.key_cache = fill_cache_range(self.key_cache, key_states, 0)
+                self.value_cache = fill_cache_range(self.value_cache, value_states, 0)
 
             self.seq_len_cached = seq_len
 
@@ -1972,28 +1993,14 @@ class MultiHeadAttention:
                 key_padded = ttnn.pad(key, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
                 value_padded = ttnn.pad(value, [(0, 0), (0, pad_amount), (0, 0), (0, 0)], 0.0)
 
-                for batch_idx in range(batch_size):
-                    k_batch = key_padded[batch_idx : batch_idx + 1, :, :, :]
-                    v_batch = value_padded[batch_idx : batch_idx + 1, :, :, :]
-                    past_key_value.key_cache = ttnn.fill_cache(
-                        past_key_value.key_cache, k_batch, batch_idx
-                    )
-                    past_key_value.value_cache = ttnn.fill_cache(
-                        past_key_value.value_cache, v_batch, batch_idx
-                    )
+                past_key_value.key_cache = fill_cache_range(past_key_value.key_cache, key_padded, 0)
+                past_key_value.value_cache = fill_cache_range(past_key_value.value_cache, value_padded, 0)
 
                 ttnn.deallocate(key_padded)
                 ttnn.deallocate(value_padded)
             else:
-                for batch_idx in range(batch_size):
-                    k_batch = key[batch_idx : batch_idx + 1, :, :, :]
-                    v_batch = value[batch_idx : batch_idx + 1, :, :, :]
-                    past_key_value.key_cache = ttnn.fill_cache(
-                        past_key_value.key_cache, k_batch, batch_idx
-                    )
-                    past_key_value.value_cache = ttnn.fill_cache(
-                        past_key_value.value_cache, v_batch, batch_idx
-                    )
+                past_key_value.key_cache = fill_cache_range(past_key_value.key_cache, key, 0)
+                past_key_value.value_cache = fill_cache_range(past_key_value.value_cache, value, 0)
             ttnn.deallocate(key)
             ttnn.deallocate(value)
         else:
