@@ -137,6 +137,22 @@ class GenerationStats:
         )
 
 
+@dataclass
+class WarmupStats:
+    """Statistics for startup warmup / precompile passes."""
+
+    prompt_tokens: int = 0
+    cache_seq_len: int = 0
+    prompt_time: float = 0.0
+    sample_time: float = 0.0
+    decode_time: float = 0.0
+    trace_captured: bool = False
+
+    @property
+    def total_time(self) -> float:
+        return self.prompt_time + self.sample_time + self.decode_time
+
+
 def pad_batch_to_32(x: torch.Tensor, batch_dim: int = 0) -> torch.Tensor:
     """Pad tensor's batch dimension to 32."""
     shape = list(x.shape)
@@ -497,6 +513,34 @@ class Batch32Generator:
         except ImportError:
             print("Warning: transformers not installed. Cannot load tokenizer.")
             self.tokenizer = None
+
+    def _default_warmup_token_id(self) -> int:
+        """Choose a deterministic token id for synthetic warmup prompts."""
+        for attr in ("eos_token_id", "pad_token_id", "bos_token_id"):
+            token_id = getattr(self.tokenizer, attr, None)
+            if token_id is not None:
+                return int(token_id)
+        return 0
+
+    def _build_warmup_input_ids(
+        self,
+        prompt: Optional[str],
+        prompt_tokens: int,
+        token_id: Optional[int],
+    ) -> NDArray[np.int64]:
+        """Build prompt token ids for startup warmup."""
+        if prompt is not None:
+            if self.tokenizer is None:
+                raise RuntimeError("Tokenizer not loaded")
+            input_ids = self.tokenizer(prompt, return_tensors="np")["input_ids"]
+            if input_ids.size == 0 or input_ids.shape[1] == 0:
+                raise ValueError("Warmup prompt must contain at least one token")
+            return input_ids
+
+        if prompt_tokens <= 0:
+            raise ValueError("prompt_tokens must be positive when prompt is omitted")
+        warm_token_id = self._default_warmup_token_id() if token_id is None else int(token_id)
+        return np.full((1, prompt_tokens), warm_token_id, dtype=np.int64)
 
     def _allocate_kv_caches(self, max_seq_len: int) -> list[KVCache]:
         """Allocate paged KV caches for all layers using virtual batch=32."""
@@ -1120,6 +1164,62 @@ class Batch32Generator:
             return int(top_k_indices[sampled_idx].item())
 
         return int(torch.argmax(last_logits).item())
+
+    def warmup(
+        self,
+        prompt: Optional[str] = None,
+        *,
+        prompt_tokens: int = 6,
+        max_new_tokens: int = 32,
+        token_id: Optional[int] = None,
+    ) -> WarmupStats:
+        """
+        Pre-compile prompt prefill and first decode/trace for serving startup.
+
+        This pays the heavy first-request compilation cost ahead of time using
+        either a real prompt or a synthetic fixed-shape prompt.
+        """
+        input_ids = self._build_warmup_input_ids(prompt, prompt_tokens, token_id)
+        stats = WarmupStats(prompt_tokens=int(input_ids.shape[1]))
+
+        max_seq_len = choose_single_user_cache_seq_len(
+            input_ids.shape[1] + max_new_tokens + TRACE_CACHE_SLACK_TOKENS
+        )
+        stats.cache_seq_len = max_seq_len
+        self._ensure_kv_caches(max_seq_len)
+
+        prefill_start = time.perf_counter()
+        cached_prefill = self._try_reuse_prefill(input_ids, max_seq_len)
+        if cached_prefill is None:
+            cached_prefill = self._try_extend_prefill_from_cached_prefix(input_ids, max_seq_len)
+            if cached_prefill is None:
+                logits, seq_len = self._prefill_batch32(input_ids)
+                self._cache_prefill(input_ids, logits, seq_len)
+            else:
+                logits, seq_len = cached_prefill
+        else:
+            logits, seq_len = cached_prefill
+        stats.prompt_time = time.perf_counter() - prefill_start
+
+        if max_new_tokens <= 0:
+            return stats
+
+        sample_start = time.perf_counter()
+        next_token = self._sample_token(logits, temperature=0.0, top_k=1)
+        stats.sample_time = time.perf_counter() - sample_start
+
+        decode_start = time.perf_counter()
+        if self.enable_trace:
+            captured_new_trace = self._capture_trace(next_token, seq_len)
+            stats.trace_captured = True
+            if not captured_new_trace:
+                self._execute_trace(next_token, seq_len)
+        else:
+            warm_logits = self._execute_decode_untraced(next_token, seq_len)
+            ttnn.deallocate(warm_logits)
+        stats.decode_time = time.perf_counter() - decode_start
+
+        return stats
 
     def generate(
         self,

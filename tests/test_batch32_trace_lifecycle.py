@@ -282,6 +282,105 @@ def test_generate_requests_tight_trace_cache_capacity(monkeypatch) -> None:
     assert counters["ensure_kv_caches"] == 1
 
 
+def test_warmup_primes_prefill_and_trace_with_synthetic_prompt(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    counters = {
+        "ensure_kv_caches": [],
+        "prefill": 0,
+        "cache_prefill": 0,
+        "sample_token": 0,
+        "capture_trace": 0,
+    }
+
+    generator.tokenizer = _FakeTokenizer()
+    generator.enable_trace = True
+    generator._kv_caches = []
+    generator._cached_prefill_key = None
+    generator._cached_prefill_seq_len = 0
+    generator._cached_prefill_logits = None
+    generator._cached_prefill_cache_seq_len = 0
+
+    generator._ensure_kv_caches = lambda max_seq_len: (
+        counters["ensure_kv_caches"].append(max_seq_len),
+        setattr(generator, "_kv_caches", [SimpleNamespace(max_seq_len=max_seq_len, seq_len_cached=0)]),
+    )
+    generator._try_reuse_prefill = lambda *_args: None
+    generator._try_extend_prefill_from_cached_prefix = lambda *_args: None
+
+    def prefill_batch32(input_ids):
+        counters["prefill"] += 1
+        assert input_ids.shape == (1, 6)
+        assert np.all(input_ids == _FakeTokenizer.eos_token_id)
+        return "prefill-logits", 6
+
+    def cache_prefill(input_ids, logits, seq_len):
+        counters["cache_prefill"] += 1
+        assert input_ids.shape == (1, 6)
+        assert logits == "prefill-logits"
+        assert seq_len == 6
+
+    generator._prefill_batch32 = prefill_batch32
+    generator._cache_prefill = cache_prefill
+    generator._sample_token = lambda logits, temperature, top_k: (
+        counters.__setitem__("sample_token", counters["sample_token"] + 1) or 7
+    )
+    generator._capture_trace = lambda token_id, current_pos: (
+        counters.__setitem__("capture_trace", counters["capture_trace"] + 1) or True
+    )
+
+    monkeypatch.setattr(generator_batch32_module, "choose_single_user_cache_seq_len", lambda requested: 64)
+
+    stats = Batch32Generator.warmup(generator, prompt=None, prompt_tokens=6, max_new_tokens=32)
+
+    assert stats.prompt_tokens == 6
+    assert stats.cache_seq_len == 64
+    assert stats.trace_captured is True
+    assert counters["ensure_kv_caches"] == [64]
+    assert counters["prefill"] == 1
+    assert counters["cache_prefill"] == 1
+    assert counters["sample_token"] == 1
+    assert counters["capture_trace"] == 1
+
+
+def test_warmup_uses_prompt_tokens_and_reuses_existing_trace(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.tokenizer = _FakeTokenizer()
+    generator.enable_trace = True
+    generator._kv_caches = []
+    generator._cached_prefill_key = None
+    generator._cached_prefill_seq_len = 0
+    generator._cached_prefill_logits = None
+    generator._cached_prefill_cache_seq_len = 0
+
+    counters = {
+        "prefill": 0,
+        "execute_trace": 0,
+    }
+
+    generator._ensure_kv_caches = lambda max_seq_len: setattr(
+        generator, "_kv_caches", [SimpleNamespace(max_seq_len=max_seq_len, seq_len_cached=0)]
+    )
+    generator._try_reuse_prefill = lambda input_ids, max_seq_len: ("cached-logits", int(input_ids.shape[1]))
+    generator._try_extend_prefill_from_cached_prefix = lambda *_args: None
+    generator._prefill_batch32 = lambda *_args: counters.__setitem__("prefill", counters["prefill"] + 1)
+    generator._cache_prefill = lambda *_args: None
+    generator._sample_token = lambda _logits, temperature=1.0, top_k=50: 7
+    generator._capture_trace = lambda *_args: False
+    generator._execute_trace = lambda *_args: counters.__setitem__(
+        "execute_trace", counters["execute_trace"] + 1
+    )
+
+    monkeypatch.setattr(generator_batch32_module, "choose_single_user_cache_seq_len", lambda requested: 96)
+
+    stats = Batch32Generator.warmup(generator, prompt="hello", max_new_tokens=32)
+
+    assert stats.prompt_tokens == 2
+    assert stats.cache_seq_len == 96
+    assert stats.trace_captured is True
+    assert counters["prefill"] == 0
+    assert counters["execute_trace"] == 1
+
+
 def test_capture_trace_skips_warmup_for_previously_compiled_position(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     decode_calls = []
