@@ -399,15 +399,18 @@ def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatc
     generator._logits_host_tensors = []
     generator._supports_host_tensor_to_torch = None
 
-    logits = SimpleNamespace(spec="spec")
+    logits = SimpleNamespace(spec="spec", shape=(1, 4, 3))
+    last_row = SimpleNamespace(spec="last-spec")
     host_tensor = object()
     calls = []
 
     monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: host_tensor)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "slice", lambda *_args, **_kwargs: last_row)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
 
     def fake_to_torch(tensor, **kwargs):
         calls.append(kwargs)
-        assert tensor is logits
+        assert tensor is last_row
         if "host_tensor" in kwargs:
             raise TypeError("unexpected keyword argument 'host_tensor'")
         return torch.tensor([[[0.1, 0.9, 0.2]]], dtype=torch.float32)
@@ -431,15 +434,18 @@ def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
     generator._logits_host_tensors = []
     generator._supports_host_tensor_to_torch = None
 
-    logits = SimpleNamespace(spec="spec")
+    logits = SimpleNamespace(spec="spec", shape=(1, 4, 3))
+    last_row = SimpleNamespace(spec="last-spec")
     host_tensor = object()
     calls = []
 
     monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: host_tensor)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "slice", lambda *_args, **_kwargs: last_row)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
 
     def fake_to_torch(tensor, **kwargs):
         calls.append(kwargs)
-        assert tensor is logits
+        assert tensor is last_row
         assert kwargs == {"host_tensor": host_tensor}
         return torch.tensor([[[0.1, 0.2, 0.8]]], dtype=torch.float32)
 
@@ -453,7 +459,7 @@ def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:
     assert calls == [{"host_tensor": host_tensor}]
 
 
-def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
+def test_sample_token_uses_sliced_host_logits_for_greedy(monkeypatch) -> None:
     generator = object.__new__(Batch32Generator)
     generator.device = object()
     generator._argmax_output_tensors = []
@@ -464,7 +470,8 @@ def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
     class _FakeTensor:
         def __init__(self, label: str):
             self.label = label
-            self.shape = (1, 1, 128256)
+            self.shape = (1, 3, 128256)
+            self.spec = f"{label}-spec"
 
         def __getitem__(self, item):
             return _FakeTensor(f"{self.label}[{item!r}]")
@@ -472,75 +479,33 @@ def test_sample_token_uses_on_device_argmax_for_greedy(monkeypatch) -> None:
         def __repr__(self) -> str:
             return self.label
 
+    sliced = _FakeTensor("last-row")
     calls = []
 
-    monkeypatch.setattr(generator_batch32_module.ttnn, "ROW_MAJOR_LAYOUT", "row")
-    monkeypatch.setattr(generator_batch32_module.ttnn, "TILE_LAYOUT", "tile")
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
-        "to_layout",
-        lambda tensor, layout: calls.append(("to_layout", repr(tensor), layout))
-        or _FakeTensor(f"{tensor.label}-{layout}"),
+        "slice",
+        lambda tensor, start, end: calls.append(("slice", tensor, tuple(start), tuple(end))) or sliced,
     )
-    monkeypatch.setattr(
-        generator_batch32_module.ttnn,
-        "argmax",
-        lambda tensor, dim=-1: calls.append(("argmax", tensor, dim)) or "token_indices",
-    )
+    monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: "host")
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
         "to_torch",
         lambda tensor, **kwargs: calls.append(("to_torch", tensor, kwargs))
-        or torch.tensor([[[5]]], dtype=torch.int32),
+        or torch.tensor([[[1.0, 5.0, 2.0]]], dtype=torch.float32),
     )
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
         "deallocate",
         lambda tensor: calls.append(("deallocate", tensor)),
     )
-    monkeypatch.setattr(
-        generator_batch32_module.ttnn,
-        "allocate_tensor_on_host",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("host tensor should not be allocated")),
-    )
 
     token = Batch32Generator._sample_token(generator, _FakeTensor("logits"), temperature=1.0, top_k=None)
 
-    assert token == 5
-    assert any(call[0] == "argmax" for call in calls)
-    assert generator._logits_host_tensors == []
-
-
-def test_sample_token_reuses_argmax_output_tensor_for_same_shape(monkeypatch) -> None:
-    generator = object.__new__(Batch32Generator)
-    generator.device = object()
-    generator._argmax_output_tensors = []
-    generator._logits_host_tensor = None
-    generator._logits_host_tensors = []
-    generator._supports_host_tensor_to_torch = None
-
-    logits = SimpleNamespace(shape=(1, 1, 128256))
-    cached_output = object()
-    calls = []
-
-    def fake_argmax(tensor, dim=-1, output_tensor=None):
-        calls.append(output_tensor)
-        return cached_output if output_tensor is None else output_tensor
-
-    monkeypatch.setattr(generator_batch32_module.ttnn, "argmax", fake_argmax)
-    monkeypatch.setattr(
-        generator_batch32_module.ttnn,
-        "to_torch",
-        lambda tensor, **kwargs: torch.tensor([[[3]]], dtype=torch.int32),
-    )
-
-    first = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
-    second = Batch32Generator._sample_token(generator, logits, temperature=1.0, top_k=None)
-
-    assert first == 3
-    assert second == 3
-    assert calls == [None, cached_output]
-    assert generator._argmax_output_tensors == [((1, 1, 128256), cached_output)]
+    assert token == 1
+    assert calls[0][0] == "slice"
+    assert any(call[0] == "to_torch" for call in calls)
+    assert ("deallocate", sliced) in calls
 
 
 def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> None:
@@ -552,12 +517,15 @@ def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> 
     generator._logits_host_tensors = [("old", old_host_tensor)]
     generator._supports_host_tensor_to_torch = None
 
-    logits = SimpleNamespace(spec="new")
+    logits = SimpleNamespace(spec="new", shape=(1, 4, 3))
+    last_row = SimpleNamespace(spec="last-new")
     new_host_tensor = object()
+    monkeypatch.setattr(generator_batch32_module.ttnn, "slice", lambda *_args, **_kwargs: last_row)
+    monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
         "allocate_tensor_on_host",
-        lambda spec, _device: new_host_tensor if spec == "new" else None,
+        lambda spec, _device: new_host_tensor if spec == "last-new" else None,
     )
     monkeypatch.setattr(
         generator_batch32_module.ttnn,
@@ -570,4 +538,4 @@ def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> 
 
     assert token == 1
     assert generator._logits_host_tensor is new_host_tensor
-    assert generator._logits_host_tensors == [("old", old_host_tensor), ("new", new_host_tensor)]
+    assert generator._logits_host_tensors == [("old", old_host_tensor), ("last-new", new_host_tensor)]

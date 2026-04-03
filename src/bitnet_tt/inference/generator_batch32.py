@@ -1063,51 +1063,48 @@ class Batch32Generator:
         top_k: Optional[int] = 50,
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
-        if temperature <= 0.0 or top_k is None or top_k <= 1:
-            shape_key = tuple(int(dim) for dim in logits.shape)
-            output_tensor = None
-            for cached_shape, cached_tensor in self._argmax_output_tensors:
-                if cached_shape == shape_key:
-                    output_tensor = cached_tensor
-                    break
-            try:
-                if output_tensor is None:
-                    output_tensor = ttnn.argmax(logits, dim=-1)
-                    self._argmax_output_tensors.append((shape_key, output_tensor))
-                else:
-                    ttnn.argmax(logits, dim=-1, output_tensor=output_tensor)
-                return int(ttnn.to_torch(output_tensor).numpy().reshape(-1)[0])
-            except Exception:
-                return _on_device_argmax_single(logits)
+        # Only the final logical token participates in sampling. Copying the
+        # entire prefill logits tensor back to host is wasteful and has caused
+        # the dev runtime to stall before the first token is sampled.
+        last_row = ttnn.slice(
+            logits,
+            (0, max(int(logits.shape[1]) - 1, 0), 0),
+            (1, int(logits.shape[1]), int(logits.shape[2])),
+        )
+        try:
+            # Reuse a pinned host tensor to avoid per-token host allocations on the
+            # logits copy path, which shows up directly in warmed batch32 wall time.
+            host_tensor = None
+            for cached_spec, cached_tensor in self._logits_host_tensors:
+                try:
+                    if cached_spec == last_row.spec:
+                        host_tensor = cached_tensor
+                        break
+                except Exception:
+                    continue
+            if host_tensor is None:
+                host_tensor = ttnn.allocate_tensor_on_host(last_row.spec, self.device)
+                self._logits_host_tensors.append((last_row.spec, host_tensor))
+            self._logits_host_tensor = host_tensor
+            if self._supports_host_tensor_to_torch is not False:
+                try:
+                    last_logits = ttnn.to_torch(
+                        last_row,
+                        host_tensor=host_tensor,
+                    )[0, 0, :].float()
+                    self._supports_host_tensor_to_torch = True
+                except TypeError:
+                    # Older TTNN wheels expose copy_device_to_host_tensor but do not
+                    # accept host_tensor in the Python to_torch wrapper yet.
+                    self._supports_host_tensor_to_torch = False
+                    last_logits = ttnn.to_torch(last_row)[0, 0, :].float()
+            else:
+                last_logits = ttnn.to_torch(last_row)[0, 0, :].float()
+        finally:
+            ttnn.deallocate(last_row)
 
-        # Reuse a pinned host tensor to avoid per-token host allocations on the
-        # logits copy path, which shows up directly in warmed batch32 wall time.
-        host_tensor = None
-        for cached_spec, cached_tensor in self._logits_host_tensors:
-            try:
-                if cached_spec == logits.spec:
-                    host_tensor = cached_tensor
-                    break
-            except Exception:
-                continue
-        if host_tensor is None:
-            host_tensor = ttnn.allocate_tensor_on_host(logits.spec, self.device)
-            self._logits_host_tensors.append((logits.spec, host_tensor))
-        self._logits_host_tensor = host_tensor
-        if self._supports_host_tensor_to_torch is not False:
-            try:
-                last_logits = ttnn.to_torch(
-                    logits,
-                    host_tensor=host_tensor,
-                )[0, -1, :].float()
-                self._supports_host_tensor_to_torch = True
-            except TypeError:
-                # Older TTNN wheels expose copy_device_to_host_tensor but do not
-                # accept host_tensor in the Python to_torch wrapper yet.
-                self._supports_host_tensor_to_torch = False
-                last_logits = ttnn.to_torch(logits)[0, -1, :].float()
-        else:
-            last_logits = ttnn.to_torch(logits)[0, -1, :].float()
+        if temperature <= 0.0 or top_k is None or top_k <= 1:
+            return int(torch.argmax(last_logits).item())
 
         if temperature != 1.0:
             last_logits = last_logits / temperature
