@@ -1096,14 +1096,13 @@ class MultiHeadAttention:
         #         cos_sin_tensors=cos_sin_tensors,
         #     )
 
-        # Standard path: fused QKV projection when available, otherwise separate projections.
-        if self.qkv_fused_weight is not None:
-            xqkv_fused = ttnn.matmul(hidden_states, self.qkv_fused_weight)
-            query, key, value = self._split_fused_qkv(xqkv_fused)
-        else:
-            query = self.q_proj(hidden_states)
-            key = self.k_proj(hidden_states)
-            value = self.v_proj(hidden_states)
+        # Standard prefill/fallback paths keep separate Q/K/V projections. The fused
+        # QKV weight is still used by the batch32 decode core, which consumes the fused
+        # output directly without slicing. In the generic path, TTNN matmul currently
+        # produces a compact trailing dimension that breaks the subsequent split logic.
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
 
         # NOTE: 1BKD path disabled - rotary_embedding_llama requires HEIGHT_SHARDED inputs
         # which cannot be properly created for batch=1. TT's 1BKD optimizations are designed
