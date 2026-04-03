@@ -17,7 +17,7 @@ from bitnet_tt.config import BitNet2B4TConfig, BitNetConfig
 
 
 def load_bitnet_weights(
-    model_id: str = "microsoft/bitnet-b1.58-2B-4T",
+    model_id: str = "microsoft/bitnet-b1.58-2B-4T-bf16",
     cache_dir: str | None = None,
 ) -> tuple[dict[str, NDArray[np.floating]], BitNetConfig]:
     """

@@ -491,7 +491,7 @@ class Batch32Generator:
         try:
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T")
+            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16")
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
         except ImportError:
@@ -1066,11 +1066,14 @@ class Batch32Generator:
         # Only the final logical token participates in sampling. Copying the
         # entire prefill logits tensor back to host is wasteful and has caused
         # the dev runtime to stall before the first token is sampled.
-        last_row = ttnn.slice(
-            logits,
-            (0, max(int(logits.shape[1]) - 1, 0), 0),
-            (1, int(logits.shape[1]), int(logits.shape[2])),
-        )
+        use_direct_logits = int(logits.shape[1]) == 1
+        last_row = logits
+        if not use_direct_logits:
+            last_row = ttnn.slice(
+                logits,
+                (0, max(int(logits.shape[1]) - 1, 0), 0),
+                (1, int(logits.shape[1]), int(logits.shape[2])),
+            )
         try:
             # Reuse a pinned host tensor to avoid per-token host allocations on the
             # logits copy path, which shows up directly in warmed batch32 wall time.
@@ -1101,7 +1104,8 @@ class Batch32Generator:
             else:
                 last_logits = ttnn.to_torch(last_row)[0, 0, :].float()
         finally:
-            ttnn.deallocate(last_row)
+            if not use_direct_logits:
+                ttnn.deallocate(last_row)
 
         if temperature <= 0.0 or top_k is None or top_k <= 1:
             return int(torch.argmax(last_logits).item())

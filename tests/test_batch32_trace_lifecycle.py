@@ -539,3 +539,42 @@ def test_sample_token_reallocates_host_tensor_when_spec_changes(monkeypatch) -> 
     assert token == 1
     assert generator._logits_host_tensor is new_host_tensor
     assert generator._logits_host_tensors == [("old", old_host_tensor), ("last-new", new_host_tensor)]
+
+
+def test_sample_token_uses_trace_logits_directly_when_single_step(monkeypatch) -> None:
+    generator = object.__new__(Batch32Generator)
+    generator.device = object()
+    generator._argmax_output_tensors = []
+    generator._logits_host_tensor = None
+    generator._logits_host_tensors = []
+    generator._supports_host_tensor_to_torch = None
+
+    logits = SimpleNamespace(spec="trace-spec", shape=(1, 1, 3))
+    calls = []
+
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "allocate_tensor_on_host",
+        lambda *_args: "host",
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "to_torch",
+        lambda tensor, **kwargs: calls.append(("to_torch", tensor, kwargs))
+        or torch.tensor([[[0.1, 0.8, 0.2]]], dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "slice",
+        lambda *_args, **_kwargs: calls.append(("slice",)) or None,
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "deallocate",
+        lambda tensor: calls.append(("deallocate", tensor)),
+    )
+
+    token = Batch32Generator._sample_token(generator, logits, temperature=0.0, top_k=1)
+
+    assert token == 1
+    assert calls == [("to_torch", logits, {"host_tensor": "host"})]
