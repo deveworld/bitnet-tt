@@ -506,12 +506,23 @@ def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatc
     monkeypatch.setattr(generator_batch32_module.ttnn, "allocate_tensor_on_host", lambda *_args: host_tensor)
     monkeypatch.setattr(generator_batch32_module.ttnn, "slice", lambda *_args, **_kwargs: last_row)
     monkeypatch.setattr(generator_batch32_module.ttnn, "deallocate", lambda _tensor: None)
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "copy_device_to_host_tensor",
+        lambda tensor, host, **_kwargs: calls.append(("copy_device_to_host_tensor", tensor, host)),
+    )
+    monkeypatch.setattr(
+        generator_batch32_module.ttnn,
+        "synchronize_device",
+        lambda _device: calls.append(("synchronize_device", _device)),
+    )
 
     def fake_to_torch(tensor, **kwargs):
         calls.append(kwargs)
-        assert tensor is last_row
         if "host_tensor" in kwargs:
+            assert tensor is last_row
             raise TypeError("unexpected keyword argument 'host_tensor'")
+        assert tensor is host_tensor
         return torch.tensor([[[0.1, 0.9, 0.2]]], dtype=torch.float32)
 
     monkeypatch.setattr(generator_batch32_module.ttnn, "to_torch", fake_to_torch)
@@ -522,7 +533,12 @@ def test_sample_token_falls_back_when_torch_wrapper_lacks_host_tensor(monkeypatc
     assert token == 1
     assert generator._logits_host_tensor is host_tensor
     assert generator._supports_host_tensor_to_torch is False
-    assert calls == [{"host_tensor": host_tensor}, {}]
+    assert calls == [
+        {"host_tensor": host_tensor},
+        ("copy_device_to_host_tensor", last_row, host_tensor),
+        ("synchronize_device", generator.device),
+        {},
+    ]
 
 
 def test_sample_token_reuses_host_tensor_when_supported(monkeypatch) -> None:

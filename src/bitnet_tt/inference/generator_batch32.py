@@ -1142,11 +1142,16 @@ class Batch32Generator:
                     self._supports_host_tensor_to_torch = True
                 except TypeError:
                     # Older TTNN wheels expose copy_device_to_host_tensor but do not
-                    # accept host_tensor in the Python to_torch wrapper yet.
+                    # accept host_tensor in the Python to_torch wrapper yet. Use
+                    # the lower-level copy path to preserve host buffer reuse.
                     self._supports_host_tensor_to_torch = False
-                    last_logits = ttnn.to_torch(last_row)[0, 0, :].float()
+                    ttnn.copy_device_to_host_tensor(last_row, host_tensor)
+                    ttnn.synchronize_device(self.device)
+                    last_logits = ttnn.to_torch(host_tensor)[0, 0, :].float()
             else:
-                last_logits = ttnn.to_torch(last_row)[0, 0, :].float()
+                ttnn.copy_device_to_host_tensor(last_row, host_tensor)
+                ttnn.synchronize_device(self.device)
+                last_logits = ttnn.to_torch(host_tensor)[0, 0, :].float()
         finally:
             if not use_direct_logits:
                 ttnn.deallocate(last_row)
