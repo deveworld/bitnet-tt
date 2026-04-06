@@ -61,6 +61,7 @@ class FeedForward:
         eps: float = 1e-5,
         model_config: Optional[dict] = None,
         use_lofi: bool = False,
+        weight_dtype: str = "bf16",
     ) -> None:
         """
         Initialize FFN.
@@ -72,6 +73,7 @@ class FeedForward:
             eps: Epsilon for numerical stability
             model_config: Optional model config with memory configs
             use_lofi: Use LoFi compute kernel for ~3.6x speedup (default: False)
+            weight_dtype: Weight storage format — "bf16", "bfp4", or "bfp8"
         """
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -89,8 +91,13 @@ class FeedForward:
             intermediate_size * 2,
             device,
             compute_fidelity=fidelity,
+            weight_dtype=weight_dtype,
         )
-        self.down_proj = Linear(intermediate_size, hidden_size, device, compute_fidelity=fidelity)
+        self.down_proj = Linear(
+            intermediate_size, hidden_size, device,
+            compute_fidelity=fidelity,
+            weight_dtype=weight_dtype,
+        )
 
         # Sub-norm applied after gate*up, before down_proj
         self.ffn_sub_norm = RMSNorm(intermediate_size, device, eps)

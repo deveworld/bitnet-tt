@@ -64,6 +64,20 @@ except ImportError:
 _device = None
 
 
+def _get_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    return _parse_bool_env_value(os.getenv(name), default)
+
+
 def get_device(device_id: int = 0) -> "ttnn.Device":
     """
     Get or create a TT-NN device.
@@ -83,9 +97,33 @@ def get_device(device_id: int = 0) -> "ttnn.Device":
         raise RuntimeError("ttnn is not available. Please install the Tenstorrent SDK.")
 
     if _device is None:
-        # trace_region_size required for Metal Trace (Trace capture/execute)
-        # Error showed need for ~12.5MB, allocating 20MB to be safe
-        _device = ttnn.open_device(device_id=device_id, trace_region_size=20_000_000)
+        if hasattr(ttnn, "CONFIG") and hasattr(ttnn.CONFIG, "enable_model_cache"):
+            ttnn.CONFIG.enable_model_cache = _get_bool_env(
+                "BITNET_TT_ENABLE_MODEL_CACHE", default=True
+            )
+
+        open_kwargs: dict[str, int] = {
+            "device_id": device_id,
+            "trace_region_size": _get_int_env("BITNET_TT_TRACE_REGION_SIZE") or 20_000_000,
+        }
+
+        l1_small_size = _get_int_env("BITNET_TT_L1_SMALL_SIZE")
+        if l1_small_size is not None:
+            open_kwargs["l1_small_size"] = l1_small_size
+
+        num_command_queues = _get_int_env("BITNET_TT_NUM_COMMAND_QUEUES")
+        if num_command_queues is not None:
+            open_kwargs["num_command_queues"] = num_command_queues
+
+        worker_l1_size = _get_int_env("BITNET_TT_WORKER_L1_SIZE")
+        if worker_l1_size is not None:
+            open_kwargs["worker_l1_size"] = worker_l1_size
+
+        _device = ttnn.open_device(**open_kwargs)
+        if _get_bool_env("BITNET_TT_ENABLE_PROGRAM_CACHE", default=True) and hasattr(
+            _device, "enable_program_cache"
+        ):
+            _device.enable_program_cache()
 
     return _device
 

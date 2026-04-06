@@ -52,19 +52,19 @@ class TestRoPE:
 
     def test_precompute_freqs_shape(self) -> None:
         """Test shape of precomputed frequencies."""
-        from bitnet_tt.layers.attention import precompute_freqs_cis
+        from bitnet_tt.utils.rope import precompute_freqs_cis
 
         dim = 64
         max_seq_len = 512
 
         cos, sin = precompute_freqs_cis(dim, max_seq_len)
 
-        assert cos.shape == (max_seq_len, dim // 2)
-        assert sin.shape == (max_seq_len, dim // 2)
+        assert cos.shape == (1, 1, max_seq_len, dim)
+        assert sin.shape == (1, 1, max_seq_len, dim)
 
     def test_precompute_freqs_values(self) -> None:
         """Test that frequencies are in valid range."""
-        from bitnet_tt.layers.attention import precompute_freqs_cis
+        from bitnet_tt.utils.rope import precompute_freqs_cis
 
         cos, sin = precompute_freqs_cis(64, 512)
 
@@ -142,7 +142,7 @@ class TestWeightLoading:
 
 @pytest.mark.skipif(
     True,  # Skip by default, enable on hardware
-    reason="Requires TT-NN hardware"
+    reason="Requires TT-NN hardware",
 )
 class TestModelTTNN:
     """Tests for TT-NN model (requires hardware)."""

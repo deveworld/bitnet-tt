@@ -41,6 +41,7 @@ class BitNetModel:
         config: BitNetConfig,
         device: ttnn.Device,
         use_lofi_mlp: bool = False,
+        weight_dtype: str = "bf16",
     ) -> None:
         self.config = config
         self.device = device
@@ -67,6 +68,7 @@ class BitNetModel:
                     rms_norm_eps=config.rms_norm_eps,
                     layer_idx=layer_idx,
                     use_lofi_mlp=use_lofi_mlp,
+                    weight_dtype=weight_dtype,
                 )
             )
 
@@ -278,5 +280,6 @@ def create_model(
     config: BitNetConfig,
     device: ttnn.Device,
     use_lofi_mlp: bool = False,
+    weight_dtype: str = "bf16",
 ) -> BitNetModel:
-    return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp)
+    return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp, weight_dtype=weight_dtype)

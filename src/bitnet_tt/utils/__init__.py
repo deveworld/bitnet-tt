@@ -11,6 +11,7 @@ from bitnet_tt.utils.quantization import (
     compute_weight_scale,
     weight_quant_ternary,
 )
+from bitnet_tt.utils.rope import precompute_freqs_cis
 from bitnet_tt.utils.weights import (
     load_bitnet_weights,
     load_weights_to_model,
@@ -20,6 +21,7 @@ __all__ = [
     "weight_quant_ternary",
     "activation_quant_absmax",
     "compute_weight_scale",
+    "precompute_freqs_cis",
     "get_device",
     "close_device",
     "device_context",

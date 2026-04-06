@@ -44,6 +44,7 @@ class TransformerBlock:
         rms_norm_eps: float = 1e-6,
         layer_idx: int = 0,
         use_lofi_mlp: bool = False,
+        weight_dtype: str = "bf16",
     ) -> None:
         """
         Initialize transformer block.
@@ -89,6 +90,7 @@ class TransformerBlock:
             device=device,
             eps=rms_norm_eps,
             use_lofi=use_lofi_mlp,
+            weight_dtype=weight_dtype,
         )
 
     def load_weights(

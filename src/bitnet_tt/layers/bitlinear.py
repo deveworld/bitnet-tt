@@ -236,7 +236,19 @@ class Linear:
     Optimization: Uses configurable compute kernel fidelity:
     - HiFi2 (default): ~2x speedup, good accuracy (BFP8)
     - LoFi: ~3.6x speedup, lower accuracy (BFP4) - suitable for MLP layers
+
+    Weight dtype options:
+    - "bf16": bfloat16 baseline (default, backward compatible)
+    - "bfp4": bfloat4_b — 4x DRAM bandwidth reduction for ternary weights
+    - "bfp8": bfloat8_b — 2x DRAM bandwidth reduction
     """
+
+    # Map string names to ttnn data types
+    _WEIGHT_DTYPE_MAP = {
+        "bf16": ttnn.bfloat16,
+        "bfp4": ttnn.bfloat4_b,
+        "bfp8": ttnn.bfloat8_b,
+    }
 
     def __init__(
         self,
@@ -244,6 +256,7 @@ class Linear:
         out_features: int,
         device: ttnn.Device,
         compute_fidelity: str = "hifi2",
+        weight_dtype: str = "bf16",
     ) -> None:
         """
         Initialize Linear layer.
@@ -253,12 +266,15 @@ class Linear:
             out_features: Size of output features
             device: TT-NN device
             compute_fidelity: One of "hifi4", "hifi2" (default), "lofi"
+            weight_dtype: Weight storage format — "bf16", "bfp4", or "bfp8"
         """
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
         self.weight: ttnn.Tensor | None = None
         self._fidelity = compute_fidelity
+        self._weight_dtype_name = weight_dtype
+        self._ttnn_weight_dtype = self._WEIGHT_DTYPE_MAP.get(weight_dtype, ttnn.bfloat16)
 
         # Initialize compute kernel config for faster matmul
         self._compute_kernel_config = None
@@ -291,7 +307,14 @@ class Linear:
         This lets higher-level fused layers concatenate separately quantized
         blocks and still reuse the standard TT matmul path.
         """
-        self.weight = numpy_to_ttnn(weight_t.astype(np.float32), self.device)
+        torch_tensor = torch.from_numpy(weight_t.astype(np.float32))
+        self.weight = ttnn.from_torch(
+            torch_tensor,
+            dtype=self._ttnn_weight_dtype,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
     def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
         """

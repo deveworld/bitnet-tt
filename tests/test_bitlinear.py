@@ -89,13 +89,12 @@ class TestActivationQuantization:
         x = np.random.randn(2, 16, 256).astype(np.float32)
         x_quant, scale = activation_quant_absmax(x)
 
-        # Reconstruct
-        x_recon = x_quant * scale
+        x_recon = x_quant.astype(np.float32) / scale
 
         # Should be close (within quantization error)
         max_error = np.max(np.abs(x - x_recon))
-        # Max error should be bounded by quantization step
-        assert max_error < np.max(np.abs(x)) / 64  # Reasonable bound
+        quant_step = np.max(np.abs(x), axis=-1, keepdims=True) / 127.0
+        assert max_error <= np.max(quant_step) + 1e-5
 
 
 class TestConfig:
@@ -122,7 +121,7 @@ class TestConfig:
 
 @pytest.mark.skipif(
     True,  # Skip by default, enable on hardware
-    reason="Requires TT-NN hardware"
+    reason="Requires TT-NN hardware",
 )
 class TestBitLinearTTNN:
     """Tests for TT-NN BitLinear layer (requires hardware)."""
