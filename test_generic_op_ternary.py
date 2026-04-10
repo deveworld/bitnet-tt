@@ -64,18 +64,28 @@ def test_single_tile_ternary_matmul():
         ttnn.DRAM_MEMORY_CONFIG,
     )
 
-    # Packed weight: flatten to uint32 row-major (for DRAM addressing)
+    # Packed weight: stored as bf16 TILE tensor for TensorAccessor compatibility.
+    # Each tile "page" (2048 bytes bf16) holds one packed ternary tile
+    # (256 bytes actual data in the first 256 bytes, rest padding).
     packed_flat = packed_bytes.flatten()
-    # Pad to 32B alignment
-    pad = (32 - len(packed_flat) % 32) % 32
-    if pad:
-        packed_flat = np.pad(packed_flat, (0, pad), constant_values=0)
-    # Convert to int32 for torch (ttnn uint32 from torch int32)
-    packed_i32 = np.frombuffer(packed_flat.tobytes(), dtype=np.int32)
+    num_packed_tiles = packed_bytes.shape[0]
+    # Each packed tile → one bf16 tile page (2048 bytes). Pad packed data
+    # to fill a full bf16 tile, then store as bf16 TILE_LAYOUT.
+    packed_pages = np.zeros((num_packed_tiles, 32, 32), dtype=np.float32)
+    for t in range(num_packed_tiles):
+        # Store 256 packed bytes as 128 float32 values (reinterpreted)
+        tile_bytes = packed_bytes[t]  # [256] uint8
+        # Put raw bytes into the first 256 bytes of 4096-byte float32 tile
+        raw_f32 = np.frombuffer(tile_bytes.tobytes(), dtype=np.float32)  # [64] f32
+        packed_pages[t, :2, :] = raw_f32.reshape(2, 32)  # first 2 rows × 32 cols
+    # Shape for ttnn: [num_tiles, 32, 32]
+    packed_torch = torch.from_numpy(packed_pages)
+    if num_packed_tiles == 1:
+        packed_torch = packed_torch.unsqueeze(0)  # [1, 1, 32, 32]
     packed_tt = ttnn.from_torch(
-        torch.from_numpy(packed_i32).unsqueeze(0),
-        dtype=ttnn.uint32,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
+        packed_torch,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
         device=device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
@@ -135,13 +145,18 @@ def test_single_tile_ternary_matmul():
     )
 
     # Fused reader: reads activation + packed weight, unpacks to cb1
+    act_ct = list(ttnn.TensorAccessorArgs(act_tt).get_compile_time_args())
+    packed_ct = list(ttnn.TensorAccessorArgs(packed_tt).get_compile_time_args())
+    reader_ct_args = act_ct + packed_ct
+    print(f"Reader CT args: act={act_ct} packed={packed_ct}")
+
     reader_rt = ttnn.RuntimeArgs()
     reader_rt[0][0] = [act_tt.buffer_address(), packed_tt.buffer_address(), Kt, Nt, Mt]
     reader_kernel = ttnn.KernelDescriptor(
         kernel_source=os.path.join(KERNEL_DIR, "reader_ternary_fused.cpp"),
         source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
         core_ranges=core_range,
-        compile_time_args=[],
+        compile_time_args=reader_ct_args,
         runtime_args=reader_rt,
         config=ttnn.ReaderConfigDescriptor(),
     )
@@ -156,14 +171,16 @@ def test_single_tile_ternary_matmul():
         config=ttnn.ComputeConfigDescriptor(),
     )
 
-    # Writer
+    # Writer — compile-time args: [out_cb_idx, TensorAccessorArgs...]
+    out_cb_idx = 16
+    writer_ct_args = [out_cb_idx] + list(ttnn.TensorAccessorArgs(out_tt).get_compile_time_args())
     writer_rt = ttnn.RuntimeArgs()
     writer_rt[0][0] = [out_tt.buffer_address(), Mt, Nt]
     writer_kernel = ttnn.KernelDescriptor(
         kernel_source=os.path.join(KERNEL_DIR, "writer_out.cpp"),
         source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
         core_ranges=core_range,
-        compile_time_args=[],
+        compile_time_args=writer_ct_args,
         runtime_args=writer_rt,
         config=ttnn.WriterConfigDescriptor(),
     )

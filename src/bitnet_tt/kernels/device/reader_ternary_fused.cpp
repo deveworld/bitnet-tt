@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// reader_ternary_fused.cpp - Fused reader for activation (bf16) and
+// reader_ternary_fused.cpp - Fused reader for activation (bf16 TILE) and
 // packed ternary weights (2-bit). Single RISCV_0 reader kernel.
 //
-// IMPORTANT: noc_async_read target must be an L1 address, NOT a stack address.
-// We use CB2 as a scratch buffer to receive packed data via DMA, then
-// unpack from that L1 region into CB1 (the bfloat16 weight CB).
+// Both tensors use TensorAccessor for bank-aware DRAM addressing.
+// Packed weight is stored as a bf16 TILE tensor (raw bytes reinterpreted).
+//
+// Compile-time args:
+//   [0..1]: TensorAccessorArgs for activation tensor
+//   [2..3]: TensorAccessorArgs for packed weight tensor
 //
 // Runtime args:
-//   arg0: act_addr     - DRAM address of activation tiles (bf16)
-//   arg1: packed_addr  - DRAM address of packed weight buffer (2-bit)
-//   arg2: Kt           - K tiles
-//   arg3: Nt           - N tiles
-//   arg4: Mt           - M tiles
+//   arg 0: act_addr     - DRAM address of activation tensor
+//   arg 1: packed_addr  - DRAM address of packed weight tensor
+//   arg 2: Kt           - K tiles
+//   arg 3: Nt           - N tiles
+//   arg 4: Mt           - M tiles
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
+#include "experimental/noc.h"
+#include "experimental/circular_buffer.h"
+#include "experimental/tensor.h"
 
 constexpr uint32_t PACKED_TILE_BYTES = 256;  // 1024 elements * 2 bits / 8
 
@@ -40,42 +46,52 @@ void kernel_main() {
     uint32_t Nt          = get_arg_val<uint32_t>(3);
     uint32_t Mt          = get_arg_val<uint32_t>(4);
 
+    constexpr auto act_accessor_args = TensorAccessorArgs<0>();
+    constexpr auto packed_accessor_args = TensorAccessorArgs<2>();
+
     constexpr uint32_t cb_in0    = 0;  // activation (bf16 tiles)
     constexpr uint32_t cb_in1    = 1;  // unpacked weight (bf16 tiles)
-    constexpr uint32_t cb_scratch = 2; // scratch for packed data DMA (L1)
+    constexpr uint32_t cb_scratch = 2; // scratch for packed data (L1)
 
-    const uint32_t act_tile_bytes = get_tile_size(cb_in0);
+    const uint32_t act_page_bytes = get_local_cb_interface(cb_in0).fifo_page_size;
+    const uint32_t scratch_page_bytes = get_local_cb_interface(cb_scratch).fifo_page_size;
+
+    const auto act_tensor = TensorAccessor(act_accessor_args, act_addr, act_page_bytes);
+    // Packed weight stored as bf16 TILE — each "page" holds one bf16 tile
+    // but only the first PACKED_TILE_BYTES bytes contain actual packed data.
+    const auto packed_tensor = TensorAccessor(packed_accessor_args, packed_addr, scratch_page_bytes);
+
+    experimental::Noc noc;
+    experimental::CircularBuffer cb0(cb_in0);
+    experimental::CircularBuffer cb1(cb_in1);
+
+    // Use scratch CB just for its L1 address — we manage it manually.
+    // Reserve once to get a stable L1 pointer, then reuse across iterations.
+    cb_reserve_back(cb_scratch, 1);
+    uint32_t l1_scratch = get_local_cb_interface(cb_scratch).fifo_wr_ptr;
 
     for (uint32_t mt = 0; mt < Mt; ++mt) {
         for (uint32_t nt = 0; nt < Nt; ++nt) {
             for (uint32_t kt = 0; kt < Kt; ++kt) {
-                // --- Read activation tile A[mt, kt] from DRAM ---
+                // --- Read activation tile A[mt, kt] ---
                 uint32_t act_tile_id = mt * Kt + kt;
-                cb_reserve_back(cb_in0, 1);
-                uint32_t l1_act = get_write_ptr(cb_in0);
-                uint64_t act_noc = get_noc_addr(act_addr + act_tile_id * act_tile_bytes);
-                noc_async_read(act_noc, l1_act, act_tile_bytes);
+                cb0.reserve_back(1);
+                noc.async_read(act_tensor, cb0, act_page_bytes,
+                               {.page_id = act_tile_id}, {.offset_bytes = 0});
 
-                // --- Read packed weight tile B[kt, nt] into L1 scratch ---
+                // --- Read packed weight tile B[kt, nt] into scratch L1 ---
                 uint32_t w_tile_id = kt * Nt + nt;
-                cb_reserve_back(cb_scratch, 1);
-                uint32_t l1_scratch = get_write_ptr(cb_scratch);
-                uint64_t w_noc = get_noc_addr(packed_addr + w_tile_id * PACKED_TILE_BYTES);
+                // Use raw noc_async_read to scratch L1 (not through CB protocol)
+                uint64_t w_noc = packed_tensor.get_noc_addr(w_tile_id, 0);
                 noc_async_read(w_noc, l1_scratch, PACKED_TILE_BYTES);
 
-                // Wait for both DMA reads to complete
-                noc_async_read_barrier();
+                // Wait for both DMA reads
+                noc.async_read_barrier();
+                cb0.push_back(1);
 
-                // Activation tile ready
-                cb_push_back(cb_in0, 1);
-
-                // Signal scratch is ready (needed for cb_pop_front below)
-                cb_push_back(cb_scratch, 1);
-
-                // --- Unpack 256 bytes → 2048 bytes (1024 bf16 values) ---
-                cb_wait_front(cb_scratch, 1);
-                cb_reserve_back(cb_in1, 1);
-                uint32_t l1_weight = get_write_ptr(cb_in1);
+                // --- Unpack packed data → bf16 tile ---
+                cb1.reserve_back(1);
+                uint32_t l1_weight = get_local_cb_interface(cb_in1).fifo_wr_ptr;
                 const uint8_t* src = reinterpret_cast<const uint8_t*>(l1_scratch);
                 uint16_t* dst = reinterpret_cast<uint16_t*>(l1_weight);
 
@@ -83,9 +99,7 @@ void kernel_main() {
                     unpack_byte(src[i], &dst[i * 4]);
                 }
 
-                // Release scratch, push unpacked weight
-                cb_pop_front(cb_scratch, 1);
-                cb_push_back(cb_in1, 1);
+                cb1.push_back(1);
             }
         }
     }
