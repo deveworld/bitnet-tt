@@ -42,3 +42,8 @@ htmlcov/
 # Misc
 *.log
 .DS_Store
+
+# Temporary files
+all_issues.json
+fix_issue_19475.patch
+diag_*.py
