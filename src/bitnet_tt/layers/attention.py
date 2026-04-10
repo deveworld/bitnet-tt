@@ -917,14 +917,34 @@ class MultiHeadAttention:
         k_heads_1bkd = ttnn.multiply(k_heads_1bkd, k_s)
         v_heads_1bkd = ttnn.multiply(v_heads_1bkd, v_s)
 
-        # 3. Apply RoPE using rotary_embedding_llama (maintains sharded state)
+        # 3. Apply RoPE — use manual half-split rotation matching HF convention.
+        #    rotary_embedding_llama uses adjacent-pair rotation which is
+        #    incompatible with HF's half-split layout unless Q/K weights are
+        #    permuted (not yet implemented).  Manual RoPE on desharded tensors
+        #    trades a small perf cost for correct rotation.
         cos, sin = rot_mats
-        q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1bkd, cos, sin, self.transformation_mat_decode, is_decode_mode=True
-        )
-        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1bkd, cos, sin, self.transformation_mat_decode, is_decode_mode=True
-        )
+        q_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        k_dram = ttnn.to_memory_config(k_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_heads_1bkd)
+        ttnn.deallocate(k_heads_1bkd)
+
+        # Reshape from 1BKD [1, B, H, D] to BHSD [B, H, 1, D] for RoPE
+        q_bhsd = ttnn.permute(q_dram, (1, 2, 0, 3))
+        k_bhsd = ttnn.permute(k_dram, (1, 2, 0, 3))
+        ttnn.deallocate(q_dram)
+        ttnn.deallocate(k_dram)
+
+        q_bhsd = self._apply_rope_to_tensor(q_bhsd, cos, sin)
+        k_bhsd = self._apply_rope_to_tensor(k_bhsd, cos, sin)
+
+        # Back to 1BKD [1, B, H, D] for paged_update_cache / sdpa_decode
+        q_heads_1bkd = ttnn.permute(q_bhsd, (2, 0, 1, 3))
+        k_heads_1bkd = ttnn.permute(k_bhsd, (2, 0, 1, 3))
+        ttnn.deallocate(q_bhsd)
+        ttnn.deallocate(k_bhsd)
+        v_dram = ttnn.to_memory_config(v_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(v_heads_1bkd)
+        v_heads_1bkd = v_dram
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
@@ -937,13 +957,14 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # 5. Update cache with paged_update_cache
-        # TT pattern: nlp outputs are sharded, call paged_update_cache directly.
-        # Match KV dtype to cache dtype (e.g. bf16 heads → bfp8 cache).
+        # 5. Update cache with paged_update_cache (requires HEIGHT_SHARDED input)
         cache_dtype = past_key_value.key_cache.dtype
         if k_heads_1bkd.dtype != cache_dtype:
             k_heads_1bkd = ttnn.typecast(k_heads_1bkd, cache_dtype)
             v_heads_1bkd = ttnn.typecast(v_heads_1bkd, cache_dtype)
+        if past_key_value._shard_config is not None:
+            k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, past_key_value._shard_config)
+            v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, past_key_value._shard_config)
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache, k_heads_1bkd, update_idxs_tensor=pos_tensor_local
         )
@@ -956,10 +977,8 @@ class MultiHeadAttention:
         ttnn.deallocate(k_heads_1bkd)
         ttnn.deallocate(v_heads_1bkd)
 
-        # 6. SDPA decode
-        # Q must be in DRAM when not sharded
-        q_heads_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(q_heads_1bkd)
+        # 6. SDPA decode — Q is already in DRAM after permute
+        q_heads_dram = q_heads_1bkd
 
         # Limit the visible cache length to a 32-token tile multiple. When the
         # backing cache already matches that compact logical view, reuse it

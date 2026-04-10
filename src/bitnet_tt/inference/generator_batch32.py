@@ -226,35 +226,31 @@ class Batch32RotarySetup:
         freqs = torch.outer(positions, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
 
-        cos = emb.cos()
-        sin = emb.sin()
-
-        cos_half = cos[:, : head_dim // 2]
-        sin_half = sin[:, : head_dim // 2]
-        cos_interleaved = torch.stack([cos_half, cos_half], dim=-1).flatten(-2)
-        sin_interleaved = torch.stack([sin_half, sin_half], dim=-1).flatten(-2)
-        self._cos_interleaved_host = cos_interleaved.to(torch.bfloat16)
-        self._sin_interleaved_host = sin_interleaved.to(torch.bfloat16)
+        cos_full = emb.cos()  # [max_seq, head_dim] duplicated-halves (HF format)
+        sin_full = emb.sin()
+        self._cos_host = cos_full.to(torch.bfloat16)
+        self._sin_host = sin_full.to(torch.bfloat16)
 
         self.cos_matrix = ttnn.from_torch(
-            cos_interleaved,
+            cos_full,
             device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.sin_matrix = ttnn.from_torch(
-            sin_interleaved,
+            sin_full,
             device=device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
+        # Adjacent-pair swap: matches tt-transformers get_rot_transformation_mat
+        # and the interleaved cos/sin layout expected by rotary_embedding_llama.
         trans_mat = torch.zeros(1, 1, TILE_SIZE, TILE_SIZE)
-        for i in range(TILE_SIZE // 2):
-            trans_mat[0, 0, i, i + TILE_SIZE // 2] = -1.0
-            trans_mat[0, 0, i + TILE_SIZE // 2, i] = 1.0
+        trans_mat[..., torch.arange(0, TILE_SIZE, 2), torch.arange(1, TILE_SIZE, 2)] = 1
+        trans_mat[..., torch.arange(1, TILE_SIZE, 2), torch.arange(0, TILE_SIZE, 2)] = -1
 
         self.trans_mat_config = create_height_sharded_config(TILE_SIZE, TILE_SIZE)
 
@@ -270,35 +266,37 @@ class Batch32RotarySetup:
         self._host_cos_sin_cache: OrderedDict[int, Tuple[ttnn.Tensor, ttnn.Tensor]] = OrderedDict()
 
     def _get_cos_sin_torch(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build interleaved cos/sin tensors for one decode position."""
+        """Build HF duplicated-halves cos/sin for one decode position.
+
+        Returns [1, 1, 1, head_dim] tensors that broadcast over [B, H, 1, D].
+        """
         if position < 0 or position >= self.max_seq_len:
             raise ValueError(
                 f"Position {position} is out of range for max_seq_len={self.max_seq_len}"
             )
 
-        cos_row = self._cos_interleaved_host[position : position + 1]
-        sin_row = self._sin_interleaved_host[position : position + 1]
-
-        cos = cos_row.expand(PADDED_BATCH, -1).unsqueeze(0).unsqueeze(2).contiguous()
-        sin = sin_row.expand(PADDED_BATCH, -1).unsqueeze(0).unsqueeze(2).contiguous()
+        cos_row = self._cos_host[position : position + 1]  # [1, head_dim]
+        sin_row = self._sin_host[position : position + 1]
+        cos = cos_row.unsqueeze(0).unsqueeze(0)  # [1, 1, 1, head_dim]
+        sin = sin_row.unsqueeze(0).unsqueeze(0)
         return cos, sin
 
     def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Create HEIGHT_SHARDED device tensors for one decode position."""
+        """Create DRAM device tensors for one decode position ([1,1,1,head_dim])."""
         cos_torch, sin_torch = self._get_cos_sin_torch(position)
         cos_device = ttnn.from_torch(
             cos_torch,
             device=self.device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
-            memory_config=self.cos_sin_config,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         sin_device = ttnn.from_torch(
             sin_torch,
             device=self.device,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
-            memory_config=self.cos_sin_config,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         return cos_device, sin_device
 
