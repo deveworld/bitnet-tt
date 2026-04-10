@@ -217,43 +217,6 @@ class RotarySetup:
 
         return [cos, sin]
 
-    def get_rot_mats_prefill(
-        self,
-        seq_len: int,
-        start_pos: int = 0,
-    ) -> List[ttnn.Tensor]:
-        """
-        Get rotation matrices for prefill (full sequence).
-
-        Args:
-            seq_len: Sequence length
-            start_pos: Starting position (for chunked prefill)
-
-        Returns:
-            [cos, sin] tensors for the full sequence
-        """
-        # Create position indices for the sequence
-        position_ids = torch.arange(start_pos, start_pos + seq_len)
-        position_ids_2d = position_ids.reshape(1, -1)  # [1, seq_len]
-
-        rot_idxs = ttnn.from_torch(
-            position_ids_2d,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-
-        # Use embedding lookup
-        cos = ttnn.embedding(rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(rot_idxs, self.sin_matrix, layout=ttnn.TILE_LAYOUT)
-
-        # Reshape for rotary_embedding_llama prefill: [1, 1, seq_len, head_dim]
-        cos = ttnn.unsqueeze_to_4D(cos)
-        sin = ttnn.unsqueeze_to_4D(sin)
-
-        return [cos, sin]
-
     def get_transformation_mats(self) -> dict:
         """Get transformation matrices for decode and prefill modes."""
         return {

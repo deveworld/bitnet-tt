@@ -61,7 +61,7 @@ class FeedForward:
         eps: float = 1e-5,
         model_config: Optional[dict] = None,
         use_lofi: bool = False,
-        weight_dtype: str = "bf16",
+        weight_dtype: str = "bfp4",
     ) -> None:
         """
         Initialize FFN.

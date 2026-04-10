@@ -104,123 +104,6 @@ def ttnn_to_numpy(tensor: ttnn.Tensor) -> NDArray[np.floating]:
     return torch_tensor.float().numpy()
 
 
-class BitLinear:
-    """
-    TT-NN native BitLinear layer.
-
-    This layer implements the quantized linear transformation used in BitNet:
-    1. Apply RMSNorm to input
-    2. Quantize activations to 8-bit (absmax per-token)
-    3. Use pre-quantized ternary weights {-1, 0, +1}
-    4. Perform matrix multiplication
-    5. Dequantize output using stored scale factors
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        device: ttnn.Device,
-        eps: float = 1e-5,
-        skip_activation_quant: bool = False,
-    ) -> None:
-        """
-        Initialize BitLinear layer.
-
-        Args:
-            in_features: Size of input features
-            out_features: Size of output features
-            device: TT-NN device
-            eps: Epsilon for numerical stability
-            skip_activation_quant: Skip activation quantization for speed
-        """
-        self.in_features = in_features
-        self.out_features = out_features
-        self.device = device
-        self.eps = eps
-        self.skip_activation_quant = skip_activation_quant
-
-        # Weights (will be loaded later)
-        self.weight: ttnn.Tensor | None = None
-        self.weight_scale: float = 1.0
-        self.norm_weight: ttnn.Tensor | None = None
-
-    def load_weights(
-        self,
-        weight: NDArray[np.floating],
-        norm_weight: NDArray[np.floating] | None = None,
-    ) -> None:
-        """
-        Load and quantize weights to device.
-
-        Weights are pre-transposed during load to avoid transpose per forward.
-
-        Args:
-            weight: Weight array of shape (out_features, in_features)
-            norm_weight: Optional RMSNorm weight of shape (in_features,)
-        """
-        # Quantize weights to ternary
-        weight_quant, scale = weight_quant_ternary(weight.astype(np.float32))
-        self.weight_scale = float(scale)
-
-        # Convert to float32 for TT-NN (ternary values as floats)
-        weight_float = weight_quant.astype(np.float32)
-
-        # Pre-transpose weights: (out, in) -> (in, out) to avoid runtime transpose
-        weight_t = weight_float.T.copy()
-
-        # Transfer to device (already transposed)
-        self.weight = numpy_to_ttnn(weight_t, self.device)
-
-        # Load norm weight if provided
-        if norm_weight is not None:
-            norm_weight_2d = norm_weight.reshape(1, 1, 1, -1).astype(np.float32)
-            self.norm_weight = numpy_to_ttnn(norm_weight_2d, self.device)
-
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, hidden_size)
-
-        Returns:
-            Output tensor of shape (batch, seq_len, out_features)
-        """
-        if self.weight is None:
-            raise RuntimeError("Weights not loaded. Call load_weights() first.")
-
-        # 1. RMSNorm
-        x_norm = ttnn.rms_norm(x, epsilon=self.eps, weight=self.norm_weight)
-
-        if self.skip_activation_quant:
-            # Fast path: skip activation quantization
-            weight_scaled = ttnn.multiply(self.weight, self.weight_scale)
-            return ttnn.matmul(x_norm, weight_scaled)
-
-        # 2. Activation quantization (simulated in bfloat16)
-        # Compute max absolute value per token
-        x_abs = ttnn.abs(x_norm)
-        x_max = ttnn.max(x_abs, dim=-1, keepdim=True)
-        scale_x = ttnn.multiply(ttnn.reciprocal(ttnn.add(x_max, self.eps)), 127.0)
-
-        # Quantize activations
-        x_scaled = ttnn.multiply(x_norm, scale_x)
-        # Note: ttnn doesn't have round, using floor(x + 0.5) as approximation
-        x_quant = ttnn.floor(ttnn.add(x_scaled, 0.5))
-        x_quant = ttnn.clip(x_quant, -128.0, 127.0)
-
-        # Dequantize for computation
-        x_dequant = ttnn.multiply(x_quant, ttnn.reciprocal(scale_x))
-
-        # 3. Matrix multiplication with pre-transposed weight
-        # Weight is already transposed at load time: (in, out)
-        weight_scaled = ttnn.multiply(self.weight, self.weight_scale)
-        output = ttnn.matmul(x_dequant, weight_scaled)
-
-        return output
-
-
 class Linear:
     """
     TT-NN native Linear layer with weight quantization.
@@ -256,7 +139,7 @@ class Linear:
         out_features: int,
         device: ttnn.Device,
         compute_fidelity: str = "hifi2",
-        weight_dtype: str = "bf16",
+        weight_dtype: str = "bfp4",
     ) -> None:
         """
         Initialize Linear layer.

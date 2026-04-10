@@ -44,7 +44,7 @@ class TransformerBlock:
         rms_norm_eps: float = 1e-6,
         layer_idx: int = 0,
         use_lofi_mlp: bool = False,
-        weight_dtype: str = "bf16",
+        weight_dtype: str = "bfp4",
     ) -> None:
         """
         Initialize transformer block.

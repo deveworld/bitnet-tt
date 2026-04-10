@@ -1089,6 +1089,10 @@ class Batch32Generator:
                 actual_batch = min(k_upload.shape[0], PADDED_BATCH)
                 k_upload_actual = k_upload[:actual_batch, :, :, :]
                 v_upload_actual = v_upload[:actual_batch, :, :, :]
+                # Match dtype to cache (e.g. bf16 prefill → bfp8 cache)
+                if k_upload_actual.dtype != batch32_cache.key_cache.dtype:
+                    k_upload_actual = ttnn.typecast(k_upload_actual, batch32_cache.key_cache.dtype)
+                    v_upload_actual = ttnn.typecast(v_upload_actual, batch32_cache.value_cache.dtype)
                 batch32_cache.key_cache = fill_cache_range(batch32_cache.key_cache, k_upload_actual, 0)
                 batch32_cache.value_cache = fill_cache_range(batch32_cache.value_cache, v_upload_actual, 0)
 

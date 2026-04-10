@@ -41,10 +41,11 @@ class BitNetModel:
         config: BitNetConfig,
         device: ttnn.Device,
         use_lofi_mlp: bool = False,
-        weight_dtype: str = "bf16",
+        weight_dtype: str = "bfp4",
     ) -> None:
         self.config = config
         self.device = device
+        self._weight_dtype = weight_dtype
 
         # Token embedding (not quantized)
         self.embed_tokens = Embedding(
@@ -280,6 +281,6 @@ def create_model(
     config: BitNetConfig,
     device: ttnn.Device,
     use_lofi_mlp: bool = False,
-    weight_dtype: str = "bf16",
+    weight_dtype: str = "bfp4",
 ) -> BitNetModel:
     return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp, weight_dtype=weight_dtype)
