@@ -69,7 +69,11 @@ void kernel_main() {
                 // Activation tile ready
                 cb_push_back(cb_in0, 1);
 
+                // Signal scratch is ready (needed for cb_pop_front below)
+                cb_push_back(cb_scratch, 1);
+
                 // --- Unpack 256 bytes → 2048 bytes (1024 bf16 values) ---
+                cb_wait_front(cb_scratch, 1);
                 cb_reserve_back(cb_in1, 1);
                 uint32_t l1_weight = get_write_ptr(cb_in1);
                 const uint8_t* src = reinterpret_cast<const uint8_t*>(l1_scratch);

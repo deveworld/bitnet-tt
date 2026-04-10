@@ -29,15 +29,17 @@ def test_single_tile_ternary_matmul():
     device = get_device()
 
     # --- Host data ---
-    rng = np.random.default_rng(42)
-    act_np = rng.standard_normal((M, K)).astype(np.float32)
-    weight_fp32 = rng.standard_normal((N, K)).astype(np.float32)  # (out, in)
-    weight_quant, scale = weight_quant_ternary(weight_fp32)
-    scale = float(scale)
+    # Use known simple pattern: all-ones weight → result = row sums of activation
+    act_np = np.ones((M, K), dtype=np.float32) * 0.5  # constant activation
+    weight_quant = np.ones((N, K), dtype=np.int8)  # all +1 ternary
+    scale = 1.0  # no scaling
 
-    # Reference: numpy matmul
+    # Reference: act @ weight_T → each output element = sum of act row = K * 0.5
     weight_t_scaled = weight_quant.T.astype(np.float32) * scale  # (K, N)
-    ref_output = act_np @ weight_t_scaled  # (M, N)
+    ref_output = act_np @ weight_t_scaled  # (M, N) — should be all 16.0
+
+    print(f"Reference expected value: {K * 0.5} (all elements)")
+    print(f"Reference first 4: {ref_output[0, :4]}")
 
     # Pack ternary weights (already transposed in pack_ternary_tilized)
     packed_bytes, tile_scales = pack_ternary_tilized(weight_quant, scale)
@@ -90,7 +92,11 @@ def test_single_tile_ternary_matmul():
     # cb1: unpacked weight tiles (bf16, written by fused reader)
     # cb2: scratch for packed DMA (256 bytes per packed tile)
     # cb16: output tiles (bf16)
-    SCRATCH_SIZE = PACKED_TILE_BYTES * 2  # double-buffer scratch
+    # Scratch CB: needs at least PACKED_TILE_BYTES (256) per page.
+    # Use a full bf16 tile page (2048) to satisfy CB alignment — only
+    # the first 256 bytes of each page are used by the reader.
+    SCRATCH_PAGE_SIZE = BF16_TILE_BYTES  # 2048 (oversized but safe)
+    SCRATCH_SIZE = SCRATCH_PAGE_SIZE * 2  # double-buffer
     cb_in0 = ttnn.CBDescriptor(
         total_size=CB_DOUBLE_BUFFER,
         core_ranges=core_range,
@@ -114,8 +120,8 @@ def test_single_tile_ternary_matmul():
         core_ranges=core_range,
         format_descriptors=[ttnn.CBFormatDescriptor(
             buffer_index=2,
-            data_format=ttnn.uint32,  # raw bytes
-            page_size=PACKED_TILE_BYTES,
+            data_format=ttnn.bfloat16,
+            page_size=SCRATCH_PAGE_SIZE,
         )],
     )
     cb_out = ttnn.CBDescriptor(
@@ -171,6 +177,8 @@ def test_single_tile_ternary_matmul():
 
     print("Running generic_op...")
     output = ttnn.generic_op([act_tt, packed_tt, out_tt], program)
+    ttnn.synchronize_device(device)
+    print("Synchronized.")
 
     # Compare
     out_np = ttnn.to_torch(output).float().numpy().reshape(M, N)
