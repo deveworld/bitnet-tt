@@ -1021,14 +1021,12 @@ class Batch32Generator:
 
         logits, model_kv_caches = self.model(
             input_ids=tokens_tt,
-            past_key_values=self._kv_caches,
+            past_key_values=None,
             use_cache=True,
             mode="prefill",
         )
 
-        # KV caches are already updated in-place by update_prefill.
-        # Just sync seq_len metadata.
-        self._set_kv_cache_length(seq_len)
+        self._transfer_prefill_to_batch32_cache(model_kv_caches, seq_len)
 
         ttnn.deallocate(tokens_tt)
 
