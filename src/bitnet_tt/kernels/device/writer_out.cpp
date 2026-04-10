@@ -11,7 +11,7 @@
 //   arg 2: Nt        — number of N-dimension tile columns
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     uint32_t dst_addr = get_arg_val<uint32_t>(0);

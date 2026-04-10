@@ -26,7 +26,7 @@
 //   arg 0: num_tiles_per_core  — total tiles this core must produce
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 // BFloat16 bit patterns
 constexpr uint16_t BF16_ZERO     = 0x0000u;
