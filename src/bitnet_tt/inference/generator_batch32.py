@@ -1019,14 +1019,17 @@ class Batch32Generator:
             device=self.device,
         )
 
-        logits, model_kv_caches = self.model(
+        # Pass batch32 caches directly — update_prefill writes KV in-place
+        # and returns original (non-cached) K/V for attention, avoiding the
+        # lossy transfer step (stride-slice + pad + re-upload).
+        logits, _ = self.model(
             input_ids=tokens_tt,
-            past_key_values=None,
+            past_key_values=self._kv_caches,
             use_cache=True,
             mode="prefill",
         )
 
-        self._transfer_prefill_to_batch32_cache(model_kv_caches, seq_len)
+        self._set_kv_cache_length(seq_len)
 
         ttnn.deallocate(tokens_tt)
 

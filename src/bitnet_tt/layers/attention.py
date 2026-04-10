@@ -210,11 +210,14 @@ class KVCache:
 
             self.seq_len_cached = seq_len
 
-            key_for_attn = self.key_cache[:, : self.num_kv_heads, :seq_len, :]
-            value_for_attn = self.value_cache[:, : self.num_kv_heads, :seq_len, :]
+            # Return ORIGINAL K/V (not cache slice) for attention to avoid
+            # batch-dim mismatch when cache batch > input batch (e.g. batch32).
             if num_kv_groups > 1:
-                key_for_attn = ttnn.repeat_interleave(key_for_attn, num_kv_groups, dim=1)
-                value_for_attn = ttnn.repeat_interleave(value_for_attn, num_kv_groups, dim=1)
+                key_for_attn = ttnn.repeat_interleave(key_states, num_kv_groups, dim=1)
+                value_for_attn = ttnn.repeat_interleave(value_states, num_kv_groups, dim=1)
+            else:
+                key_for_attn = key_states
+                value_for_attn = value_states
             return key_for_attn, value_for_attn
         else:
             # Not preallocated: expand and store for concat-based decode
