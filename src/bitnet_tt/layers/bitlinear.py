@@ -71,22 +71,17 @@ def numpy_int_to_ttnn(
     return tensor
 
 
-def quantize_weight_like_hf(weight: NDArray[np.floating]) -> NDArray[np.float32]:
+def quantize_and_transpose_weight(
+    weight: NDArray[np.floating],
+) -> tuple[NDArray[np.float32], float]:
     """
-    Quantize a linear weight using the HuggingFace BitLinear rule.
+    Quantize weight to ternary {-1, 0, +1} and pre-transpose to (in, out).
 
-    The returned values stay in float32 so they can be consumed by the current
-    TT-NN matmul path without requiring a dedicated ternary kernel.
+    Returns pure ternary values (not scaled) so that BFP4 storage is lossless.
+    The scale factor must be applied post-matmul.
     """
-    weight_fp32 = weight.astype(np.float32)
-    scale = np.abs(weight_fp32).mean()
-    s = 1.0 / max(scale, 1e-5)
-    return np.clip(np.round(weight_fp32 * s), -1, 1).astype(np.float32) / s
-
-
-def quantize_and_transpose_weight(weight: NDArray[np.floating]) -> NDArray[np.float32]:
-    """Quantize a weight matrix and pre-transpose it to (in, out)."""
-    return quantize_weight_like_hf(weight).T.copy()
+    weight_quant, scale = weight_quant_ternary(weight.astype(np.float32))
+    return weight_quant.T.astype(np.float32).copy(), float(scale)
 
 
 def ttnn_to_numpy(tensor: ttnn.Tensor) -> NDArray[np.floating]:
@@ -155,6 +150,7 @@ class Linear:
         self.out_features = out_features
         self.device = device
         self.weight: ttnn.Tensor | None = None
+        self.weight_scale: float = 1.0
         self._fidelity = compute_fidelity
         self._weight_dtype_name = weight_dtype
         self._ttnn_weight_dtype = self._WEIGHT_DTYPE_MAP.get(weight_dtype, ttnn.bfloat16)
@@ -172,24 +168,27 @@ class Linear:
         """
         Load and pre-quantize weights to device.
 
-        Applies ternary weight quantization matching HuggingFace BitLinear:
-            s = 1.0 / weight.abs().mean()
-            result = (weight * s).round().clamp(-1, 1) / s
-
-        Weights are pre-transposed to avoid transpose per forward.
+        Stores pure ternary {-1, 0, +1} values (lossless in BFP4) and
+        applies the scale factor as a cheap post-matmul scalar multiply.
 
         Args:
             weight: Weight array of shape (out_features, in_features)
         """
-        self.load_pretransposed_weight(quantize_and_transpose_weight(weight))
+        weight_t, scale = quantize_and_transpose_weight(weight)
+        self.load_pretransposed_weight(weight_t, scale=scale)
 
-    def load_pretransposed_weight(self, weight_t: NDArray[np.floating]) -> None:
+    def load_pretransposed_weight(
+        self, weight_t: NDArray[np.floating], scale: float = 1.0
+    ) -> None:
         """
         Load a weight that is already quantized and transposed to (in, out).
 
-        This lets higher-level fused layers concatenate separately quantized
-        blocks and still reuse the standard TT matmul path.
+        Args:
+            weight_t: Pre-transposed weight array (in_features, out_features).
+            scale: Post-matmul scale factor. Set to 1.0 for fused weights
+                   whose scales are applied externally (e.g. fused gate_up).
         """
+        self.weight_scale = scale
         torch_tensor = torch.from_numpy(weight_t.astype(np.float32))
         self.weight = ttnn.from_torch(
             torch_tensor,
@@ -212,16 +211,18 @@ class Linear:
         if self.weight is None:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
-        # Weight is already transposed at load time: (in, out)
-        # Use HiFi2 compute kernel if available for ~2x speedup
         if self._compute_kernel_config is not None:
-            return ttnn.matmul(
+            out = ttnn.matmul(
                 x,
                 self.weight,
                 compute_kernel_config=self._compute_kernel_config,
             )
         else:
-            return ttnn.matmul(x, self.weight)
+            out = ttnn.matmul(x, self.weight)
+
+        if self.weight_scale != 1.0:
+            out = ttnn.multiply(out, self.weight_scale)
+        return out
 
 
 class RMSNorm:

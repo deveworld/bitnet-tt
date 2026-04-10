@@ -22,17 +22,16 @@ from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_w
 def build_fused_gate_up_weight(
     gate_weight: NDArray[np.floating],
     up_weight: NDArray[np.floating],
-) -> NDArray[np.float32]:
+) -> tuple[NDArray[np.float32], float, float]:
     """
     Build a single pre-transposed gate+up matrix from separately quantized weights.
 
-    BitNet quantizes each projection independently. Concatenating after
-    quantization preserves that behavior while reducing decode matmul dispatches
-    from two projections to one.
+    Returns pure ternary {-1,0,+1} fused weight and per-projection scales.
     """
-    gate_weight_t = quantize_and_transpose_weight(gate_weight)
-    up_weight_t = quantize_and_transpose_weight(up_weight)
-    return np.concatenate([gate_weight_t, up_weight_t], axis=1)
+    gate_weight_t, gate_scale = quantize_and_transpose_weight(gate_weight)
+    up_weight_t, up_scale = quantize_and_transpose_weight(up_weight)
+    fused = np.concatenate([gate_weight_t, up_weight_t], axis=1)
+    return fused, gate_scale, up_scale
 
 
 class FeedForward:
@@ -118,7 +117,9 @@ class FeedForward:
             down_weight: Down projection weight
             ffn_sub_norm_weight: Sub-norm weight (applied after gate*up, before down_proj)
         """
-        fused_gate_up = build_fused_gate_up_weight(gate_weight, up_weight)
+        fused_gate_up, self._gate_scale, self._up_scale = build_fused_gate_up_weight(
+            gate_weight, up_weight
+        )
         self.gate_up_proj.load_pretransposed_weight(fused_gate_up)
         self.down_proj.load_weights(down_weight)
 
@@ -136,7 +137,7 @@ class FeedForward:
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
-        gate_up = self.gate_up_proj(x)
+        gate_up = self.gate_up_proj(x)  # scale=1.0, no post-matmul scale
 
         split_start = [0] * len(gate_up.shape)
         gate_end = list(gate_up.shape)
@@ -148,6 +149,10 @@ class FeedForward:
         up_end = list(gate_up.shape)
         up = ttnn.slice(gate_up, up_start, up_end)
         ttnn.deallocate(gate_up)
+
+        # Apply per-projection scales from ternary quantization
+        gate = ttnn.multiply(gate, self._gate_scale)
+        up = ttnn.multiply(up, self._up_scale)
 
         # Gate with squared ReLU
         gate = ttnn.relu(gate)

@@ -406,17 +406,17 @@ def build_fused_qkv_weight(
     q_weight: NDArray[np.floating],
     k_weight: NDArray[np.floating],
     v_weight: NDArray[np.floating],
-) -> NDArray[np.float32]:
+) -> tuple[NDArray[np.float32], float, float, float]:
     """
     Build a single pre-transposed QKV matrix from separately quantized weights.
 
-    Preserving per-projection quantization avoids changing BitLinear behavior
-    while reducing three projection matmuls to one.
+    Returns pure ternary {-1,0,+1} fused weight and per-projection scales.
     """
-    q_t = quantize_and_transpose_weight(q_weight)
-    k_t = quantize_and_transpose_weight(k_weight)
-    v_t = quantize_and_transpose_weight(v_weight)
-    return np.concatenate([q_t, k_t, v_t], axis=1)
+    q_t, q_scale = quantize_and_transpose_weight(q_weight)
+    k_t, k_scale = quantize_and_transpose_weight(k_weight)
+    v_t, v_scale = quantize_and_transpose_weight(v_weight)
+    fused = np.concatenate([q_t, k_t, v_t], axis=1)
+    return fused, q_scale, k_scale, v_scale
 
 
 class MultiHeadAttention:
@@ -648,13 +648,14 @@ class MultiHeadAttention:
         if attn_sub_norm_weight is not None:
             self.attn_sub_norm.load_weights(attn_sub_norm_weight)
 
-        qkv_fused = build_fused_qkv_weight(q_weight, k_weight, v_weight)
+        qkv_fused, q_s, k_s, v_s = build_fused_qkv_weight(q_weight, k_weight, v_weight)
+        self._qkv_scales = (q_s, k_s, v_s)
 
         self.qkv_fused_weight = ttnn.from_torch(
             torch.from_numpy(qkv_fused),
             device=self.device,
             layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
+            dtype=self.q_proj._ttnn_weight_dtype,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
@@ -909,6 +910,12 @@ class MultiHeadAttention:
             memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
         )
         ttnn.deallocate(xqkv_fused)
+
+        # Apply per-projection ternary scales after head split
+        q_s, k_s, v_s = self._qkv_scales
+        q_heads_1bkd = ttnn.multiply(q_heads_1bkd, q_s)
+        k_heads_1bkd = ttnn.multiply(k_heads_1bkd, k_s)
+        v_heads_1bkd = ttnn.multiply(v_heads_1bkd, v_s)
 
         # 3. Apply RoPE using rotary_embedding_llama (maintains sharded state)
         cos, sin = rot_mats
