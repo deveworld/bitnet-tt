@@ -64,11 +64,7 @@ void kernel_main() {
     experimental::Noc noc;
     experimental::CircularBuffer cb0(cb_in0);
     experimental::CircularBuffer cb1(cb_in1);
-
-    // Use scratch CB just for its L1 address — we manage it manually.
-    // Reserve once to get a stable L1 pointer, then reuse across iterations.
-    cb_reserve_back(cb_scratch, 1);
-    uint32_t l1_scratch = get_local_cb_interface(cb_scratch).fifo_wr_ptr;
+    experimental::CircularBuffer cb_s(cb_scratch);
 
     for (uint32_t mt = 0; mt < Mt; ++mt) {
         for (uint32_t nt = 0; nt < Nt; ++nt) {
@@ -78,27 +74,30 @@ void kernel_main() {
                 cb0.reserve_back(1);
                 noc.async_read(act_tensor, cb0, act_page_bytes,
                                {.page_id = act_tile_id}, {.offset_bytes = 0});
-
-                // --- Read packed weight tile B[kt, nt] into scratch L1 ---
-                uint32_t w_tile_id = kt * Nt + nt;
-                // Use raw noc_async_read to scratch L1 (not through CB protocol)
-                uint64_t w_noc = packed_tensor.get_noc_addr(w_tile_id, 0);
-                noc_async_read(w_noc, l1_scratch, PACKED_TILE_BYTES);
-
-                // Wait for both DMA reads
                 noc.async_read_barrier();
                 cb0.push_back(1);
 
+                // --- Read packed weight tile B[kt, nt] into scratch CB ---
+                uint32_t w_tile_id = kt * Nt + nt;
+                cb_s.reserve_back(1);
+                noc.async_read(packed_tensor, cb_s, scratch_page_bytes,
+                               {.page_id = w_tile_id}, {.offset_bytes = 0});
+                noc.async_read_barrier();
+                cb_s.push_back(1);
+
                 // --- Unpack packed data → bf16 tile ---
+                cb_s.wait_front(1);
                 cb1.reserve_back(1);
+                uint32_t l1_scratch_rd = get_local_cb_interface(cb_scratch).fifo_rd_ptr;
                 uint32_t l1_weight = get_local_cb_interface(cb_in1).fifo_wr_ptr;
-                const uint8_t* src = reinterpret_cast<const uint8_t*>(l1_scratch);
+                const uint8_t* src = reinterpret_cast<const uint8_t*>(l1_scratch_rd);
                 uint16_t* dst = reinterpret_cast<uint16_t*>(l1_weight);
 
                 for (uint32_t i = 0; i < PACKED_TILE_BYTES; ++i) {
                     unpack_byte(src[i], &dst[i * 4]);
                 }
 
+                cb_s.pop_front(1);
                 cb1.push_back(1);
             }
         }

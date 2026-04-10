@@ -64,28 +64,14 @@ def test_single_tile_ternary_matmul():
         ttnn.DRAM_MEMORY_CONFIG,
     )
 
-    # Packed weight: stored as bf16 TILE tensor for TensorAccessor compatibility.
-    # Each tile "page" (2048 bytes bf16) holds one packed ternary tile
-    # (256 bytes actual data in the first 256 bytes, rest padding).
-    packed_flat = packed_bytes.flatten()
-    num_packed_tiles = packed_bytes.shape[0]
-    # Each packed tile → one bf16 tile page (2048 bytes). Pad packed data
-    # to fill a full bf16 tile, then store as bf16 TILE_LAYOUT.
-    packed_pages = np.zeros((num_packed_tiles, 32, 32), dtype=np.float32)
-    for t in range(num_packed_tiles):
-        # Store 256 packed bytes as 128 float32 values (reinterpreted)
-        tile_bytes = packed_bytes[t]  # [256] uint8
-        # Put raw bytes into the first 256 bytes of 4096-byte float32 tile
-        raw_f32 = np.frombuffer(tile_bytes.tobytes(), dtype=np.float32)  # [64] f32
-        packed_pages[t, :2, :] = raw_f32.reshape(2, 32)  # first 2 rows × 32 cols
-    # Shape for ttnn: [num_tiles, 32, 32]
-    packed_torch = torch.from_numpy(packed_pages)
-    if num_packed_tiles == 1:
-        packed_torch = packed_torch.unsqueeze(0)  # [1, 1, 32, 32]
+    # Packed weight: uint32 ROW_MAJOR — each page = 64 uint32 = 256 bytes = 1 packed tile.
+    # TensorAccessor works with ROW_MAJOR uint32 (page_size = 256).
+    packed_flat = packed_bytes.flatten()  # [num_tiles * 256] uint8
+    packed_i32 = np.frombuffer(packed_flat.tobytes(), dtype=np.int32)  # [num_tiles * 64]
     packed_tt = ttnn.from_torch(
-        packed_torch,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
+        torch.from_numpy(packed_i32.copy()).unsqueeze(0),  # [1, num_tiles * 64]
+        dtype=ttnn.uint32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
@@ -102,10 +88,7 @@ def test_single_tile_ternary_matmul():
     # cb1: unpacked weight tiles (bf16, written by fused reader)
     # cb2: scratch for packed DMA (256 bytes per packed tile)
     # cb16: output tiles (bf16)
-    # Scratch CB: needs at least PACKED_TILE_BYTES (256) per page.
-    # Use a full bf16 tile page (2048) to satisfy CB alignment — only
-    # the first 256 bytes of each page are used by the reader.
-    SCRATCH_PAGE_SIZE = BF16_TILE_BYTES  # 2048 (oversized but safe)
+    SCRATCH_PAGE_SIZE = PACKED_TILE_BYTES  # 256 bytes per packed tile
     SCRATCH_SIZE = SCRATCH_PAGE_SIZE * 2  # double-buffer
     cb_in0 = ttnn.CBDescriptor(
         total_size=CB_DOUBLE_BUFFER,
@@ -130,7 +113,7 @@ def test_single_tile_ternary_matmul():
         core_ranges=core_range,
         format_descriptors=[ttnn.CBFormatDescriptor(
             buffer_index=2,
-            data_format=ttnn.bfloat16,
+            data_format=ttnn.uint32,
             page_size=SCRATCH_PAGE_SIZE,
         )],
     )
