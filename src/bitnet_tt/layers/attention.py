@@ -553,7 +553,6 @@ class MultiHeadAttention:
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        self.transformation_mat_dram = _trans_mat_dram  # DRAM copy for prefill RoPE matmul
         self.transformation_mat_decode = ttnn.to_memory_config(
             _trans_mat_dram, _trans_mat_sharded_config
         )
@@ -565,6 +564,20 @@ class MultiHeadAttention:
             strategy=ttnn.ShardStrategy.HEIGHT,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
+        )
+
+        # 128x128 rotation matrix for prefill adjacent-pair RoPE
+        # rot[2k, 2k+1] = -1, rot[2k+1, 2k] = 1 for each pair
+        rot_mat_128 = torch.zeros(1, 1, self.head_dim, self.head_dim)
+        for k in range(self.head_dim // 2):
+            rot_mat_128[0, 0, 2 * k, 2 * k + 1] = -1
+            rot_mat_128[0, 0, 2 * k + 1, 2 * k] = 1
+        self._rope_rotation_mat = ttnn.from_torch(
+            rot_mat_128,
+            device=device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
         # Store core grid for dynamic sharding
@@ -1164,20 +1177,9 @@ class MultiHeadAttention:
 
         Weights are pre-permuted so x is already in adjacent-pair order.
         cos/sin are interleaved [f0,f0,f1,f1,...] format.
-        Rotation: rot[2k] = -x[2k+1], rot[2k+1] = x[2k]
+        x_rotated = x @ rot_matrix_128 where rot_matrix swaps adjacent pairs with sign.
         """
-        x_even = x[:, :, :, 0::2]
-        x_odd = x[:, :, :, 1::2]
-        x_rotated = ttnn.concat([ttnn.neg(x_odd), x_even], dim=-1)
-        # Interleave back: [rot_even_0, rot_odd_0, rot_even_1, rot_odd_1, ...]
-        # Actually this concat gives [all_rot_even, all_rot_odd] not interleaved.
-        # We need the same interleaved layout. Since ttnn doesn't have a simple
-        # interleave op, use the fact that:
-        # rot[2k] = -x[2k+1], rot[2k+1] = x[2k]
-        # This is equivalent to: x @ trans_mat where trans_mat swaps adjacent pairs.
-        # For prefill, we can compute this directly:
-        # Actually, let me just replicate the matmul approach for correctness.
-        x_rotated = ttnn.matmul(x, self.transformation_mat_dram)
+        x_rotated = ttnn.matmul(x, self._rope_rotation_mat)
 
         # Use broadcasting in multiply instead of explicit repeat
         # This eliminates 4 repeat ops per layer (120 total for 30 layers)
