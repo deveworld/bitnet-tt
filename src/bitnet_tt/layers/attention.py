@@ -723,11 +723,16 @@ class MultiHeadAttention:
         )
         self._qkv_scales = (q_s, k_s, v_s)
 
+        # fused QKV always uses standard matmul (not packed ternary) —
+        # use bfp4 when the per-proj dtype is packed_ternary
+        fused_dtype = self.q_proj._ttnn_weight_dtype
+        if fused_dtype == ttnn.uint32:  # packed_ternary
+            fused_dtype = ttnn.bfloat4_b
         self.qkv_fused_weight = ttnn.from_torch(
             torch.from_numpy(qkv_fused),
             device=self.device,
             layout=ttnn.TILE_LAYOUT,
-            dtype=self.q_proj._ttnn_weight_dtype,
+            dtype=fused_dtype,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
