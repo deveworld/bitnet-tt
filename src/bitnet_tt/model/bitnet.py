@@ -42,6 +42,7 @@ class BitNetModel:
         device: ttnn.Device,
         use_lofi_mlp: bool = False,
         weight_dtype: str = "bfp4",
+        use_fused_rope: bool = True,
     ) -> None:
         self.config = config
         self.device = device
@@ -70,6 +71,7 @@ class BitNetModel:
                     layer_idx=layer_idx,
                     use_lofi_mlp=use_lofi_mlp,
                     weight_dtype=weight_dtype,
+                    use_fused_rope=use_fused_rope,
                 )
             )
 
@@ -282,5 +284,6 @@ def create_model(
     device: ttnn.Device,
     use_lofi_mlp: bool = False,
     weight_dtype: str = "bfp4",
+    use_fused_rope: bool = True,
 ) -> BitNetModel:
-    return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp, weight_dtype=weight_dtype)
+    return BitNetModel(config, device, use_lofi_mlp=use_lofi_mlp, weight_dtype=weight_dtype, use_fused_rope=use_fused_rope)

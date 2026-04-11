@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--warmup-new", type=int, default=32)
     ap.add_argument("--no-trace", action="store_true")
     ap.add_argument("--lofi-mlp", action="store_true")
+    ap.add_argument("--no-fused-rope", action="store_true", help="Use manual RoPE (slower but more accurate)")
     args = ap.parse_args()
 
     print(f"=== BitNet-TT Batch32 decode benchmark ===")
@@ -33,7 +34,7 @@ def main():
     print(f"[load] hf state_dict -> numpy  {time.perf_counter()-t0:.1f}s")
 
     t0 = time.perf_counter()
-    model = create_model(config, device, weight_dtype=args.dtype, use_lofi_mlp=args.lofi_mlp)
+    model = create_model(config, device, weight_dtype=args.dtype, use_lofi_mlp=args.lofi_mlp, use_fused_rope=not args.no_fused_rope)
     load_weights_to_model(model, state_dict)
     print(f"[load] numpy -> device  {time.perf_counter()-t0:.1f}s")
 

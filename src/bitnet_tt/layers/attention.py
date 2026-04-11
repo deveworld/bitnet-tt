@@ -469,6 +469,7 @@ class MultiHeadAttention:
         max_position_embeddings: int = 4096,
         rope_theta: float = 500000.0,
         eps: float = 1e-5,
+        use_fused_rope: bool = True,
         layer_idx: int = 0,
     ) -> None:
         """Initialize attention layer."""
@@ -480,6 +481,7 @@ class MultiHeadAttention:
         self.device = device
         self.eps = eps
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.use_fused_rope = use_fused_rope
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
 
@@ -717,7 +719,7 @@ class MultiHeadAttention:
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            permute_for_rope=True,
+            permute_for_rope=self.use_fused_rope,
         )
         self._qkv_scales = (q_s, k_s, v_s)
 
@@ -987,22 +989,42 @@ class MultiHeadAttention:
         k_heads_1bkd = ttnn.multiply(k_heads_1bkd, k_s)
         v_heads_1bkd = ttnn.multiply(v_heads_1bkd, v_s)
 
-        # 3. Apply RoPE via rotary_embedding_llama in decode mode.
-        #    Q/K weights are pre-permuted to adjacent-pair order in load_weights().
-        #    cos/sin arrive as DRAM TILE tensors — shard here (captured by trace).
+        # 3. Apply RoPE
         cos_dram, sin_dram = rot_mats
-        cos = ttnn.to_memory_config(cos_dram, self._rope_cos_sin_config)
-        sin = ttnn.to_memory_config(sin_dram, self._rope_cos_sin_config)
-        q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
-        )
-        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
-        )
-        ttnn.deallocate(cos)
-        ttnn.deallocate(sin)
+        if self.use_fused_rope:
+            # Fused path: rotary_embedding_llama with HEIGHT_SHARDED inputs (29 t/s)
+            cos = ttnn.to_memory_config(cos_dram, self._rope_cos_sin_config)
+            sin = ttnn.to_memory_config(sin_dram, self._rope_cos_sin_config)
+            q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+                q_heads_1bkd, cos, sin, self.transformation_mat_decode,
+                is_decode_mode=True,
+            )
+            k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
+                k_heads_1bkd, cos, sin, self.transformation_mat_decode,
+                is_decode_mode=True,
+            )
+            ttnn.deallocate(cos)
+            ttnn.deallocate(sin)
+        else:
+            # Manual path: half-split RoPE with HF cos/sin (16 t/s, higher accuracy)
+            cos, sin = cos_dram, sin_dram
+            q_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+            k_dram = ttnn.to_memory_config(k_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(q_heads_1bkd)
+            ttnn.deallocate(k_heads_1bkd)
+            q_bhsd = ttnn.permute(q_dram, (1, 2, 0, 3))
+            k_bhsd = ttnn.permute(k_dram, (1, 2, 0, 3))
+            ttnn.deallocate(q_dram)
+            ttnn.deallocate(k_dram)
+            q_bhsd = self._apply_rope_to_tensor(q_bhsd, cos, sin)
+            k_bhsd = self._apply_rope_to_tensor(k_bhsd, cos, sin)
+            q_heads_1bkd = ttnn.permute(q_bhsd, (2, 0, 1, 3))
+            k_heads_1bkd = ttnn.permute(k_bhsd, (2, 0, 1, 3))
+            ttnn.deallocate(q_bhsd)
+            ttnn.deallocate(k_bhsd)
+            v_dram = ttnn.to_memory_config(v_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(v_heads_1bkd)
+            v_heads_1bkd = v_dram
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
@@ -1173,13 +1195,16 @@ class MultiHeadAttention:
         cos: ttnn.Tensor,
         sin: ttnn.Tensor,
     ) -> ttnn.Tensor:
-        """Apply adjacent-pair RoPE to a single tensor.
-
-        Weights are pre-permuted so x is already in adjacent-pair order.
-        cos/sin are interleaved [f0,f0,f1,f1,...] format.
-        x_rotated = x @ rot_matrix_128 where rot_matrix swaps adjacent pairs with sign.
-        """
-        x_rotated = ttnn.matmul(x, self._rope_rotation_mat)
+        """Apply RoPE to a single tensor. Convention depends on use_fused_rope."""
+        if self.use_fused_rope:
+            # Adjacent-pair: x @ rot_matrix_128
+            x_rotated = ttnn.matmul(x, self._rope_rotation_mat)
+        else:
+            # HF half-split: [-x2, x1]
+            half_dim = self.head_dim // 2
+            x1 = x[:, :, :, :half_dim]
+            x2 = x[:, :, :, half_dim:]
+            x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
         # Use broadcasting in multiply instead of explicit repeat
         # This eliminates 4 repeat ops per layer (120 total for 30 layers)

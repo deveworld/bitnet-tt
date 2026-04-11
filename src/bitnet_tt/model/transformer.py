@@ -45,6 +45,7 @@ class TransformerBlock:
         layer_idx: int = 0,
         use_lofi_mlp: bool = False,
         weight_dtype: str = "bfp4",
+        use_fused_rope: bool = True,
     ) -> None:
         """
         Initialize transformer block.
@@ -78,6 +79,7 @@ class TransformerBlock:
             rope_theta=rope_theta,
             eps=rms_norm_eps,
             layer_idx=layer_idx,
+            use_fused_rope=use_fused_rope,
         )
 
         # Pre-FFN normalization

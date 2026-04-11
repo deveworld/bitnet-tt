@@ -213,20 +213,25 @@ class Batch32RotarySetup:
         head_dim: int,
         max_seq_len: int,
         rope_theta: float = 500000.0,
+        use_fused_rope: bool = True,
     ):
         self.device = device
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.rope_theta = rope_theta
+        self.use_fused_rope = use_fused_rope
 
         inv_freq = 1.0 / (
             rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )
         positions = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
-        # Interleaved format for rotary_embedding_llama adjacent-pair rotation:
-        # [f0, f0, f1, f1, ..., f63, f63] (each freq duplicated adjacently)
-        emb = torch.repeat_interleave(freqs, 2, dim=-1)
+        if use_fused_rope:
+            # Interleaved: [f0, f0, f1, f1, ...] for adjacent-pair rotation
+            emb = torch.repeat_interleave(freqs, 2, dim=-1)
+        else:
+            # HF duplicated-halves: [f0, f1, ..., f63, f0, f1, ..., f63]
+            emb = torch.cat([freqs, freqs], dim=-1)
 
         cos_full = emb.cos()  # [max_seq, head_dim] interleaved (TT format)
         sin_full = emb.sin()
@@ -280,9 +285,14 @@ class Batch32RotarySetup:
 
         cos_row = self._cos_host[position]  # [head_dim]
         sin_row = self._sin_host[position]
-        # Expand to [1, PADDED_BATCH, 1, head_dim] — batch at dim 1 for rotary_embedding_llama decode
-        cos = cos_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
-        sin = sin_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
+        if self.use_fused_rope:
+            # [1, PADDED_BATCH, 1, head_dim] for rotary_embedding_llama decode mode
+            cos = cos_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
+            sin = sin_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
+        else:
+            # [1, 1, 1, head_dim] for manual RoPE broadcast
+            cos = cos_row.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            sin = sin_row.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         return cos, sin
 
     def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
@@ -491,11 +501,13 @@ class Batch32Generator:
             self._decode_matmul_kernel_config = None
 
         # Batch-32 RoPE setup
+        use_fused_rope = self.model.layers[0].self_attn.use_fused_rope if self.model.layers else True
         self.rotary_setup = Batch32RotarySetup(
             device=self.device,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_position_embeddings,
             rope_theta=self.config.rope_theta,
+            use_fused_rope=use_fused_rope,
         )
         self._transformation_mat = self.rotary_setup.get_sharded_trans_mat()
         self._sdpa_output_sharded_config = create_sdpa_output_sharded_config(
