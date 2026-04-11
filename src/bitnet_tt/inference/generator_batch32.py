@@ -224,9 +224,11 @@ class Batch32RotarySetup:
         )
         positions = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
+        # Interleaved format for rotary_embedding_llama adjacent-pair rotation:
+        # [f0, f0, f1, f1, ..., f63, f63] instead of HF [f0,...,f63, f0,...,f63]
+        emb = torch.repeat_interleave(freqs, 2, dim=-1)
 
-        cos_full = emb.cos()  # [max_seq, head_dim] duplicated-halves (HF format)
+        cos_full = emb.cos()  # [max_seq, head_dim] interleaved (TT format)
         sin_full = emb.sin()
         self._cos_host = cos_full.to(torch.bfloat16)
         self._sin_host = sin_full.to(torch.bfloat16)
@@ -266,7 +268,7 @@ class Batch32RotarySetup:
         self._host_cos_sin_cache: OrderedDict[int, Tuple[ttnn.Tensor, ttnn.Tensor]] = OrderedDict()
 
     def _get_cos_sin_torch(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build HF duplicated-halves cos/sin for one decode position.
+        """Build interleaved cos/sin for one decode position (TT adjacent-pair format).
 
         Returns [1, 1, 1, head_dim] tensors that broadcast over [B, H, 1, D].
         """
