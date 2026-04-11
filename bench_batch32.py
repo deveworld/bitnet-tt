@@ -8,7 +8,7 @@ import numpy as np
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dtype", default="bf16", choices=["bf16", "bfp8", "bfp4"])
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "bfp8", "bfp4", "packed_ternary"])
     ap.add_argument("--prompt", default="The meaning of life is")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--warmup-prompt-tokens", type=int, default=6)

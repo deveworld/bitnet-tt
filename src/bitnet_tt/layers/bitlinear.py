@@ -11,6 +11,7 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.utils.quantization import weight_quant_ternary
+from bitnet_tt.kernels.pack import pack_ternary_tilized
 
 
 def numpy_to_ttnn(
@@ -126,6 +127,7 @@ class Linear:
         "bf16": ttnn.bfloat16,
         "bfp4": ttnn.bfloat4_b,
         "bfp8": ttnn.bfloat8_b,
+        "packed_ternary": ttnn.uint32,  # 2-bit packed
     }
 
     def __init__(
@@ -154,6 +156,7 @@ class Linear:
         self._fidelity = compute_fidelity
         self._weight_dtype_name = weight_dtype
         self._ttnn_weight_dtype = self._WEIGHT_DTYPE_MAP.get(weight_dtype, ttnn.bfloat16)
+        self._use_packed_ternary = (weight_dtype == "packed_ternary")
 
         # Initialize compute kernel config for faster matmul
         self._compute_kernel_config = None
@@ -171,9 +174,30 @@ class Linear:
         Stores pure ternary {-1, 0, +1} values (lossless in BFP4) and
         applies the scale factor as a cheap post-matmul scalar multiply.
 
+        For packed_ternary: stores 2-bit packed weight (8× smaller DRAM footprint).
+
         Args:
             weight: Weight array of shape (out_features, in_features)
         """
+        if self._weight_dtype_name == "packed_ternary":
+            weight_quant, scale = weight_quant_ternary(weight.astype(np.float32))
+            packed_bytes, _ = pack_ternary_tilized(weight_quant.astype(np.int8), float(scale))
+            packed_u32 = np.frombuffer(packed_bytes.flatten().tobytes(), dtype=np.uint32)
+            num_tiles = packed_bytes.shape[0]
+            packed_torch = torch.from_numpy(
+                packed_u32.reshape(num_tiles, 64).astype(np.int32)
+            ).to(torch.int32)
+            self.weight = ttnn.from_torch(
+                packed_torch,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            self.weight_scale = float(scale)
+            self._use_packed_ternary = True
+            return
+
         weight_t, scale = quantize_and_transpose_weight(weight)
         self.load_pretransposed_weight(weight_t, scale=scale)
 
@@ -189,6 +213,27 @@ class Linear:
                    whose scales are applied externally (e.g. fused gate_up).
         """
         self.weight_scale = scale
+
+        if self._use_packed_ternary:
+            # weight_t is already transposed (K, N) with {-1, 0, +1} values.
+            # pack_ternary_tilized expects (out, in) and transposes internally,
+            # so we pass weight_t.T to undo the pre-transpose.
+            wq_int8 = np.round(weight_t.T).astype(np.int8)
+            packed_bytes, _ = pack_ternary_tilized(wq_int8, 1.0)
+            packed_u32 = np.frombuffer(packed_bytes.flatten().tobytes(), dtype=np.uint32)
+            num_tiles = packed_bytes.shape[0]
+            packed_torch = torch.from_numpy(
+                packed_u32.reshape(num_tiles, 64).astype(np.int32)
+            ).to(torch.int32)
+            self.weight = ttnn.from_torch(
+                packed_torch,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            return
+
         torch_tensor = torch.from_numpy(weight_t.astype(np.float32))
         self.weight = ttnn.from_torch(
             torch_tensor,
@@ -211,7 +256,11 @@ class Linear:
         if self.weight is None:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
-        if self._compute_kernel_config is not None:
+        if self._use_packed_ternary:
+            out = ttnn.experimental.ternary_matmul(
+                x, self.weight, use_packed_ternary=True,
+            )
+        elif self._compute_kernel_config is not None:
             out = ttnn.matmul(
                 x,
                 self.weight,
