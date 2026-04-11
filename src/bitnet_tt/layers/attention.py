@@ -414,8 +414,8 @@ def _permute_halfsplit_to_adjacent(weight_t: NDArray, num_heads: int, head_dim: 
     half = head_dim // 2
     perm = np.empty(head_dim, dtype=np.intp)
     for k in range(half):
-        perm[2 * k] = k
-        perm[2 * k + 1] = k + half
+        perm[2 * k] = k + half
+        perm[2 * k + 1] = k
 
     out = weight_t.copy()
     for h in range(num_heads):
