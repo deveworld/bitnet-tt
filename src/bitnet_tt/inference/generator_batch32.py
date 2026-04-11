@@ -286,9 +286,10 @@ class Batch32RotarySetup:
         return cos, sin
 
     def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Create HEIGHT_SHARDED device tensors for one decode position.
+        """Create DRAM device tensors for one decode position.
 
-        Shape: [1, 1, PADDED_BATCH, head_dim], HEIGHT_SHARDED for rotary_embedding_llama decode mode.
+        Shape: [1, PADDED_BATCH, 1, head_dim]. Sharding to HEIGHT_SHARDED
+        happens inside the decode forward (so it's part of the trace).
         """
         cos_torch, sin_torch = self._get_cos_sin_torch(position)
         cos_device = ttnn.from_torch(
@@ -305,8 +306,6 @@ class Batch32RotarySetup:
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        cos_device = ttnn.to_memory_config(cos_device, self.cos_sin_config)
-        sin_device = ttnn.to_memory_config(sin_device, self.cos_sin_config)
         return cos_device, sin_device
 
     def get_cos_sin_host_tensor(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:

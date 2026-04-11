@@ -558,6 +558,15 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(_trans_mat_dram)
 
+        # HEIGHT_SHARDED config for cos/sin in rotary_embedding_llama decode mode
+        self._rope_cos_sin_config = ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+
         # Store core grid for dynamic sharding
         self.core_grid = device.compute_with_storage_grid_size()
         self._sdpa_decode_compute_kernel_config = None
@@ -967,9 +976,10 @@ class MultiHeadAttention:
 
         # 3. Apply RoPE via rotary_embedding_llama in decode mode.
         #    Q/K weights are pre-permuted to adjacent-pair order in load_weights().
-        #    cos/sin are HEIGHT_SHARDED [1,1,32,head_dim] interleaved from Batch32RotarySetup.
-        #    Q/K are HEIGHT_SHARDED from nlp_create_qkv_heads_decode.
-        cos, sin = rot_mats
+        #    cos/sin arrive as DRAM TILE tensors — shard here (captured by trace).
+        cos_dram, sin_dram = rot_mats
+        cos = ttnn.to_memory_config(cos_dram, self._rope_cos_sin_config)
+        sin = ttnn.to_memory_config(sin_dram, self._rope_cos_sin_config)
         q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
             q_heads_1bkd, cos, sin, self.transformation_mat_decode,
             is_decode_mode=True,
@@ -978,6 +988,8 @@ class MultiHeadAttention:
             k_heads_1bkd, cos, sin, self.transformation_mat_decode,
             is_decode_mode=True,
         )
+        ttnn.deallocate(cos)
+        ttnn.deallocate(sin)
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
