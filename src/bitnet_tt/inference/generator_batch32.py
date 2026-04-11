@@ -224,9 +224,11 @@ class Batch32RotarySetup:
         )
         positions = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
+        # Interleaved format for rotary_embedding_llama adjacent-pair rotation:
+        # [f0, f0, f1, f1, ..., f63, f63] (each freq duplicated adjacently)
+        emb = torch.repeat_interleave(freqs, 2, dim=-1)
 
-        cos_full = emb.cos()  # [max_seq, head_dim] duplicated-halves (HF format)
+        cos_full = emb.cos()  # [max_seq, head_dim] interleaved (TT format)
         sin_full = emb.sin()
         self._cos_host = cos_full.to(torch.bfloat16)
         self._sin_host = sin_full.to(torch.bfloat16)
@@ -266,23 +268,28 @@ class Batch32RotarySetup:
         self._host_cos_sin_cache: OrderedDict[int, Tuple[ttnn.Tensor, ttnn.Tensor]] = OrderedDict()
 
     def _get_cos_sin_torch(self, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build HF duplicated-halves cos/sin for one decode position.
+        """Build interleaved cos/sin for one decode position.
 
-        Returns [1, 1, 1, head_dim] tensors that broadcast over [B, H, 1, D].
+        Returns [1, 1, PADDED_BATCH, head_dim] tensors for HEIGHT_SHARDED decode.
+        The position's cos/sin are broadcast (repeated) across the batch dimension.
         """
         if position < 0 or position >= self.max_seq_len:
             raise ValueError(
                 f"Position {position} is out of range for max_seq_len={self.max_seq_len}"
             )
 
-        cos_row = self._cos_host[position : position + 1]  # [1, head_dim]
-        sin_row = self._sin_host[position : position + 1]
-        cos = cos_row.unsqueeze(0).unsqueeze(0)  # [1, 1, 1, head_dim]
-        sin = sin_row.unsqueeze(0).unsqueeze(0)
+        cos_row = self._cos_host[position]  # [head_dim]
+        sin_row = self._sin_host[position]
+        # Expand to [1, 1, PADDED_BATCH, head_dim] — same value for all batch entries
+        cos = cos_row.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, 1, PADDED_BATCH, -1).contiguous()
+        sin = sin_row.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, 1, PADDED_BATCH, -1).contiguous()
         return cos, sin
 
     def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Create DRAM device tensors for one decode position ([1,1,1,head_dim])."""
+        """Create HEIGHT_SHARDED device tensors for one decode position.
+
+        Shape: [1, 1, PADDED_BATCH, head_dim], HEIGHT_SHARDED for rotary_embedding_llama decode mode.
+        """
         cos_torch, sin_torch = self._get_cos_sin_torch(position)
         cos_device = ttnn.from_torch(
             cos_torch,
@@ -298,6 +305,8 @@ class Batch32RotarySetup:
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        cos_device = ttnn.to_memory_config(cos_device, self.cos_sin_config)
+        sin_device = ttnn.to_memory_config(sin_device, self.cos_sin_config)
         return cos_device, sin_device
 
     def get_cos_sin_host_tensor(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
@@ -329,8 +338,14 @@ class Batch32RotarySetup:
         return cos_host, sin_host
 
     def get_sharded_trans_mat(self) -> ttnn.Tensor:
-        """Get HEIGHT_SHARDED transformation matrix."""
+        """Get HEIGHT_SHARDED transformation matrix for rotary_embedding_llama decode mode."""
         return ttnn.to_memory_config(self.transformation_mat, self.trans_mat_config)
+
+    def get_trans_mat_for_decode(self) -> ttnn.Tensor:
+        """Get transformation matrix in correct config for decode rotary_embedding_llama."""
+        if not hasattr(self, '_cached_sharded_trans_mat'):
+            self._cached_sharded_trans_mat = self.get_sharded_trans_mat()
+        return self._cached_sharded_trans_mat
 
     def release_host_cache(self) -> None:
         """Release cached host-side cos/sin tensors."""
