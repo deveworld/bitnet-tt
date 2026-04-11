@@ -280,9 +280,9 @@ class Batch32RotarySetup:
 
         cos_row = self._cos_host[position]  # [head_dim]
         sin_row = self._sin_host[position]
-        # Expand to [1, 1, PADDED_BATCH, head_dim] — same value for all batch entries
-        cos = cos_row.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, 1, PADDED_BATCH, -1).contiguous()
-        sin = sin_row.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(1, 1, PADDED_BATCH, -1).contiguous()
+        # Expand to [1, PADDED_BATCH, 1, head_dim] — batch at dim 1 for rotary_embedding_llama decode
+        cos = cos_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
+        sin = sin_row.view(1, 1, 1, -1).expand(1, PADDED_BATCH, 1, -1).contiguous()
         return cos, sin
 
     def create_cos_sin_device_tensors(self, position: int) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
