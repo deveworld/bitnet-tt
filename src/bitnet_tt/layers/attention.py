@@ -966,11 +966,9 @@ class MultiHeadAttention:
         k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
             q_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
         )
         k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
             k_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
         )
 
         # 4. Create position tensor if not provided
