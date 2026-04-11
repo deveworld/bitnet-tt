@@ -11,7 +11,6 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.utils.quantization import weight_quant_ternary
-from bitnet_tt.kernels.pack import pack_ternary_tilized
 
 
 def numpy_to_ttnn(
@@ -180,6 +179,7 @@ class Linear:
             weight: Weight array of shape (out_features, in_features)
         """
         if self._weight_dtype_name == "packed_ternary":
+            from bitnet_tt.kernels.pack import pack_ternary_tilized
             weight_quant, scale = weight_quant_ternary(weight.astype(np.float32))
             packed_bytes, _ = pack_ternary_tilized(weight_quant.astype(np.int8), float(scale))
             packed_u32 = np.frombuffer(packed_bytes.flatten().tobytes(), dtype=np.uint32)
@@ -215,6 +215,7 @@ class Linear:
         self.weight_scale = scale
 
         if self._use_packed_ternary:
+            from bitnet_tt.kernels.pack import pack_ternary_tilized
             # weight_t is already transposed (K, N) with {-1, 0, +1} values.
             # pack_ternary_tilized expects (out, in) and transposes internally,
             # so we pass weight_t.T to undo the pre-transpose.
