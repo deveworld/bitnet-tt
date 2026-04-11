@@ -74,7 +74,7 @@ def test_ternary_matmul(device, M=32, K=64, N=32):
     assert packed_flat.nbytes % 4 == 0, f"packed bytes {packed_flat.nbytes} not 4-byte aligned"
     packed_u32 = np.frombuffer(packed_flat.tobytes(), dtype=np.uint32)
     num_tiles = packed_bytes.shape[0]
-    packed_reshaped = packed_u32.reshape(1, num_tiles * 64)  # [1, total_u32]
+    packed_reshaped = packed_u32.reshape(num_tiles, 64)  # [num_tiles, 64] — each row = one packed tile (256 bytes)
 
     packed_torch = torch.from_numpy(packed_reshaped.astype(np.int32)).to(torch.int32)
     packed_ttnn = ttnn.from_torch(
