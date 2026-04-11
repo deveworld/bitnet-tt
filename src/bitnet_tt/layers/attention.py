@@ -959,16 +959,15 @@ class MultiHeadAttention:
         # 3. Apply RoPE via rotary_embedding_llama (adjacent-pair rotation).
         #    Q/K weights are pre-permuted in load_weights() so activations are
         #    already in adjacent-pair order matching rotary_embedding_llama.
-        #    rotary_embedding_llama requires INTERLEAVED input, so move from
-        #    HEIGHT_SHARDED (nlp_create_qkv_heads_decode output) to DRAM first.
+        #    Decode mode requires HEIGHT_SHARDED input (already from nlp_create_qkv_heads_decode).
         cos, sin = rot_mats
-        q_heads_1bkd = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
-        k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
         q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
             q_heads_1bkd, cos, sin, self.transformation_mat_decode,
+            is_decode_mode=True,
         )
         k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
             k_heads_1bkd, cos, sin, self.transformation_mat_decode,
+            is_decode_mode=True,
         )
 
         # 4. Create position tensor if not provided
