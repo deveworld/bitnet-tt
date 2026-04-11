@@ -61,35 +61,38 @@ def test_ternary_matmul(device, M=32, K=64, N=32):
     bf16_corr = np.corrcoef(ref_output.flatten(), out_bf16_np.flatten())[0, 1]
     print(f"bf16 matmul: max_err={bf16_err:.4f}, corr={bf16_corr:.6f}")
 
-    # === Test path 2: custom ternary_matmul with 2-bit packed weights ===
-    from ttnn._ttnn.operations.bitnet import ternary_matmul
-
+    # === Test path 2: packed ternary matmul via ttnn.experimental.ternary_matmul ===
     # Pack weights to 2-bit
     packed_bytes, tile_scales = pack_ternary_tilized(weight_quant, scale)
     print(f"Packed: {packed_bytes.shape[0]} tiles, {packed_bytes.nbytes} bytes (vs {M*K*2} bf16 bytes)")
 
-    # Create packed weight tensor on device (flat uint8)
+    # Create packed weight tensor on device as uint32 ROW_MAJOR
+    # Each tile = 256 bytes = 64 uint32 values
+    # Shape: [num_tiles, 64] so TensorAccessor page_size=256 works
     packed_flat = packed_bytes.flatten()
-    # Pad to 32-byte alignment
-    pad_len = (32 - len(packed_flat) % 32) % 32
-    if pad_len:
-        packed_flat = np.pad(packed_flat, (0, pad_len), constant_values=0)
+    # Reinterpret as uint32 (4 bytes per uint32)
+    assert packed_flat.nbytes % 4 == 0, f"packed bytes {packed_flat.nbytes} not 4-byte aligned"
+    packed_u32 = np.frombuffer(packed_flat.tobytes(), dtype=np.uint32)
+    num_tiles = packed_bytes.shape[0]
+    packed_reshaped = packed_u32.reshape(1, num_tiles * 64)  # [1, total_u32]
 
-    packed_torch = torch.from_numpy(packed_flat.astype(np.int32)).to(torch.int32)
+    packed_torch = torch.from_numpy(packed_reshaped.astype(np.int32)).to(torch.int32)
     packed_ttnn = ttnn.from_torch(
-        packed_torch.unsqueeze(0),
+        packed_torch,
         dtype=ttnn.uint32,
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
     )
 
-    Mt = M // 32
-    Kt = K // 32
-    Nt = N // 32
-
     try:
-        out_ternary = ternary_matmul(act_ttnn, packed_ttnn, scale, Mt, Kt, Nt)
+        out_ternary = ttnn.experimental.ternary_matmul(
+            act_ttnn, packed_ttnn,
+            use_packed_ternary=True,
+        )
         out_ternary_np = ttnn.to_torch(out_ternary).float().numpy().reshape(M, N)
+
+        # Scale the output (packed weights are {-1,0,+1}, scale applied post-matmul)
+        out_ternary_np *= scale
 
         ternary_err = np.max(np.abs(ref_output - out_ternary_np))
         ternary_corr = np.corrcoef(ref_output.flatten(), out_ternary_np.flatten())[0, 1]
