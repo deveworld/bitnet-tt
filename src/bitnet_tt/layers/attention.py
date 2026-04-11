@@ -553,10 +553,10 @@ class MultiHeadAttention:
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
+        self.transformation_mat_dram = _trans_mat_dram  # DRAM copy for prefill RoPE matmul
         self.transformation_mat_decode = ttnn.to_memory_config(
             _trans_mat_dram, _trans_mat_sharded_config
         )
-        ttnn.deallocate(_trans_mat_dram)
 
         # HEIGHT_SHARDED config for cos/sin in rotary_embedding_llama decode mode
         self._rope_cos_sin_config = ttnn.create_sharded_memory_config(
@@ -1160,15 +1160,24 @@ class MultiHeadAttention:
         cos: ttnn.Tensor,
         sin: ttnn.Tensor,
     ) -> ttnn.Tensor:
-        """Apply RoPE to a single tensor.
+        """Apply adjacent-pair RoPE to a single tensor.
 
-        Uses TTNN broadcasting in multiply (no explicit repeat needed).
-        cos/sin are [1, 1, seq, head_dim], x is [batch, heads, seq, head_dim].
+        Weights are pre-permuted so x is already in adjacent-pair order.
+        cos/sin are interleaved [f0,f0,f1,f1,...] format.
+        Rotation: rot[2k] = -x[2k+1], rot[2k+1] = x[2k]
         """
-        half_dim = self.head_dim // 2
-        x1 = x[:, :, :, :half_dim]
-        x2 = x[:, :, :, half_dim:]
-        x_rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+        x_even = x[:, :, :, 0::2]
+        x_odd = x[:, :, :, 1::2]
+        x_rotated = ttnn.concat([ttnn.neg(x_odd), x_even], dim=-1)
+        # Interleave back: [rot_even_0, rot_odd_0, rot_even_1, rot_odd_1, ...]
+        # Actually this concat gives [all_rot_even, all_rot_odd] not interleaved.
+        # We need the same interleaved layout. Since ttnn doesn't have a simple
+        # interleave op, use the fact that:
+        # rot[2k] = -x[2k+1], rot[2k+1] = x[2k]
+        # This is equivalent to: x @ trans_mat where trans_mat swaps adjacent pairs.
+        # For prefill, we can compute this directly:
+        # Actually, let me just replicate the matmul approach for correctness.
+        x_rotated = ttnn.matmul(x, self.transformation_mat_dram)
 
         # Use broadcasting in multiply instead of explicit repeat
         # This eliminates 4 repeat ops per layer (120 total for 30 layers)
