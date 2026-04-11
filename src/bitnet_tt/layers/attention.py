@@ -402,52 +402,19 @@ class KVCache:
 
 
 
-def _permute_halfsplit_to_adjacent(weight_t: NDArray, num_heads: int, head_dim: int) -> NDArray:
-    """Permute transposed Q/K weight columns from HF half-split to TT adjacent-pair RoPE order.
-
-    HF pairs d[i] with d[i + head_dim//2] (half-split).
-    TT rotary_embedding_llama pairs d[2i] with d[2i+1] (adjacent).
-
-    Permute each head's columns: [0, hd//2, 1, hd//2+1, ..., hd//2-1, hd-1]
-    so that activations come out in adjacent-pair order.
-    """
-    half = head_dim // 2
-    perm = np.empty(head_dim, dtype=np.intp)
-    for k in range(half):
-        perm[2 * k] = k
-        perm[2 * k + 1] = k + half
-
-    out = weight_t.copy()
-    for h in range(num_heads):
-        col_start = h * head_dim
-        out[:, col_start:col_start + head_dim] = weight_t[:, col_start + perm]
-    return out
-
-
 def build_fused_qkv_weight(
     q_weight: NDArray[np.floating],
     k_weight: NDArray[np.floating],
     v_weight: NDArray[np.floating],
-    num_heads: int = 0,
-    num_kv_heads: int = 0,
-    head_dim: int = 0,
-    permute_for_rope: bool = False,
 ) -> tuple[NDArray[np.float32], float, float, float]:
     """
     Build a single pre-transposed QKV matrix from separately quantized weights.
 
     Returns pure ternary {-1,0,+1} fused weight and per-projection scales.
-    If permute_for_rope=True, permutes Q/K head dimensions from HF half-split
-    to TT adjacent-pair order for rotary_embedding_llama compatibility.
     """
     q_t, q_scale = quantize_and_transpose_weight(q_weight)
     k_t, k_scale = quantize_and_transpose_weight(k_weight)
     v_t, v_scale = quantize_and_transpose_weight(v_weight)
-
-    if permute_for_rope and head_dim > 0:
-        q_t = _permute_halfsplit_to_adjacent(q_t, num_heads, head_dim)
-        k_t = _permute_halfsplit_to_adjacent(k_t, num_kv_heads, head_dim)
-
     fused = np.concatenate([q_t, k_t, v_t], axis=1)
     return fused, q_scale, k_scale, v_scale
 
@@ -681,13 +648,7 @@ class MultiHeadAttention:
         if attn_sub_norm_weight is not None:
             self.attn_sub_norm.load_weights(attn_sub_norm_weight)
 
-        qkv_fused, q_s, k_s, v_s = build_fused_qkv_weight(
-            q_weight, k_weight, v_weight,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            permute_for_rope=True,
-        )
+        qkv_fused, q_s, k_s, v_s = build_fused_qkv_weight(q_weight, k_weight, v_weight)
         self._qkv_scales = (q_s, k_s, v_s)
 
         self.qkv_fused_weight = ttnn.from_torch(
@@ -956,19 +917,34 @@ class MultiHeadAttention:
         k_heads_1bkd = ttnn.multiply(k_heads_1bkd, k_s)
         v_heads_1bkd = ttnn.multiply(v_heads_1bkd, v_s)
 
-        # 3. Apply RoPE via rotary_embedding_llama (adjacent-pair rotation).
-        #    Q/K weights are pre-permuted in load_weights() so activations are
-        #    already in adjacent-pair order matching rotary_embedding_llama.
-        #    Decode mode requires HEIGHT_SHARDED input (already from nlp_create_qkv_heads_decode).
+        # 3. Apply RoPE — use manual half-split rotation matching HF convention.
+        #    rotary_embedding_llama uses adjacent-pair rotation which is
+        #    incompatible with HF's half-split layout unless Q/K weights are
+        #    permuted (not yet implemented).  Manual RoPE on desharded tensors
+        #    trades a small perf cost for correct rotation.
         cos, sin = rot_mats
-        q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
-        )
-        k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1bkd, cos, sin, self.transformation_mat_decode,
-            is_decode_mode=True,
-        )
+        q_dram = ttnn.to_memory_config(q_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        k_dram = ttnn.to_memory_config(k_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_heads_1bkd)
+        ttnn.deallocate(k_heads_1bkd)
+
+        # Reshape from 1BKD [1, B, H, D] to BHSD [B, H, 1, D] for RoPE
+        q_bhsd = ttnn.permute(q_dram, (1, 2, 0, 3))
+        k_bhsd = ttnn.permute(k_dram, (1, 2, 0, 3))
+        ttnn.deallocate(q_dram)
+        ttnn.deallocate(k_dram)
+
+        q_bhsd = self._apply_rope_to_tensor(q_bhsd, cos, sin)
+        k_bhsd = self._apply_rope_to_tensor(k_bhsd, cos, sin)
+
+        # Back to 1BKD [1, B, H, D] for paged_update_cache / sdpa_decode
+        q_heads_1bkd = ttnn.permute(q_bhsd, (2, 0, 1, 3))
+        k_heads_1bkd = ttnn.permute(k_bhsd, (2, 0, 1, 3))
+        ttnn.deallocate(q_bhsd)
+        ttnn.deallocate(k_bhsd)
+        v_dram = ttnn.to_memory_config(v_heads_1bkd, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(v_heads_1bkd)
+        v_heads_1bkd = v_dram
 
         # 4. Create position tensor if not provided
         pos_tensor_local = current_pos_tensor
