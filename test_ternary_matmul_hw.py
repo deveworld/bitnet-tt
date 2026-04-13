@@ -62,19 +62,21 @@ def test_ternary_matmul(device, M=32, K=64, N=32):
     print(f"bf16 matmul: max_err={bf16_err:.4f}, corr={bf16_corr:.6f}")
 
     # === Test path 2: packed ternary matmul via ttnn.experimental.ternary_matmul ===
-    # Pack weights to 2-bit
-    packed_bytes, tile_scales = pack_ternary_tilized(weight_quant, scale)
-    print(f"Packed: {packed_bytes.shape[0]} tiles, {packed_bytes.nbytes} bytes (vs {M*K*2} bf16 bytes)")
+    # Pack weights as BFP2_b (320 bytes/tile, HW-unpacked on device).
+    from ttnn._ttnn.bfp_utils import pack_bfp2
 
-    # Create packed weight tensor on device as uint32 ROW_MAJOR
-    # Each tile = 256 bytes = 64 uint32 values
-    # Shape: [num_tiles, 64] so TensorAccessor page_size=256 works
-    packed_flat = packed_bytes.flatten()
-    # Reinterpret as uint32 (4 bytes per uint32)
-    assert packed_flat.nbytes % 4 == 0, f"packed bytes {packed_flat.nbytes} not 4-byte aligned"
-    packed_u32 = np.frombuffer(packed_flat.tobytes(), dtype=np.uint32)
-    num_tiles = packed_bytes.shape[0]
-    packed_reshaped = packed_u32.reshape(num_tiles, 64)  # [num_tiles, 64] — each row = one packed tile (256 bytes)
+    w_kn = weight_quant.T.astype(np.float32)  # (K, N)
+    Kt, Nt = K // 32, N // 32
+    w_tiled = (
+        w_kn.reshape(Kt, 32, Nt, 32)
+        .transpose(0, 2, 1, 3)
+        .reshape(Kt * Nt, 1024)
+    )
+    flat = w_tiled.reshape(-1).astype(np.float32)
+    packed_u32 = pack_bfp2(flat, row_major_input=True, is_exp_a=False)
+    num_tiles = Kt * Nt
+    print(f"Packed: {num_tiles} tiles, {num_tiles * 320} bytes (vs {M*K*2} bf16 bytes)")
+    packed_reshaped = np.asarray(packed_u32).reshape(num_tiles, 80)
 
     packed_torch = torch.from_numpy(packed_reshaped.astype(np.int32)).to(torch.int32)
     packed_ttnn = ttnn.from_torch(
