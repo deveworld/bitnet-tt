@@ -62,7 +62,9 @@ def test_ternary_matmul(device, M=32, K=64, N=32):
     print(f"bf16 matmul: max_err={bf16_err:.4f}, corr={bf16_corr:.6f}")
 
     # === Test path 2: packed ternary matmul via ttnn.experimental.ternary_matmul ===
-    # Pack weights as BFP2_b (320 bytes/tile, HW-unpacked on device).
+    # True 2-bit storage: pack as BFP2_b then strip the constant exponent block
+    # (256B mantissa = 64 uint32 per 32x32 tile). Device synthesizes the
+    # exponent in L1.
     from ttnn._ttnn.bfp_utils import pack_bfp2
 
     w_kn = weight_quant.T.astype(np.float32)  # (K, N)
@@ -73,12 +75,12 @@ def test_ternary_matmul(device, M=32, K=64, N=32):
         .reshape(Kt * Nt, 1024)
     )
     flat = w_tiled.reshape(-1).astype(np.float32)
-    packed_u32 = pack_bfp2(flat, row_major_input=True, is_exp_a=False)
+    packed_full = np.asarray(pack_bfp2(flat, row_major_input=True, is_exp_a=False))
     num_tiles = Kt * Nt
-    print(f"Packed: {num_tiles} tiles, {num_tiles * 320} bytes (vs {M*K*2} bf16 bytes)")
-    packed_reshaped = np.asarray(packed_u32).reshape(num_tiles, 80)
-
-    packed_torch = torch.from_numpy(packed_reshaped.astype(np.int32)).to(torch.int32)
+    packed_full = packed_full.reshape(num_tiles, 80)
+    mantissa_only = packed_full[:, 16:].copy()  # (num_tiles, 64)
+    print(f"Packed: {num_tiles} tiles, {num_tiles * 256} bytes (vs {M*K*2} bf16 bytes)")
+    packed_torch = torch.from_numpy(mantissa_only.astype(np.int32)).to(torch.int32)
     packed_ttnn = ttnn.from_torch(
         packed_torch,
         dtype=ttnn.uint32,
