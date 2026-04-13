@@ -179,37 +179,36 @@ class Linear:
             weight: Weight array of shape (out_features, in_features)
         """
         if self._weight_dtype_name == "packed_ternary":
-            # Pack ternary values {-1, 0, +1} as BFP2_b tiles using tt-metal's
-            # official packer. BFP2 is: 1 sign bit + 1 mantissa bit + shared
-            # 8-bit exponent per 16-value group. With shared exponent = 0,
-            # representable values are exactly {-1, 0, +1} — lossless.
-            # Hardware unpacker (Tensix) decodes BFP2_b on the fly, so no SW
-            # unpack is needed in the device kernel.
+            # True 2-bit packed_ternary with HW unpack. We pack via tt-metal's
+            # bfp2 packer, then DROP the shared-exponent section before storing
+            # to DRAM. For ternary values {-1, 0, +1} the bfp2 exponent is
+            # always 0x7F (= 127, scale 2^0=1) for any non-zero group, and
+            # mantissa=0 makes all-zero groups correct regardless of exp.
+            # The device-side reader synthesizes the 0x7F exponent block once
+            # in cb_in1's L1 region, then DMAs only the 64 uint32 mantissa per
+            # tile from DRAM. End-to-end storage is 256 B / 32x32 tile = pure
+            # 2 bits per weight, while compute uses the Tensix HW unpacker.
             from ttnn._ttnn.bfp_utils import pack_bfp2
 
             weight_quant, scale = weight_quant_ternary(weight.astype(np.float32))
-            # weight is (out, in); op expects (K, N) = (in, out), so transpose.
             w_kn = weight_quant.T.astype(np.float32)
             K, N = w_kn.shape
             assert K % 32 == 0 and N % 32 == 0, "K/N must be multiples of 32"
             Kt, Nt = K // 32, N // 32
-            # Tile up row-major KxN into (Kt, Nt) tiles, then pack per tile so
-            # each tile's 1024 values land contiguously in the flat packer input.
             w_tiled = (
                 w_kn.reshape(Kt, 32, Nt, 32)
                 .transpose(0, 2, 1, 3)  # (Kt, Nt, 32, 32)
                 .reshape(Kt * Nt, 1024)
             )
             flat = w_tiled.reshape(-1).astype(np.float32)
-            packed_u32 = pack_bfp2(flat, row_major_input=True, is_exp_a=False)
-            # 80 uint32 per 32x32 tile (320 bytes: 256 exp + 64 data)
-            num_tiles = Kt * Nt
-            assert packed_u32.size == num_tiles * 80, (
-                f"unexpected bfp2 pack size: {packed_u32.size} vs {num_tiles*80}"
+            packed_full = np.asarray(
+                pack_bfp2(flat, row_major_input=True, is_exp_a=False)
             )
-            packed_torch = torch.from_numpy(
-                np.asarray(packed_u32).reshape(num_tiles, 80).astype(np.int32)
-            ).to(torch.int32)
+            num_tiles = Kt * Nt
+            # Each bfp2 tile = 80 uint32 (16 exp + 64 mantissa). Drop exponent.
+            packed_full = packed_full.reshape(num_tiles, 80)
+            mantissa_only = packed_full[:, 16:].copy()  # (num_tiles, 64)
+            packed_torch = torch.from_numpy(mantissa_only.astype(np.int32)).to(torch.int32)
             self.weight = ttnn.from_torch(
                 packed_torch,
                 dtype=ttnn.uint32,
@@ -239,7 +238,7 @@ class Linear:
 
         if self._use_packed_ternary:
             # Pre-transposed weight: shape (K, N) with {-1, 0, +1} values.
-            # Pack as BFP2_b tiles (hardware-unpacked on device).
+            # Pack as BFP2_b tiles, drop the constant exponent block.
             from ttnn._ttnn.bfp_utils import pack_bfp2
 
             w_kn = weight_t.astype(np.float32)
@@ -252,11 +251,13 @@ class Linear:
                 .reshape(Kt * Nt, 1024)
             )
             flat = w_tiled.reshape(-1).astype(np.float32)
-            packed_u32 = pack_bfp2(flat, row_major_input=True, is_exp_a=False)
+            packed_full = np.asarray(
+                pack_bfp2(flat, row_major_input=True, is_exp_a=False)
+            )
             num_tiles = Kt * Nt
-            packed_torch = torch.from_numpy(
-                np.asarray(packed_u32).reshape(num_tiles, 80).astype(np.int32)
-            ).to(torch.int32)
+            packed_full = packed_full.reshape(num_tiles, 80)
+            mantissa_only = packed_full[:, 16:].copy()  # (num_tiles, 64)
+            packed_torch = torch.from_numpy(mantissa_only.astype(np.int32)).to(torch.int32)
             self.weight = ttnn.from_torch(
                 packed_torch,
                 dtype=ttnn.uint32,
