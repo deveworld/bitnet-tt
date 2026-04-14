@@ -1,6 +1,6 @@
 # TODO
 
-## 현재 상태 (2026-04-14)
+## 현재 상태 (2026-04-15)
 
 ### 달성 — Track A 완료
 - **34.81 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
@@ -36,11 +36,13 @@
 - [x] True 2-bit DRAM (mantissa-only, L1-synthesized exp)
 - [x] 2D multi-core (108 cores gate_up, 40 cores mcast for down_proj/o_proj)
 - [x] Dual-NoC split (BRISC activation, NCRISC weight+output)
-- [x] `matmul_block` compute (ct_dim=nt_per_core, single K block)
+- [x] `matmul_block` compute (ct_dim=nt_per_core)
 - [x] `nt_per_core ∈ [2, 8]` heuristic (amortises call overhead)
 - [x] **Activation multicast** via rectangular layout + sender/receiver
 - [x] `SetCommonRuntimeArgs` for shared DRAM addresses
 - [x] FFN 통합: gate_up, down_proj, o_proj 모두 `ttnn.experimental.ternary_matmul` 사용
+- [x] Attention 통합: q/k/v/o_proj + fused QKV 모두 packed_ternary
+- [x] **K-block pipelining** (`in0_block_w = Kt/2`) — cb0/cb1 자동 double-buffer
 - [x] bench_batch32 end-to-end 검증
 
 ### 설계 메모
@@ -52,15 +54,39 @@
   un-inited L1이 0x7F 패턴과 충돌 가능)
 - **mcast 활성 조건**: rectangular layout의 core count ≥ L-shape core count
   AND ≥ 2. gate_up은 108 L-shape 유지, down_proj/o_proj는 40-core 5×8 rect.
-
-### 향후 여지 (선택)
-- [x] ~~K-block pipelining~~ — Kt/2 double-buffer 적용 완료
-- [ ] `multi_core_reuse_optimized` factory 포팅 (3300줄 재작성) — 유일한 큰 여지
+- **K-block pipelining**: cb0/cb1은 Kt 크기 유지, in0_block_w만 Kt/2로 줄이면
+  자동으로 2-block double-buffer가 됨. BRISC sender 전환 이전에는 perf-neutral
+  이었는데, dual-NoC가 실제로 병렬 동작하게 되면서 DMA/compute overlap이 발현됨.
+  Kt/4는 sync 오버헤드로 Kt/2와 noise 내 동등.
 
 ---
 
-## Track B: Zero-Tile Skip
-- **불가:** 0% all-zero tiles (분석 완료)
+## Track B: Zero-Tile Skip — ✗ 불가
+- 0% all-zero tiles (분석 완료, 구현 가치 없음)
+
+---
+
+## Track C: multi_core_reuse_optimized 포팅 — 🔄 Future
+**목표:** Activation + weight 둘 다 multicast + 2D core grid reuse 패턴으로
+매트멀 팩토리 재작성. DRAM 대역폭을 `Kt × Nt` → `Kt + Nt` 수준으로 축소.
+
+**예상 이득:** +2~4 t/s (추정, 대역폭 축소 비율 × 현재 DMA 비중)
+
+**범위:**
+- tt-metal 프로덕션 `matmul_multi_core_reuse_optimized` 약 3300줄 참고
+- ternary(BFP2_b) 포맷 + mantissa-only DRAM 레이아웃 유지
+- 2D mcast: in0는 row-wise mcast, in1(weight)는 column-wise mcast
+- 기존 Track A의 단순 팩토리와 공존 (shape 기반 선택)
+- Blackhole NCRISC mcast 제약 재확인 필요 (receivers도 BRISC?)
+
+**규모:** 독립 프로젝트 (며칠~주 단위), Track A와는 분리된 작업.
+구현 가이드는 별도 설계 문서 필요.
+
+**선행 조건 / 리스크:**
+- p150a harvesting (2 Tensix reserved) 하에서 row/column mcast 사각형 유효성
+- Weight mcast sender도 BRISC에 배치 필요 (NCRISC mcast CQ 손상)
+- 현재 팩토리의 core heuristic (`nt_per_core ∈ [2, 8]`)과 재구성된 core
+  grid의 호환성 — 특히 non-divisor shapes 처리
 
 ---
 
