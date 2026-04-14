@@ -471,6 +471,7 @@ class MultiHeadAttention:
         eps: float = 1e-5,
         use_fused_rope: bool = True,
         layer_idx: int = 0,
+        weight_dtype: str = "bfp4",
     ) -> None:
         """Initialize attention layer."""
         self.hidden_size = hidden_size
@@ -484,15 +485,18 @@ class MultiHeadAttention:
         self.use_fused_rope = use_fused_rope
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
+        self._weight_dtype = weight_dtype
 
         # Projections (weights pre-transposed in Linear.load_weights)
-        self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device)
-        self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
-        self.v_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device)
-        self.o_proj = Linear(num_attention_heads * self.head_dim, hidden_size, device)
+        self.q_proj = Linear(hidden_size, num_attention_heads * self.head_dim, device, weight_dtype=weight_dtype)
+        self.k_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device, weight_dtype=weight_dtype)
+        self.v_proj = Linear(hidden_size, num_key_value_heads * self.head_dim, device, weight_dtype=weight_dtype)
+        self.o_proj = Linear(num_attention_heads * self.head_dim, hidden_size, device, weight_dtype=weight_dtype)
 
         # Fused QKV projection for optimized decode (created when weights are loaded)
         self.qkv_fused_weight: ttnn.Tensor | None = None
+        self._qkv_fused_linear: Linear | None = None
+        self._qkv_use_packed_ternary: bool = False
         self._qkv_dim = (num_attention_heads + 2 * num_key_value_heads) * self.head_dim
 
         # Sub-norm applied after attention, before o_proj (BitNet-specific)
@@ -723,18 +727,20 @@ class MultiHeadAttention:
         )
         self._qkv_scales = (q_s, k_s, v_s)
 
-        # fused QKV always uses standard matmul (not packed ternary) —
-        # use bfp4 when the per-proj dtype is packed_ternary
-        fused_dtype = self.q_proj._ttnn_weight_dtype
-        if fused_dtype == ttnn.uint32:  # packed_ternary
-            fused_dtype = ttnn.bfloat4_b
-        self.qkv_fused_weight = ttnn.from_torch(
-            torch.from_numpy(qkv_fused),
+        # Fused QKV weight: route through a Linear so that packed_ternary
+        # lands in the BFP2_b mantissa-only format consumed by
+        # ttnn.experimental.ternary_matmul. Scales are applied per-head
+        # after nlp_create_qkv_heads_decode, so the Linear is built with
+        # scale=1.0.
+        self._qkv_fused_linear = Linear(
+            in_features=self.hidden_size,
+            out_features=self._qkv_dim,
             device=self.device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=fused_dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            weight_dtype=self._weight_dtype,
         )
+        self._qkv_fused_linear.load_pretransposed_weight(qkv_fused, scale=1.0)
+        self.qkv_fused_weight = self._qkv_fused_linear.weight
+        self._qkv_use_packed_ternary = self._qkv_fused_linear._use_packed_ternary
 
     def __call__(
         self,

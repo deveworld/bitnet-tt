@@ -624,7 +624,13 @@ class Batch32Generator:
 
             # Fused QKV matmul
             attention = layer.self_attn
-            if self._decode_matmul_kernel_config is not None:
+            if attention._qkv_use_packed_ternary:
+                qkv_fused = ttnn.experimental.ternary_matmul(
+                    normed,
+                    attention.qkv_fused_weight,
+                    use_packed_ternary=True,
+                )
+            elif self._decode_matmul_kernel_config is not None:
                 qkv_fused = ttnn.matmul(
                     normed,
                     attention.qkv_fused_weight,

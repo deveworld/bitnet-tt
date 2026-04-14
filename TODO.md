@@ -3,8 +3,9 @@
 ## 현재 상태 (2026-04-14)
 
 ### 달성 — Track A 완료
-- **32.41 t/s** decode (batch32 + trace + fused RoPE, 7-run avg) — Blackhole p150a
-- **bfp4 production (30.08) 대비 +7.7%**, storage는 절반 (~600MB vs ~1.2GB)
+- **33.61 t/s** decode (batch32 + trace + fused RoPE, 4-run avg excl. hot) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +11.5%**, storage는 절반 (~600MB vs ~1.2GB)
+- **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
 - **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0)
 - **Prefill 정확도:** HF reference 일치
@@ -20,7 +21,8 @@
 | 7. true 2-bit DRAM | ~21 | 256B/tile + L1 exp |
 | 8. dual-NoC split | ~30 | — |
 | 9. cb1 exp probe 버그 fix + nt_per_core≥2 | 31.4 | NaN 버그 해결 |
-| 10. **activation multicast + RISC swap** | **32.41** | sender on BRISC/NOC_0 |
+| 10. activation multicast + RISC swap | 32.41 | sender on BRISC/NOC_0 |
+| 11. **fused QKV + attn projections → packed_ternary** | **33.61** | 전체 attention 경로 2-bit |
 
 ---
 
@@ -52,7 +54,6 @@
 ### 향후 여지 (선택)
 - [ ] PACKER_L1_ACC multi-K-block pipelining (이전에 deadlock)
 - [ ] `multi_core_reuse_optimized` factory 포팅 (3300줄 재작성)
-- [ ] QKV 경로 packed_ternary 전환 (현재 fused는 bfp4 사용)
 
 ---
 
@@ -73,18 +74,17 @@
 
 ## bitnet-tt 통합 상태
 - [x] **FFN**: gate/up/down → ternary_matmul
-- [x] **O_proj**: ternary_matmul
+- [x] **Attention q/k/v/o_proj**: ternary_matmul
+- [x] **Fused QKV (decode)**: ternary_matmul (BFP2_b mantissa-only 저장)
 - [x] **Prefill**: HF 출력 일치
-- [ ] **QKV (decode fused)**: 현재 bfp4. `uint32` TILE로 fuse pack이 안 되어
-  ternary 전환 시 per-proj 경로가 필요 (trade-off 있음)
 
 ---
 
 ## 성능 참조 (최종)
 | dtype | avg t/s | p50 ms | storage (2.4B) |
 |---|---:|---:|---:|
-| **packed_ternary (mcast)** | **32.41** | **29** | **~600 MB** |
-| bfp4 production | 30.08 | 31 | ~1.2 GB |
+| **packed_ternary (QKV+FFN+O)** | **33.61** | **27** | **~600 MB** |
+| bfp4 production | 30.15 | 31 | ~1.2 GB |
 | bf16 | ~16 | ~62 | ~4.8 GB |
 
 측정 조건: batch32 + trace + fused RoPE + 128 tokens + LoFi.

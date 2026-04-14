@@ -80,6 +80,7 @@ class TransformerBlock:
             eps=rms_norm_eps,
             layer_idx=layer_idx,
             use_fused_rope=use_fused_rope,
+            weight_dtype=weight_dtype,
         )
 
         # Pre-FFN normalization
