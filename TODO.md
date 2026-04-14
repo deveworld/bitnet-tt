@@ -3,9 +3,10 @@
 ## 현재 상태 (2026-04-14)
 
 ### 달성 — Track A 완료
-- **33.61 t/s** decode (batch32 + trace + fused RoPE, 4-run avg excl. hot) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +11.5%**, storage는 절반 (~600MB vs ~1.2GB)
+- **34.81 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +15.5%**, storage는 절반 (~600MB vs ~1.2GB)
 - **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
+- **K-block pipelining**: in0_block_w = Kt/2로 cb0/cb1 double-buffer → DMA/compute overlap
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
 - **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0)
 - **Prefill 정확도:** HF reference 일치
@@ -22,7 +23,8 @@
 | 8. dual-NoC split | ~30 | — |
 | 9. cb1 exp probe 버그 fix + nt_per_core≥2 | 31.4 | NaN 버그 해결 |
 | 10. activation multicast + RISC swap | 32.41 | sender on BRISC/NOC_0 |
-| 11. **fused QKV + attn projections → packed_ternary** | **33.61** | 전체 attention 경로 2-bit |
+| 11. fused QKV + attn projections → packed_ternary | 33.61 | 전체 attention 경로 2-bit |
+| 12. **in0_block_w=Kt/2 K-block pipelining** | **34.81** | cb0/cb1 자동 double-buffer, BRISC sender가 상쇄 제거 |
 
 ---
 
@@ -52,8 +54,8 @@
   AND ≥ 2. gate_up은 108 L-shape 유지, down_proj/o_proj는 40-core 5×8 rect.
 
 ### 향후 여지 (선택)
-- [ ] PACKER_L1_ACC multi-K-block pipelining (이전에 deadlock)
-- [ ] `multi_core_reuse_optimized` factory 포팅 (3300줄 재작성)
+- [x] ~~K-block pipelining~~ — Kt/2 double-buffer 적용 완료
+- [ ] `multi_core_reuse_optimized` factory 포팅 (3300줄 재작성) — 유일한 큰 여지
 
 ---
 
@@ -83,7 +85,7 @@
 ## 성능 참조 (최종)
 | dtype | avg t/s | p50 ms | storage (2.4B) |
 |---|---:|---:|---:|
-| **packed_ternary (QKV+FFN+O)** | **33.61** | **27** | **~600 MB** |
+| **packed_ternary (K-pipe + full attn)** | **34.81** | **26** | **~600 MB** |
 | bfp4 production | 30.15 | 31 | ~1.2 GB |
 | bf16 | ~16 | ~62 | ~4.8 GB |
 
