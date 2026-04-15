@@ -1003,19 +1003,19 @@ class MultiHeadAttention:
         # 3. Apply RoPE
         cos_dram, sin_dram = rot_mats
         if self.use_fused_rope:
-            # Fused path: rotary_embedding_llama with HEIGHT_SHARDED inputs (29 t/s)
-            cos = ttnn.to_memory_config(cos_dram, self._rope_cos_sin_config)
-            sin = ttnn.to_memory_config(sin_dram, self._rope_cos_sin_config)
+            # Fused path: rotary_embedding_llama with HEIGHT_SHARDED inputs.
+            # cos/sin are pre-sharded once per step by
+            # generator_batch32._decode_step_batch32 (caller owns the lifetime
+            # and deallocates after the layer loop), so we skip the per-layer
+            # to_memory_config here.
             q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-                q_heads_1bkd, cos, sin, self.transformation_mat_decode,
+                q_heads_1bkd, cos_dram, sin_dram, self.transformation_mat_decode,
                 is_decode_mode=True,
             )
             k_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
-                k_heads_1bkd, cos, sin, self.transformation_mat_decode,
+                k_heads_1bkd, cos_dram, sin_dram, self.transformation_mat_decode,
                 is_decode_mode=True,
             )
-            ttnn.deallocate(cos)
-            ttnn.deallocate(sin)
         else:
             # Manual path: half-split RoPE with HF cos/sin (16 t/s, higher accuracy)
             cos, sin = cos_dram, sin_dram

@@ -614,6 +614,20 @@ class Batch32Generator:
         """
         hidden = token_embeds
 
+        # Pre-shard cos/sin ONCE per step (fused RoPE path). Every layer
+        # shares the same _rope_cos_sin_config, so the per-layer
+        # ttnn.to_memory_config inside _forward_decode_1bkd was running
+        # the same conversion 30 times in a row. Hoisting saves 60 dispatched
+        # ops per decode step. Caller owns the lifetime and deallocates
+        # after the layer loop.
+        first_attn = self.model.layers[0].self_attn
+        if first_attn.use_fused_rope:
+            cos_shared = ttnn.to_memory_config(cos, first_attn._rope_cos_sin_config)
+            sin_shared = ttnn.to_memory_config(sin, first_attn._rope_cos_sin_config)
+        else:
+            cos_shared = cos
+            sin_shared = sin
+
         for layer_idx in range(self.config.num_layers):
             layer = self.model.layers[layer_idx]
             kv_cache = self._kv_caches[layer_idx]
@@ -642,7 +656,7 @@ class Batch32Generator:
                 qkv_fused,
                 kv_cache,
                 current_pos,
-                (cos, sin),
+                (cos_shared, sin_shared),
                 PADDED_BATCH,
                 current_pos_tensor=current_pos_tensor,
             )
@@ -662,6 +676,11 @@ class Batch32Generator:
             ttnn.deallocate(residual)
             if layer_idx > 0:
                 ttnn.deallocate(prev_hidden)
+
+        # Release the pre-sharded cos/sin now that all layers are done.
+        if first_attn.use_fused_rope:
+            ttnn.deallocate(cos_shared)
+            ttnn.deallocate(sin_shared)
 
         # Final norm + LM head
         hidden = self.model.norm(hidden)
