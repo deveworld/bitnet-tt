@@ -993,23 +993,26 @@ class MultiHeadAttention:
             batch_size: Batch size
             current_pos_tensor: Position as tensor (int32) for cache update
         """
-        # 1. Reshape fused QKV to [1, 1, batch, qkv_dim] for nlp_create_qkv_heads_decode
-        # TT pattern uses reshape with tile shape for proper padding
-        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
+        # 1. Reshape fused QKV to [1, 1, batch, qkv_dim] for nlp_create_qkv_heads_decode.
+        # Fast path: batch32 decode hands us a 4D TILE tensor directly from
+        # ternary_matmul — shape is already [1,1,32,qkv_dim] and layout TILE,
+        # so no conversion is needed (saves 3 ops / layer = 90 ops / step).
         fqkv_shape = xqkv_fused.shape
-
-        if len(fqkv_shape) == 3:
-            # 3D: [batch, seq, qkv_dim] -> [1, 1, batch, qkv_dim]
-            qkv_dim = fqkv_shape[-1]
-            # Use reshape with tile shape (second arg) for proper TILE padding
-            xqkv_fused = ttnn.reshape(xqkv_fused, (1, 1, batch_size, qkv_dim), (1, 1, 32, qkv_dim))
-        elif len(fqkv_shape) == 4:
-            # 4D: already correct format, pass through
+        if len(fqkv_shape) == 4 and xqkv_fused.layout == ttnn.TILE_LAYOUT:
             pass
         else:
-            raise ValueError(f"Unexpected xqkv_fused shape: {fqkv_shape}")
-
-        xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
+            # Slow fallback: 3D prefill/batchN inputs need reshape, which
+            # requires the intermediate to be ROW_MAJOR because the target
+            # shape may not be tile-aligned on every axis.
+            xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.ROW_MAJOR_LAYOUT)
+            if len(fqkv_shape) == 3:
+                qkv_dim = fqkv_shape[-1]
+                xqkv_fused = ttnn.reshape(
+                    xqkv_fused, (1, 1, batch_size, qkv_dim), (1, 1, 32, qkv_dim)
+                )
+            elif len(fqkv_shape) != 4:
+                raise ValueError(f"Unexpected xqkv_fused shape: {fqkv_shape}")
+            xqkv_fused = ttnn.to_layout(xqkv_fused, ttnn.TILE_LAYOUT)
 
         # 2. Create QKV heads - outputs 1BKD sharded tensors
         # TT pattern: use L1_HEIGHT_SHARDED_MEMORY_CONFIG for Wormhole (model_config.py Line 930)
