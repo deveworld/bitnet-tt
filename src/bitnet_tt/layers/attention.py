@@ -1109,6 +1109,13 @@ class MultiHeadAttention:
         # Limit the visible cache length to a 32-token tile multiple. When the
         # backing cache already matches that compact logical view, reuse it
         # directly to avoid per-token K/V slice overhead in every layer.
+        #
+        # IMPORTANT: cur_pos_tensor is a correctness mask inside SDPA, not a
+        # compute short-circuit. Passing the full preallocated cache makes
+        # SDPA iterate over every k_chunk in the full cache, even if most of
+        # them are masked out. Measured regression was 37.5 -> 31 t/s. So we
+        # keep the slice — the dispatch cost is much smaller than the wasted
+        # SDPA k-chunk work would be.
         active_seq_len = current_pos + 1
         padded_seq_len = ((active_seq_len + 31) // 32) * 32
         padded_seq_len = min(padded_seq_len, past_key_value.key_cache.shape[2])
