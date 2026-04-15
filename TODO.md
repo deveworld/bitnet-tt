@@ -61,8 +61,43 @@
 
 ---
 
-## Track B: Zero-Tile Skip — ✗ 불가
-- 0% all-zero tiles (분석 완료, 구현 가치 없음)
+## Track B: Zero-Tile / Sparsity Skip — ✗ 불가 (실측 검증 완료)
+
+### 조사한 각도
+1. **All-zero 32×32 tiles**: 전 projection 0%. 값 분포가 1/3:1/3:1/3 균일이라
+   1024개 값이 모두 0일 확률이 (1/3)^1024 ≈ 0.
+2. **All-zero BFP2 groups (16v)**: gate/up/down/o_proj에서 4.7%, q/k/v에서
+   0~3%. Tensix `matmul_block`이 tile 단위라 group skip 불가능.
+3. **Dead 32-row/col slabs**: 전부 0/…. 개별 dead rows/cols는 있지만 32
+   경계에 정렬되지 않음.
+4. **FFN 구조적 sparsity (lossless 조건)**:
+   `(gate_row_dead ∧ up_row_dead) ∨ down_col_dead`인 intermediate 채널.
+   - 30 layers 평균: 334 channels (4.8%)
+   - **Layer 1: 3016 channels (43.5%)** — 놀라운 값, 학습 중 early layer가
+     intermediate의 절반을 사용하지 않도록 압축됨
+   - Layer 2/3도 27%/15%
+   - 전 레이어 공통 dead 인덱스: 0 → per-layer 독립 pruning 필요
+
+### 구현 시도 결과 (2026-04-15)
+`compute_ffn_prune_mask` + per-layer `intermediate_size` 축소 구현, tile=128
+(Nt가 8의 배수 되도록) alignment, gate_up/down_proj/ffn_sub_norm 재생성.
+
+| 지표 | Baseline | With FFN pruning | Δ |
+|---|---:|---:|---:|
+| 7-run mean | 35.00 t/s | 35.05 t/s | +0.05 |
+| 7-run trimmed | 34.81 t/s | 35.08 t/s | +0.27 |
+| Trace capture | ~3s | ~20s | +17s (per-layer shapes → program cache miss ×60) |
+
+**결론: noise 수준 (σ ≈ 0.7 t/s)**. 출력은 bfp4와 token-level 일치 → lossless
+검증됨. 수학적으론 정확하지만 현재 decode가 core-count-limited도 DRAM-BW-
+bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
+
+**분석 스크립트** (재현용, 미커밋 local):
+- `analyze_sparsity.py` — tile/group/row/col-level zero 통계
+- `analyze_dead_indices.py` — per-layer lossless dead index count + 32 정렬
+
+**재검토 조건:** decode가 BW-bound가 되는 shape(더 큰 batch, 더 긴 context)이
+나 hardware(더 낮은 DRAM bandwidth)로 전환될 경우 재고 가치 있음.
 
 ---
 
