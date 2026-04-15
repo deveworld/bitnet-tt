@@ -150,11 +150,12 @@ class FeedForward:
         up = ttnn.slice(gate_up, up_start, up_end)
         ttnn.deallocate(gate_up)
 
-        # Apply per-projection scales from ternary quantization
-        gate = ttnn.multiply(gate, self._gate_scale)
-        up = ttnn.multiply(up, self._up_scale)
-
-        # Gate with squared ReLU
+        # gate_scale and up_scale are NOT applied here. ffn_sub_norm below
+        # is an RMSNorm, and for any positive scalar c the identity
+        #   RMSNorm(c * x) = (c*x) * w / (c * rms(x)) = RMSNorm(x)
+        # holds to eps precision. The combined factor
+        # gate_scale² * up_scale is positive, so sub_norm absorbs it
+        # completely — saving two dispatched elementwise ops per layer.
         gate = ttnn.relu(gate)
         gate = ttnn.multiply(gate, gate)  # Squared ReLU
 
