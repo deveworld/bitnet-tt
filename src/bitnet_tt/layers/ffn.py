@@ -155,12 +155,19 @@ class FeedForward:
         #   RMSNorm(c * x) = (c*x) * w / (c * rms(x)) = RMSNorm(x)
         # holds to eps precision. The combined factor
         # gate_scale² * up_scale is positive, so sub_norm absorbs it
-        # completely — saving two dispatched elementwise ops per layer.
-        gate = ttnn.relu(gate)
-        gate = ttnn.multiply(gate, gate)  # Squared ReLU
-
-        # Element-wise multiplication
-        hidden = ttnn.multiply(gate, up)
+        # completely.
+        #
+        # Squared-ReLU(gate) * up fused into a single ttnn.mul call via
+        # stacked unary activations on operand A. Replaces three ops
+        # (relu → square → mul) with one → saves 60 dispatched ops per
+        # decode step (2 × 30 layers).
+        hidden = ttnn.mul(
+            gate, up,
+            input_tensor_a_activations=[
+                ttnn.UnaryOpType.RELU,
+                ttnn.UnaryOpType.SQUARE,
+            ],
+        )
 
         # Deallocate intermediates to save memory
         ttnn.deallocate(gate)
