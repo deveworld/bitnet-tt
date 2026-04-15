@@ -3,8 +3,8 @@
 ## 현재 상태 (2026-04-15)
 
 ### 달성 — Track A 완료 + Path C 프로파일링 + QKV scale fold
-- **37.01 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +22.8%**, storage는 절반 (~600MB vs ~1.2GB)
+- **37.52 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +24.5%**, storage는 절반 (~600MB vs ~1.2GB)
 - **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
 - **K-block pipelining**: in0_block_w = Kt/2로 cb0/cb1 double-buffer → DMA/compute overlap
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
@@ -27,7 +27,8 @@
 | 12. in0_block_w=Kt/2 K-block pipelining | 34.81 | cb0/cb1 자동 double-buffer, BRISC sender가 상쇄 제거 |
 | 13. Phase 1a: cos/sin hoist 밖으로 | 35.38 | 60 ops/step 제거 (to_memory_config 30×2→1×2) |
 | 14. QKV scale fold (B') | 35.94 | 3 multiplies/layer 제거. q*k scale → SDPA, v scale → attn_sub_norm RMSNorm 흡수 (90 ops/step) |
-| 15. **qkv_layout_reshape skip** | **37.01** | decode 입력이 이미 4D TILE → to_layout(RM) + to_layout(TILE) 건너뛰기 (60 ops/step) |
+| 15. qkv_layout_reshape skip | 37.01 | decode 입력이 이미 4D TILE → to_layout(RM) + to_layout(TILE) 건너뛰기 (60 ops/step) |
+| 16. **kv_update_prep 제거** | **37.52** | paged_update_cache가 RoPE 출력을 직접 수용 → typecast + to_memory_config 전부 제거 (60-120 ops/step) |
 
 ---
 
@@ -149,7 +150,7 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 ## 성능 참조 (최종)
 | dtype | avg t/s | p50 ms | storage (2.4B) |
 |---|---:|---:|---:|
-| **packed_ternary (+ hoist + scale fold + reshape skip)** | **37.01** | **25** | **~600 MB** |
+| **packed_ternary (+ hoist + scale fold + 2 reshape skips)** | **37.52** | **25** | **~600 MB** |
 | packed_ternary (Track A final) | 34.81 | 26 | ~600 MB |
 | bfp4 production | 30.15 | 31 | ~1.2 GB |
 | bf16 | ~16 | ~62 | ~4.8 GB |

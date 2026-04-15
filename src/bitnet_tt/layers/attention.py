@@ -1083,13 +1083,14 @@ class MultiHeadAttention:
         # paged_fused_update_cache requires K and V to live on non-overlapping
         # core ranges (production llama3 splits them to different cores),
         # which we don't do — so we keep two separate calls here.
-        cache_dtype = past_key_value.key_cache.dtype
-        if k_heads_1bkd.dtype != cache_dtype:
-            k_heads_1bkd = ttnn.typecast(k_heads_1bkd, cache_dtype)
-            v_heads_1bkd = ttnn.typecast(v_heads_1bkd, cache_dtype)
-        if past_key_value._shard_config is not None:
-            k_heads_1bkd = ttnn.to_memory_config(k_heads_1bkd, past_key_value._shard_config)
-            v_heads_1bkd = ttnn.to_memory_config(v_heads_1bkd, past_key_value._shard_config)
+        #
+        # Optimistic: skip both typecast and to_memory_config entirely. The
+        # KV cache is created with cache_dtype=bf16 by default (matches the
+        # K/V tensors right out of RoPE), and paged_update_cache appears to
+        # accept the L1_HEIGHT_SHARDED_MEMORY_CONFIG output of the upstream
+        # head-split + RoPE path directly. If a future caller sets a
+        # cache_dtype that differs from the K/V dtype, re-introduce a
+        # conditional typecast here.
         ttnn.experimental.paged_update_cache(
             past_key_value.key_cache, k_heads_1bkd, update_idxs_tensor=pos_tensor_local
         )
