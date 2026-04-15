@@ -482,6 +482,9 @@ class MultiHeadAttention:
         self.device = device
         self.eps = eps
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        # Effective SDPA scale after load_weights folds q_scale*k_scale in.
+        # Default = self.scale (no fold) until load_weights runs.
+        self._sdpa_scale = self.scale
         self.use_fused_rope = use_fused_rope
         self.layer_idx = layer_idx
         self.max_position_embeddings = max_position_embeddings
@@ -742,6 +745,30 @@ class MultiHeadAttention:
         self.qkv_fused_weight = self._qkv_fused_linear.weight
         self._qkv_use_packed_ternary = self._qkv_fused_linear._use_packed_ternary
 
+        # QKV scale fold. The three per-projection quantization scales
+        # (q_scale, k_scale, v_scale) do not need to be applied as separate
+        # elementwise multiplies on the head tensors:
+        #
+        #   softmax((Q*q_s) @ (K*k_s).T * self.scale) @ (V*v_s)
+        #     = softmax(Q @ K.T * (self.scale*q_s*k_s)) @ V * v_s
+        #
+        # q_s*k_s collapses into SDPA's scale argument. v_s survives as a
+        # positive scalar factor on the attention output, which is then
+        # immediately fed into attn_sub_norm (an RMSNorm) that absorbs any
+        # positive scalar factor exactly — so v_s can simply be dropped.
+        #
+        # This removes 3 ttnn.multiply dispatches per layer (~90 ops/step)
+        # from the decode path and 3 from the prefill path.
+        self._q_scale = float(q_s)
+        self._k_scale = float(k_s)
+        self._v_scale = float(v_s)
+        self._sdpa_scale = self.scale * self._q_scale * self._k_scale
+        # Suppress the trailing ttnn.multiply inside each per-projection
+        # Linear call (prefill path), since scales are now folded / absorbed.
+        self.q_proj.weight_scale = 1.0
+        self.k_proj.weight_scale = 1.0
+        self.v_proj.weight_scale = 1.0
+
     def __call__(
         self,
         hidden_states: ttnn.Tensor,
@@ -914,7 +941,7 @@ class MultiHeadAttention:
                 key_expanded,
                 value_expanded,
                 cur_pos_tensor=current_pos_tensor,
-                scale=self.scale,
+                scale=self._sdpa_scale,
             )
 
             # permute works directly in TILE_LAYOUT - no layout conversion needed
@@ -927,7 +954,7 @@ class MultiHeadAttention:
                 value_expanded,
                 attn_mask=attention_mask,
                 is_causal=is_causal,
-                scale=self.scale,
+                scale=self._sdpa_scale,
             )
 
         attn_output = ttnn.transpose(attn_output, 1, 2)
@@ -994,11 +1021,10 @@ class MultiHeadAttention:
         )
         ttnn.deallocate(xqkv_fused)
 
-        # Apply per-projection ternary scales after head split
-        q_s, k_s, v_s = self._qkv_scales
-        q_heads_1bkd = ttnn.multiply(q_heads_1bkd, q_s)
-        k_heads_1bkd = ttnn.multiply(k_heads_1bkd, k_s)
-        v_heads_1bkd = ttnn.multiply(v_heads_1bkd, v_s)
+        # Per-projection quantization scales are folded at init time:
+        # q_scale*k_scale into self._sdpa_scale, v_scale absorbed by the
+        # downstream attn_sub_norm RMSNorm. See MultiHeadAttention.load_weights
+        # for the derivation.
 
         # 3. Apply RoPE
         cos_dram, sin_dram = rot_mats
@@ -1007,7 +1033,9 @@ class MultiHeadAttention:
             # cos/sin are pre-sharded once per step by
             # generator_batch32._decode_step_batch32 (caller owns the lifetime
             # and deallocates after the layer loop), so we skip the per-layer
-            # to_memory_config here.
+            # to_memory_config here. (rotary_embedding_llama_fused_qk would
+            # save another dispatch but requires Q and K to be on
+            # non-overlapping core ranges, which we don't split into.)
             q_heads_1bkd = ttnn.experimental.rotary_embedding_llama(
                 q_heads_1bkd, cos_dram, sin_dram, self.transformation_mat_decode,
                 is_decode_mode=True,
@@ -1048,7 +1076,10 @@ class MultiHeadAttention:
                 device=self.device,
             )
 
-        # 5. Update cache with paged_update_cache (requires HEIGHT_SHARDED input)
+        # 5. Update cache with paged_update_cache (requires HEIGHT_SHARDED input).
+        # paged_fused_update_cache requires K and V to live on non-overlapping
+        # core ranges (production llama3 splits them to different cores),
+        # which we don't do — so we keep two separate calls here.
         cache_dtype = past_key_value.key_cache.dtype
         if k_heads_1bkd.dtype != cache_dtype:
             k_heads_1bkd = ttnn.typecast(k_heads_1bkd, cache_dtype)
@@ -1111,7 +1142,7 @@ class MultiHeadAttention:
             key_cache_for_sdpa,
             value_cache_for_sdpa,
             cur_pos_tensor=pos_tensor_local,
-            scale=self.scale,
+            scale=self._sdpa_scale,
             program_config=sdpa_program_config,
             compute_kernel_config=self._sdpa_decode_compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -1342,7 +1373,7 @@ class MultiHeadAttention:
             value_expanded,
             attn_mask=None,
             is_causal=True,
-            scale=self.scale,
+            scale=self._sdpa_scale,
         )
 
         # Cleanup expanded tensors

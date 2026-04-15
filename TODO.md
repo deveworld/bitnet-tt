@@ -2,9 +2,9 @@
 
 ## 현재 상태 (2026-04-15)
 
-### 달성 — Track A 완료
-- **34.81 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +15.5%**, storage는 절반 (~600MB vs ~1.2GB)
+### 달성 — Track A 완료 + Path C 프로파일링 + QKV scale fold
+- **35.94 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +19.2%**, storage는 절반 (~600MB vs ~1.2GB)
 - **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
 - **K-block pipelining**: in0_block_w = Kt/2로 cb0/cb1 double-buffer → DMA/compute overlap
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
@@ -24,7 +24,9 @@
 | 9. cb1 exp probe 버그 fix + nt_per_core≥2 | 31.4 | NaN 버그 해결 |
 | 10. activation multicast + RISC swap | 32.41 | sender on BRISC/NOC_0 |
 | 11. fused QKV + attn projections → packed_ternary | 33.61 | 전체 attention 경로 2-bit |
-| 12. **in0_block_w=Kt/2 K-block pipelining** | **34.81** | cb0/cb1 자동 double-buffer, BRISC sender가 상쇄 제거 |
+| 12. in0_block_w=Kt/2 K-block pipelining | 34.81 | cb0/cb1 자동 double-buffer, BRISC sender가 상쇄 제거 |
+| 13. Phase 1a: cos/sin hoist 밖으로 | 35.38 | 60 ops/step 제거 (to_memory_config 30×2→1×2) |
+| 14. **QKV scale fold (B')** | **35.94** | 3 multiplies/layer 제거. q*k scale → SDPA, v scale → attn_sub_norm RMSNorm 흡수 (90 ops/step) |
 
 ---
 
@@ -146,7 +148,8 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 ## 성능 참조 (최종)
 | dtype | avg t/s | p50 ms | storage (2.4B) |
 |---|---:|---:|---:|
-| **packed_ternary (K-pipe + full attn)** | **34.81** | **26** | **~600 MB** |
+| **packed_ternary (+ cos/sin hoist + QKV scale fold)** | **35.94** | **26** | **~600 MB** |
+| packed_ternary (Track A final) | 34.81 | 26 | ~600 MB |
 | bfp4 production | 30.15 | 31 | ~1.2 GB |
 | bf16 | ~16 | ~62 | ~4.8 GB |
 
