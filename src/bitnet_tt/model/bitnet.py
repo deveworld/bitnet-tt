@@ -18,6 +18,7 @@ Based on tt_transformers patterns.
 from typing import Optional
 
 import numpy as np
+import torch
 import ttnn
 from numpy.typing import NDArray
 
@@ -137,7 +138,14 @@ class BitNetModel:
         self.norm.load_weights(norm_weight)
         # Pre-transpose LM head: (vocab, hidden) -> (hidden, vocab)
         lm_head_t = lm_head_weight.T.astype(np.float32).copy()
-        self.lm_head_weight = numpy_to_ttnn(lm_head_t, self.device)
+        lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
+        self.lm_head_weight = ttnn.from_torch(
+            torch.from_numpy(lm_head_t),
+            dtype=lm_head_dtype,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
     def __call__(
         self,
