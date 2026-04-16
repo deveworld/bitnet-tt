@@ -481,6 +481,7 @@ class Batch32Generator:
         self._trace_id: Optional[int] = None
         self._trace_inputs: Optional[dict] = None
         self._trace_output: Optional[ttnn.Tensor] = None
+        self._trace_argmax_output: Optional[ttnn.Tensor] = None
         self._trace_capture_pos: Optional[int] = None
         self._warmed_trace_keys: set[tuple[int, int]] = set()
         self._decode_inputs: Optional[dict] = None
@@ -981,6 +982,7 @@ class Batch32Generator:
             self._trace_inputs["cos"],
             self._trace_inputs["sin"],
         )
+        self._trace_argmax_output = ttnn.argmax(self._trace_output, dim=-1)
         self._set_kv_cache_length(current_pos + 1)
 
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
@@ -1028,6 +1030,7 @@ class Batch32Generator:
             self._trace_id = None
 
         self._trace_output = None
+        self._trace_argmax_output = None
         self._trace_capture_pos = None
 
     def _release_trace_inputs(self) -> None:
@@ -1162,11 +1165,15 @@ class Batch32Generator:
         logits: ttnn.Tensor,
         temperature: float = 1.0,
         top_k: Optional[int] = 50,
+        device_argmax: Optional[ttnn.Tensor] = None,
     ) -> int:
         """Sample next token from the last logical position of batch element 0."""
-        # Only the final logical token participates in sampling. Copying the
-        # entire prefill logits tensor back to host is wasteful and has caused
-        # the dev runtime to stall before the first token is sampled.
+        # Fastest path: pre-computed argmax from inside the trace. The argmax
+        # runs as part of the traced kernel so no extra dispatch or CQ sync.
+        # Reading the tiny int32 result costs ~0.06 ms vs ~4 ms for post-trace ops.
+        if device_argmax is not None and (temperature <= 0.0 or top_k is None or top_k <= 1):
+            return int(ttnn.to_torch(device_argmax).reshape(-1)[0].item())
+
         use_direct_logits = int(logits.shape[1]) == 1
         last_row = logits
         if not use_direct_logits:
@@ -1175,9 +1182,22 @@ class Batch32Generator:
                 (0, max(int(logits.shape[1]) - 1, 0), 0),
                 (1, int(logits.shape[1]), int(logits.shape[2])),
             )
+
+        # Fast path: greedy argmax on device (non-trace ops).
+        if temperature <= 0.0 or top_k is None or top_k <= 1:
+            try:
+                token_indices = ttnn.argmax(last_row, dim=-1)
+                token_id = int(ttnn.to_torch(token_indices).reshape(-1)[0].item())
+                ttnn.deallocate(token_indices)
+                if not use_direct_logits:
+                    ttnn.deallocate(last_row)
+                return token_id
+            except Exception:
+                pass  # fall through to host path (last_row still live)
+
+        # Slow path: copy full logits to host (needed for temperature sampling,
+        # or as fallback if device argmax fails on this shape/layout).
         try:
-            # Reuse a pinned host tensor to avoid per-token host allocations on the
-            # logits copy path, which shows up directly in warmed batch32 wall time.
             host_tensor = None
             for cached_spec, cached_tensor in self._logits_host_tensors:
                 try:
@@ -1198,9 +1218,6 @@ class Batch32Generator:
                     )[0, 0, :].float()
                     self._supports_host_tensor_to_torch = True
                 except TypeError:
-                    # Older TTNN wheels expose copy_device_to_host_tensor but do not
-                    # accept host_tensor in the Python to_torch wrapper yet. Use
-                    # the lower-level copy path to preserve host buffer reuse.
                     self._supports_host_tensor_to_torch = False
                     ttnn.copy_device_to_host_tensor(last_row, host_tensor)
                     ttnn.synchronize_device(self.device)
@@ -1351,7 +1368,10 @@ class Batch32Generator:
                 if captured_new_trace
                 else self._execute_trace(next_token, current_pos)
             )
-            next_token = self._sample_token(trace_logits, temperature, top_k)
+            next_token = self._sample_token(
+                trace_logits, temperature, top_k,
+                device_argmax=self._trace_argmax_output,
+            )
             generated_ids.append(next_token)
             current_pos += 1
 
@@ -1364,7 +1384,10 @@ class Batch32Generator:
             else:
                 logits = self._execute_decode_untraced(next_token, current_pos)
 
-            next_token = self._sample_token(logits, temperature, top_k)
+            next_token = self._sample_token(
+                logits, temperature, top_k,
+                device_argmax=self._trace_argmax_output if not logits_owned else None,
+            )
             generated_ids.append(next_token)
             current_pos += 1
 
@@ -1454,7 +1477,10 @@ class Batch32Generator:
             stats.token_times.append(trace_time)
             stats.generation_time += trace_time
 
-            next_token = self._sample_token(trace_logits, temperature, top_k)
+            next_token = self._sample_token(
+                trace_logits, temperature, top_k,
+                device_argmax=self._trace_argmax_output,
+            )
             generated_ids.append(next_token)
             stats.generated_tokens += 1
             current_pos += 1
@@ -1482,7 +1508,10 @@ class Batch32Generator:
             stats.token_times.append(token_time)
             stats.generation_time += token_time
 
-            next_token = self._sample_token(logits, temperature, top_k)
+            next_token = self._sample_token(
+                logits, temperature, top_k,
+                device_argmax=self._trace_argmax_output if not logits_owned else None,
+            )
             generated_ids.append(next_token)
             stats.generated_tokens += 1
             current_pos += 1
