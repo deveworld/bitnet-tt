@@ -629,13 +629,20 @@ class Batch32Generator:
             cos_shared = cos
             sin_shared = sin
 
+        # L1 memory config for norm→matmul intermediates. Keeping the norm
+        # output in L1 avoids a DRAM round-trip: the downstream ternary_matmul
+        # reads activation from L1 instead of DRAM (lower latency, no BW
+        # contention with weight reads). Decode tensors are small enough
+        # (~160 KB interleaved across 110 cores) to fit comfortably.
+        _norm_mem = ttnn.L1_MEMORY_CONFIG
+
         for layer_idx in range(self.config.num_layers):
             layer = self.model.layers[layer_idx]
             kv_cache = self._kv_caches[layer_idx]
             prev_hidden = hidden
 
-            # Input LayerNorm
-            normed = layer.input_layernorm(hidden)
+            # Input LayerNorm → L1 output for fast ternary_matmul read
+            normed = layer.input_layernorm(hidden, memory_config=_norm_mem)
 
             # Fused QKV matmul
             attention = layer.self_attn
@@ -669,7 +676,7 @@ class Batch32Generator:
 
             # FFN
             residual = hidden_attn
-            hidden_normed = layer.post_attention_layernorm(hidden_attn)
+            hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
             hidden_mlp = layer.mlp(hidden_normed, mode="decode")
             hidden = ttnn.add(residual, hidden_mlp)
             ttnn.deallocate(hidden_normed)

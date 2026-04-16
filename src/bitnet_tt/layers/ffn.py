@@ -174,7 +174,10 @@ class FeedForward:
         ttnn.deallocate(up)
 
         # Apply sub-norm before down projection (BitNet-specific!)
-        hidden = self.ffn_sub_norm(hidden)
+        # In decode mode, keep norm output in L1 so the downstream
+        # ternary_matmul reader avoids a DRAM round-trip.
+        norm_mem = ttnn.L1_MEMORY_CONFIG if mode == "decode" else None
+        hidden = self.ffn_sub_norm(hidden, memory_config=norm_mem)
 
         # Down projection
         return self.down_proj(hidden)

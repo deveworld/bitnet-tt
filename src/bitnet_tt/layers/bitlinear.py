@@ -341,14 +341,17 @@ class RMSNorm:
         weight_2d = weight.reshape(1, 1, 1, -1).astype(np.float32)
         self.weight = numpy_to_ttnn(weight_2d, self.device)
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(self, x: ttnn.Tensor, memory_config=None) -> ttnn.Tensor:
         """
         Forward pass.
 
         Args:
             x: Input tensor
+            memory_config: Optional output memory config (e.g. L1_MEMORY_CONFIG
+                           to keep output in L1 for a downstream matmul).
 
         Returns:
             Normalized tensor
         """
-        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight)
+        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight,
+                             memory_config=memory_config)
