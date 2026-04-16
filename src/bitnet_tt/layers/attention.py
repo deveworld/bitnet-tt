@@ -1156,7 +1156,7 @@ class MultiHeadAttention:
             scale=self._sdpa_scale,
             program_config=sdpa_program_config,
             compute_kernel_config=self._sdpa_decode_compute_kernel_config,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         ttnn.deallocate(q_heads_dram)
         if not can_reuse_full_cache:
