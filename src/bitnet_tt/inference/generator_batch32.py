@@ -670,15 +670,15 @@ class Batch32Generator:
             )
             ttnn.deallocate(normed)
 
-            # Residual — keep in L1 so the entire layer pipeline stays L1-resident.
-            hidden_attn = ttnn.add(hidden, attn_output_proj, memory_config=_norm_mem)
+            # Residual
+            hidden_attn = ttnn.add(hidden, attn_output_proj)
             ttnn.deallocate(attn_output_proj)
 
             # FFN
             residual = hidden_attn
             hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
             hidden_mlp = layer.mlp(hidden_normed, mode="decode")
-            hidden = ttnn.add(residual, hidden_mlp, memory_config=_norm_mem)
+            hidden = ttnn.add(residual, hidden_mlp)
             ttnn.deallocate(hidden_normed)
             ttnn.deallocate(hidden_mlp)
             ttnn.deallocate(residual)
