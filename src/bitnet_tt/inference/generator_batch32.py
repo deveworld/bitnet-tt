@@ -1520,9 +1520,8 @@ class Batch32Generator:
             stats.generated_tokens += 1
             current_pos += 1
 
-            current_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            new_text = current_text[prev_text_len:]
-            prev_text_len = len(current_text)
+            # Decode only the new token to avoid O(n²) full-sequence re-decode.
+            new_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
             yield new_text, stats
 
             if logits_owned:
