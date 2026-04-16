@@ -1,17 +1,19 @@
 # TODO
 
-## 현재 상태 (2026-04-15)
+## 현재 상태 (2026-04-16)
 
-### 달성 — Track A 완료 + Path C 프로파일링 + QKV scale fold
-- **37.52 t/s** decode (batch32 + trace + fused RoPE, 7-run trimmed avg) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +24.5%**, storage는 절반 (~600MB vs ~1.2GB)
+### 달성 — 48.18 t/s (p50 51.8 t/s), bfp4 대비 +59.8%
+- **48.18 t/s** decode avg (batch32 + trace + fused RoPE, p50=19.3ms=51.8 t/s) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +59.8%**, storage는 절반 (~600MB vs ~1.2GB)
+- **In-trace greedy argmax**: sample_token 6.37→0.16 ms (argmax가 trace 커널 안에서 실행)
+- **lm_head bfp4**: DRAM BW 절반 (1.81→0.75 ms, PCC 0.9992 vs bf16 → 무손실)
+- **ROW_MAJOR argmax**: TILE 4.39→RM 2.26 ms (branchless bf16 비교 커널 포함)
 - **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
 - **K-block pipelining**: in0_block_w = Kt/2로 cb0/cb1 double-buffer → DMA/compute overlap
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
 - **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0)
-- **Prefill 정확도:** HF reference 일치
-- **matmul 정확도:** 모든 shape corr > 0.9999 vs bf16
-- **Dual RoPE:** fused (~32 t/s) / manual (~21 t/s), `--no-fused-rope` 옵션
+- **정확도:** PCC 0.975 vs HF (packed_ternary 고유 한계, lm_head bfp4 영향 0.005)
+- **Dual RoPE:** fused (~48 t/s) / manual (~21 t/s), `--no-fused-rope` 옵션
 
 ### 성능 진화 요약
 | 단계 | t/s | 주요 변화 |
@@ -28,7 +30,11 @@
 | 13. Phase 1a: cos/sin hoist 밖으로 | 35.38 | 60 ops/step 제거 (to_memory_config 30×2→1×2) |
 | 14. QKV scale fold (B') | 35.94 | 3 multiplies/layer 제거. q*k scale → SDPA, v scale → attn_sub_norm RMSNorm 흡수 (90 ops/step) |
 | 15. qkv_layout_reshape skip | 37.01 | decode 입력이 이미 4D TILE → to_layout(RM) + to_layout(TILE) 건너뛰기 (60 ops/step) |
-| 16. **kv_update_prep 제거** | **37.52** | paged_update_cache가 RoPE 출력을 직접 수용 → typecast + to_memory_config 전부 제거 (60-120 ops/step) |
+| 16. kv_update_prep 제거 | 37.52 | paged_update_cache가 RoPE 출력을 직접 수용 → typecast + to_memory_config 전부 제거 (60-120 ops/step) |
+| 17. **in-trace greedy argmax** | **41.39** | sample_token 6.37→0.16 ms. argmax를 trace 안에 포함, host round-trip 제거 |
+| 18. **lm_head bfp4** | **43.17** | bf16→bfp4 (657→164 MB). DRAM BW 절반, PCC 0.9992 vs bf16 무손실 |
+| 19. **ROW_MAJOR argmax** | **47.68** | to_layout(RM) + argmax(RM). TILE 4.39→RM 2.26 ms. branchless bf16 비교 커널 |
+| 20. **streaming decode O(1)** | **48.18** | tokenizer.decode 전체 시퀀스 재디코딩 → per-token O(1) 변경 |
 
 ---
 
@@ -109,7 +115,7 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 **목표:** Activation + weight 둘 다 multicast + 2D core grid reuse 패턴으로
 매트멀 팩토리 재작성. DRAM 대역폭을 `Kt × Nt` → `Kt + Nt` 수준으로 축소.
 
-**예상 이득:** +2~4 t/s (추정, 대역폭 축소 비율 × 현재 DMA 비중)
+**예상 이득:** +3~6 t/s (ternary matmul = trace kernel의 36%, 2× speedup 시 ~3 ms 절감)
 
 **범위:**
 - tt-metal 프로덕션 `matmul_multi_core_reuse_optimized` 약 3300줄 참고
@@ -148,14 +154,24 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 ---
 
 ## 성능 참조 (최종)
-| dtype | avg t/s | p50 ms | storage (2.4B) |
-|---|---:|---:|---:|
-| **packed_ternary (+ hoist + scale fold + 2 reshape skips)** | **37.52** | **25** | **~600 MB** |
-| packed_ternary (Track A final) | 34.81 | 26 | ~600 MB |
-| bfp4 production | 30.15 | 31 | ~1.2 GB |
-| bf16 | ~16 | ~62 | ~4.8 GB |
+| dtype | avg t/s | p50 ms | p50 t/s | storage (2.4B) |
+|---|---:|---:|---:|---:|
+| **packed_ternary (current)** | **48.18** | **19.3** | **51.8** | **~600 MB** |
+| packed_ternary (pre-session) | 37.52 | 25 | 40 | ~600 MB |
+| packed_ternary (Track A final) | 34.81 | 26 | 38.5 | ~600 MB |
+| bfp4 production | 30.15 | 31 | 32.3 | ~1.2 GB |
+| bf16 | ~16 | ~62 | ~16 | ~4.8 GB |
 
-측정 조건: batch32 + trace + fused RoPE + 128 tokens + LoFi.
+측정 조건: batch32 + trace + fused RoPE + 128 tokens.
+
+### Trace kernel 내부 분해 (17.6 ms, 2026-04-16 측정)
+| 항목 | ms | % |
+|---|---:|---:|
+| RMSNorm (121×~0.06) | ~7.0 | 40% |
+| ternary matmul (120×) | ~6.3 | 36% |
+| argmax RM (to_layout + argmax) | ~1.8 | 10% |
+| lm_head bfp4 | 0.75 | 4% |
+| glue (SDPA, heads, RoPE, slice, add) | ~1.7 | 10% |
 
 ---
 

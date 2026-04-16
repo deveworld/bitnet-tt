@@ -4,269 +4,230 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 
 ## Key Features
 
+- **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
+- **51.8 t/s Decode** (p50 steady-state, batch32 + Metal Trace + fused RoPE)
+- **+59.8% faster than bfp4** at half the storage
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
-- **TT-NN Native**: Implementation optimized for Tenstorrent hardware
-- **KV-Cache Support**: Efficient autoregressive generation
-- **HiFi2 Compute Kernel**: Accelerated matmul with BFP8 operations
-- **High Accuracy**: Achieves correlation 0.99+ with HuggingFace implementation
+- **In-trace Greedy Argmax**: Argmax runs inside Metal Trace — zero host round-trip per token
+- **Accuracy Preserved**: PCC 0.975 vs HuggingFace CPU reference (packed_ternary inherent limit)
 
 ## Quick Start
 
 ```bash
-# Installation
-git clone https://github.com/deveworld/bitnet-tt.git
-cd bitnet-tt
-uv sync
+# On Tenstorrent p150a server
+cd ~/bitnet-tt && source ~/.tenstorrent-venv/bin/activate
 
-# Test
-python main.py --test
+# Benchmark (128-token greedy decode)
+TT_METAL_ENABLE_L1_DATA_CACHE_RISCVS=BR,NC,TR,ER \
+BITNET_TT_TRACE_REGION_SIZE=200000000 \
+python bench_batch32.py --dtype packed_ternary --max-new 128
 
-# Mini model demo
-python main.py
+# Accuracy comparison vs HuggingFace
+python bench_accuracy.py --dtype packed_ternary --decode-steps 32
 
-# Full 2B model demo
-python main.py --full
-
-# Interactive chat
+# Interactive (non-trace, slower)
 python main.py --chat
 ```
 
 ## Performance
 
-Measured on Tenstorrent Blackhole p150a:
+Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
-| Mode | Speed | Notes |
-| ---- | ----- | ----- |
-| Chat (Streaming) | **8.0 - 9.7 t/s** | HiFi2 applied, batch_size=1 |
-| Full Demo | ~5.5 t/s | 30 tokens generation |
+### Decode Throughput (batch32 + trace + fused RoPE, 128 tokens)
 
-### Optimization Status
+| dtype | avg t/s | p50 ms | p50 t/s | model size |
+|---|---:|---:|---:|---:|
+| **packed_ternary** | **48.18** | **19.3** | **51.8** | **~600 MB** |
+| bfp4 (production baseline) | 30.15 | 31 | 32.3 | ~1.2 GB |
+| bf16 | ~16 | ~62 | ~16 | ~4.8 GB |
 
-| Optimization | Status | Effect |
-| ------------ | ------ | ------ |
-| HiFi2 Compute Kernel | ✅ Applied | ~2x matmul acceleration (theoretical) |
-| KV-Cache | ✅ Applied | Concat-based |
-| Pre-transposed Weights | ✅ Applied | Transpose overhead removed |
-| RoPE Pre-upload | ✅ Applied | Prevents cos/sin recomputation |
-| HEIGHT_SHARDED Decode | ❌ Not Applied | num_heads=20 compatibility issue |
-| Trace Capture | ❌ Not Applied | Incompatible with concat cache |
+### Performance Evolution
 
-### Target Performance
+| Step | t/s | Key change |
+|---|---:|---|
+| 0. baseline (1-core scalar) | ~0.9 | — |
+| 1-5. multi-core + BFP2_b HW unpack | ~21 | 108 Tensix cores |
+| 8. dual-NoC RISC split | ~30 | BRISC/NOC_0 + NCRISC/NOC_1 |
+| 10. activation multicast | 32.41 | rectangular mcast layout |
+| 12. K-block pipelining | 34.81 | cb0/cb1 double-buffer |
+| 13. cos/sin hoist | 35.38 | 60 ops/step eliminated |
+| 14. QKV scale fold | 35.94 | q*k → SDPA scale, v → RMSNorm absorbed |
+| 15. qkv_layout skip | 37.01 | 4D TILE stays, no roundtrip |
+| 16. kv_update_prep skip | 37.52 | paged_update_cache accepts RoPE output |
+| 17. **in-trace greedy argmax** | **41.39** | sample_token 6.37→0.16 ms |
+| 18. **lm_head bfp4** | **43.17** | 1.81→0.75 ms DRAM BW halved |
+| 19. **ROW_MAJOR argmax** | **47.68** | TILE 4.39→RM 2.26 ms |
+| 20. **streaming decode O(1)** | **48.18** | tokenizer.decode per-token |
 
-| Reference Model | Hardware | Speed |
-| --------------- | -------- | ----- |
-| Llama 3.1 8B | p150a | 33.1 t/s/u |
-| Llama 3.2 3B | n150 | 46.6 t/s/u |
-| **BitNet 2B (Target)** | p150a | **30+ t/s** |
+### Accuracy (vs HuggingFace CPU reference)
 
-## Validation Results
+| Metric | packed_ternary | bfp4 |
+|---|---|---|
+| Prefill PCC | 0.975 | 0.993 |
+| Top-1 match | True | True |
+| Top-5 overlap | 80% | 90% |
+| Greedy divergence | step 1 | step 3 |
 
-Comparison with HuggingFace official implementation:
-
-| Metric | Result |
-| ------ | ------ |
-| Logits Correlation | 0.988 ~ 0.999 |
-| Top-1 Prediction Match | 100% |
-| Max Logit Difference | < 2.5 |
-
-```bash
-# Run validation scripts
-python examples/debug_compare.py      # Layer-by-layer comparison
-python examples/debug_full_compare.py  # Full model comparison
-```
+Note: PCC 0.975 is the inherent limit of 2-bit weight quantization. The lm_head dtype (bfp4) adds negligible additional error (PCC 0.9992 vs bf16 lm_head).
 
 ## Architecture
 
 ### Model Structure
 
 ```text
-BitNetModel (2.4B params)
+BitNetModel (2.4B params, ~600 MB packed_ternary)
 ├── Embedding (128256 vocab, 2560 dim)
-├── TransformerBlock x 30
+├── TransformerBlock × 30
 │   ├── RMSNorm (input)
 │   ├── MultiHeadAttention
-│   │   ├── Q/K/V Projection (Linear, ternary weights)
-│   │   ├── RoPE (θ=500000)
-│   │   ├── Grouped Query Attention (20 Q heads, 5 KV heads)
-│   │   ├── Attention Sub-Norm (BitNet-specific)
-│   │   └── O Projection (Linear)
+│   │   ├── Fused QKV Projection (ternary_matmul, 2-bit)
+│   │   │   └── QKV scales folded: q*k → SDPA, v → attn_sub_norm
+│   │   ├── nlp_create_qkv_heads_decode (L1 HEIGHT_SHARDED)
+│   │   ├── RoPE (rotary_embedding_llama, fused)
+│   │   ├── paged_update_cache (K, V)
+│   │   ├── SDPA decode (with folded q*k scale)
+│   │   ├── Attention Sub-Norm (RMSNorm, BitNet-specific)
+│   │   └── O Projection (ternary_matmul, 2-bit)
+│   ├── Residual Add
 │   ├── RMSNorm (post-attention)
 │   └── FFN
-│       ├── Gate/Up Projection (Linear)
-│       ├── Squared ReLU (relu2)
-│       ├── FFN Sub-Norm (BitNet-specific)
-│       └── Down Projection (Linear)
+│       ├── Fused Gate+Up Projection (ternary_matmul, 2-bit)
+│       ├── Squared ReLU × Up (fused mul with stacked activations)
+│       ├── FFN Sub-Norm (RMSNorm, BitNet-specific)
+│       └── Down Projection (ternary_matmul, 2-bit)
 ├── RMSNorm (final)
-└── LM Head
+├── LM Head (bfp4, standard matmul)
+└── Argmax (in-trace, ROW_MAJOR fast path)
 ```
 
-### BitLinear Weight Quantization
+### Packed Ternary Storage (BFP2_b)
 
-Same quantization as HuggingFace BitLinear:
-
-```python
-# Weight quantization formula (applied at load time)
-s = 1.0 / weight.abs().mean()
-weight_quant = (weight * s).round().clamp(-1, 1) / s
-# Result: ternary values {-scale, 0, +scale}
+```
+DRAM per tile:  256 bytes mantissa only (64 uint32)
+L1 per tile:    320 bytes (256B mantissa + 64B synthesized 0x7F exponent)
+Tensix HW:      UNPACKER decodes BFP2_b → bf16 on the fly
+Storage:        2 bits/weight × 2.4B params ≈ 600 MB
 ```
 
-### Key Components
+### Decode Pipeline (traced)
 
-| Component | File | Description |
-| --------- | ---- | ----------- |
-| Config | `config.py` | Model configuration + HiFi2 kernel settings |
-| Embedding | `layers/embedding.py` | Token embedding |
-| RMSNorm | `layers/bitlinear.py` | Root Mean Square Normalization |
-| Linear | `layers/bitlinear.py` | Ternary weights + HiFi2 matmul |
-| Attention | `layers/attention.py` | GQA + RoPE + KV-Cache |
-| FFN | `layers/ffn.py` | Squared ReLU |
-| Transformer | `model/transformer.py` | Transformer block |
-| BitNetModel | `model/bitnet.py` | Full model |
-| Generator | `inference/generator.py` | Text generation + streaming |
+```
+Per step (19.3 ms p50):
+  copy_inputs [host→device: embed + pos + cos + sin]     0.66 ms
+  execute_trace [CQ dispatch]                             0.01 ms
+  ┌── trace kernel ──────────────────────────────────┐
+  │  30 × (norm → qkv_matmul → heads → RoPE →       │
+  │        cache_update → SDPA → reshape →            │
+  │        sub_norm → o_proj → residual →             │  ~15.6 ms
+  │        norm → gate_up → relu²×up →               │
+  │        sub_norm → down_proj → residual)           │
+  │  final_norm → lm_head(bfp4) → to_layout(RM)      │  +1.8 ms
+  │  → argmax(RM, branchless bf16)                    │
+  └──────────────────────────────────────────────────┘
+  sync_device [wait for trace kernel]                    17.6 ms
+  sample_token [read 4-byte int32 from device]            0.16 ms
+```
 
 ## Project Structure
 
 ```text
 bitnet-tt/
 ├── src/bitnet_tt/
-│   ├── config.py              # Model configuration + compute kernel config
+│   ├── config.py                  # Model config + compute kernel config
 │   ├── layers/
-│   │   ├── attention.py       # Multi-Head Attention + KV-Cache
-│   │   ├── bitlinear.py       # Linear (HiFi2), RMSNorm
-│   │   ├── embedding.py       # Embedding layer
-│   │   ├── ffn.py             # Feed-Forward Network
-│   │   └── rope_optimized.py  # RoPE pre-upload
+│   │   ├── attention.py           # GQA + KV-Cache + fused RoPE + QKV scale fold
+│   │   ├── bitlinear.py           # Linear (ternary_matmul), RMSNorm
+│   │   ├── embedding.py           # Token embedding
+│   │   └── ffn.py                 # FFN (fused gate+up, stacked relu²×up)
 │   ├── model/
-│   │   ├── bitnet.py          # BitNetModel
-│   │   └── transformer.py     # TransformerBlock
+│   │   ├── bitnet.py              # BitNetModel (bfp4 lm_head)
+│   │   └── transformer.py         # TransformerBlock
 │   ├── inference/
-│   │   └── generator.py       # TextGenerator (streaming)
+│   │   ├── generator.py           # Single-batch generator
+│   │   └── generator_batch32.py   # Batch-32 + Metal Trace + in-trace argmax
 │   └── utils/
-│       ├── device.py          # TT-NN device management
-│       ├── quantization.py    # Quantization utilities
-│       └── weights.py         # HuggingFace weight loading
-├── examples/
-│   ├── demo.py                # Demo script
-│   ├── debug_compare.py       # Layer-by-layer comparison
-│   └── debug_full_compare.py  # Full model comparison
-├── main.py                    # CLI entry point
-└── MEMO.md                    # Technical memo (optimization records)
+│       ├── device.py              # TT-NN device management
+│       ├── quantization.py        # weight_quant_ternary
+│       └── weights.py             # HuggingFace weight loading
+├── bench_batch32.py               # Decode throughput benchmark
+├── bench_accuracy.py              # PCC + greedy match vs HuggingFace
+├── profile_decode.py              # Category-level non-trace profiler
+├── main.py                        # CLI entry point
+├── TODO.md                        # Detailed optimization log
+└── MEMO.md                        # Technical reference memo
 ```
 
 ## API Usage
 
-### Basic Inference
+### High-Performance Batch-32 Decode
 
 ```python
-from bitnet_tt.model.bitnet import create_model
-from bitnet_tt.inference.generator import TextGenerator
-from bitnet_tt.utils.device import device_context
+from bitnet_tt.utils.device import get_device, close_device
 from bitnet_tt.utils.weights import load_bitnet_weights, load_weights_to_model
-
-with device_context() as device:
-    # Load model
-    state_dict, config = load_bitnet_weights("microsoft/bitnet-b1.58-2B-4T-bf16")
-    model = create_model(config, device)
-    load_weights_to_model(model, state_dict)
-
-    # Generate text
-    generator = TextGenerator(model)
-    output = generator.generate(
-        "Hello, I am",
-        max_new_tokens=50,
-        temperature=0.7,
-    )
-    print(output)
-```
-
-### Streaming Chat
-
-```python
+from bitnet_tt.model.bitnet import create_model
+from bitnet_tt.inference.generator_batch32 import Batch32Generator
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16")
-generator = TextGenerator(model, tokenizer)
+device = get_device()
+state_dict, config = load_bitnet_weights("microsoft/bitnet-b1.58-2B-4T-bf16")
+model = create_model(config, device, weight_dtype="packed_ternary",
+                     use_fused_rope=True)
+load_weights_to_model(model, state_dict)
 
-# Streaming output
-for text, stats in generator.chat_streaming(
-    "Hello! How are you?",
+tokenizer = AutoTokenizer.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16")
+gen = Batch32Generator(model, tokenizer=tokenizer, enable_trace=True)
+
+# Streaming generation (greedy decode uses in-trace argmax)
+for text, stats in gen.generate_streaming(
+    "The meaning of life is",
     max_new_tokens=100,
-    temperature=0.7,
+    temperature=0.0,
+    top_k=1,
 ):
     print(text, end="", flush=True)
+print(f"\n[{stats.tokens_per_second:.1f} t/s]")
 
-print(f"\n[Speed: {stats.tokens_per_second:.2f} t/s]")
+close_device()
 ```
 
 ## Hardware Requirements
 
 ### Tenstorrent Blackhole p150a
 
-| Specification | Value |
-| ------------- | ----- |
-| Tensix Cores | 140 |
-| SRAM | 210MB (1.5MB per core) |
-| Memory | 32GB GDDR6 |
-| TDP | Up to 300W |
+| Spec | Value |
+|---|---|
+| Tensix Cores | 140 (108 active after harvesting) |
+| L1 SRAM | 1.5 MB per core |
+| DRAM | 32 GB GDDR6 (~512 GB/s) |
 
-### Software Requirements
+### Environment
 
-- Ubuntu 20.04/22.04 LTS
-- Python 3.10 (ttnn compatible)
-- TT-NN SDK
-- PyTorch 2.0+
-- Transformers 4.40+
+```bash
+# Required env vars
+export TT_METAL_ENABLE_L1_DATA_CACHE_RISCVS=BR,NC,TR,ER
+export BITNET_TT_TRACE_REGION_SIZE=200000000
 
-## Implementation Details
-
-### Compute Kernel Configuration
-
-```python
-# HiFi2: BFP8 operations, ~2x speed improvement (accuracy maintained)
-from bitnet_tt.config import get_compute_kernel_config
-
-kernel_config = get_compute_kernel_config("hifi2")
-# ttnn.matmul(..., compute_kernel_config=kernel_config)
+# Software
+# - Source-built tt-metal with custom ternary_matmul op
+# - Python 3.10, ttnn (editable install), torch 2.11+cpu
 ```
 
-| Fidelity | Precision | Speed | Use Case |
-| -------- | --------- | ----- | -------- |
-| HiFi4 | BF16 | 1x | Prefill, accuracy-critical |
-| HiFi2 | BFP8 | ~2x | Decode (currently used) |
-| LoFi | BFP4 | ~3.6x | MLP (experimental) |
+## Custom tt-metal Op: `ternary_matmul`
 
-### TT-NN Tensor Layout
+Located at `ttnn/cpp/ttnn/operations/experimental/ternary_matmul/` in our tt-metal fork.
 
-```python
-# TILE_LAYOUT: Optimized for compute (required for matmul)
-# ROW_MAJOR_LAYOUT: reshape/embedding input
-
-# Layout conversion before reshape/permute
-x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-x = ttnn.reshape(x, new_shape)
-x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
-```
-
-## Known Limitations
-
-1. **HEIGHT_SHARDED Not Supported**: BitNet's `num_heads=20` is incompatible with tt_transformers' 32-core grid
-2. **Trace Capture Not Applied**: Concat-based KV-Cache is incompatible with trace
-3. **batch_size=1 Only**: batch>1 is inefficient without HEIGHT_SHARDED
+Key design:
+- **BFP2_b HW unpack**: Tensix UNPACKER decodes 2-bit mantissa + shared exponent → bf16
+- **True 2-bit DRAM**: 256 B mantissa per tile, 64 B exponent synthesized in L1
+- **Activation multicast**: rectangular core layout for down_proj/o_proj (5×8), L-shape for gate_up
+- **RISC split**: BRISC/NOC_0 = activation reader + mcast, NCRISC/NOC_1 = weight + output + exp init
+- **K-block pipelining**: `in0_block_w = Kt/2` for automatic double-buffering
 
 ## References
 
-### Tenstorrent
-
-- [Official Documentation](https://docs.tenstorrent.com)
-- [TT-Metal GitHub](https://github.com/tenstorrent/tt-metal)
-- [tt_transformers](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
-
-### BitNet
-
-- [BitNet Paper (arXiv:2310.11453)](https://arxiv.org/abs/2310.11453)
-- [BitNet b1.58 Paper (arXiv:2402.17764)](https://arxiv.org/abs/2402.17764)
+- [BitNet b1.58 Paper](https://arxiv.org/abs/2402.17764)
 - [BitNet b1.58 2B4T (HuggingFace)](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
+- [TT-Metal](https://github.com/tenstorrent/tt-metal)
 
 ## License
 
