@@ -5,8 +5,8 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **51.8 t/s Decode** (p50 steady-state, batch32 + Metal Trace + fused RoPE)
-- **+59.8% faster than bfp4** at half the storage
+- **56.2 t/s Decode** (p50 steady-state, batch32 + Metal Trace + fused RoPE)
+- **+71% faster than bfp4** at half the storage
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
 - **In-trace Greedy Argmax**: Argmax runs inside Metal Trace — zero host round-trip per token
 - **Accuracy Preserved**: PCC 0.975 vs HuggingFace CPU reference (packed_ternary inherent limit)
@@ -37,7 +37,7 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | avg t/s | p50 ms | p50 t/s | model size |
 |---|---:|---:|---:|---:|
-| **packed_ternary** | **48.18** | **19.3** | **51.8** | **~600 MB** |
+| **packed_ternary** | **51.58** | **17.8** | **56.2** | **~600 MB** |
 | bfp4 (production baseline) | 30.15 | 31 | 32.3 | ~1.2 GB |
 | bf16 | ~16 | ~62 | ~16 | ~4.8 GB |
 
@@ -58,6 +58,7 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 18. **lm_head bfp4** | **43.17** | 1.81→0.75 ms DRAM BW halved |
 | 19. **ROW_MAJOR argmax** | **47.68** | TILE 4.39→RM 2.26 ms |
 | 20. **streaming decode O(1)** | **48.18** | tokenizer.decode per-token |
+| 21. **L1 norm→matmul + SDPA L1** | **51.58** | norm/SDPA outputs in L1, DRAM round-trip eliminated |
 
 ### Accuracy (vs HuggingFace CPU reference)
 
@@ -112,19 +113,19 @@ Storage:        2 bits/weight × 2.4B params ≈ 600 MB
 ### Decode Pipeline (traced)
 
 ```
-Per step (19.3 ms p50):
+Per step (17.8 ms p50):
   copy_inputs [host→device: embed + pos + cos + sin]     0.66 ms
   execute_trace [CQ dispatch]                             0.01 ms
   ┌── trace kernel ──────────────────────────────────┐
-  │  30 × (norm → qkv_matmul → heads → RoPE →       │
-  │        cache_update → SDPA → reshape →            │
-  │        sub_norm → o_proj → residual →             │  ~15.6 ms
-  │        norm → gate_up → relu²×up →               │
-  │        sub_norm → down_proj → residual)           │
+  │  30 × (norm(→L1) → qkv_matmul → heads → RoPE →  │
+  │        cache_update → SDPA(→L1) → reshape →       │
+  │        sub_norm(→L1) → o_proj → residual →        │  ~14.0 ms
+  │        norm(→L1) → gate_up → relu²×up →           │
+  │        sub_norm(→L1) → down_proj → residual)      │
   │  final_norm → lm_head(bfp4) → to_layout(RM)      │  +1.8 ms
   │  → argmax(RM, branchless bf16)                    │
   └──────────────────────────────────────────────────┘
-  sync_device [wait for trace kernel]                    17.6 ms
+  sync_device [wait for trace kernel]                    ~16.5 ms
   sample_token [read 4-byte int32 from device]            0.16 ms
 ```
 

@@ -2,9 +2,10 @@
 
 ## 현재 상태 (2026-04-16)
 
-### 달성 — 48.18 t/s (p50 51.8 t/s), bfp4 대비 +59.8%
-- **48.18 t/s** decode avg (batch32 + trace + fused RoPE, p50=19.3ms=51.8 t/s) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +59.8%**, storage는 절반 (~600MB vs ~1.2GB)
+### 달성 — 51.58 t/s (p50 56.2 t/s), bfp4 대비 +71.1%
+- **51.58 t/s** decode avg (batch32 + trace + fused RoPE, p50=17.8ms=56.2 t/s) — Blackhole p150a
+- **bfp4 production (30.15) 대비 +71.1%**, storage는 절반 (~600MB vs ~1.2GB)
+- **L1 norm→matmul 경로**: 120개 RMSNorm 출력 + SDPA 출력을 L1에 유지 → DRAM 왕복 제거
 - **In-trace greedy argmax**: sample_token 6.37→0.16 ms (argmax가 trace 커널 안에서 실행)
 - **lm_head bfp4**: DRAM BW 절반 (1.81→0.75 ms, PCC 0.9992 vs bf16 → 무손실)
 - **ROW_MAJOR argmax**: TILE 4.39→RM 2.26 ms (branchless bf16 비교 커널 포함)
@@ -13,7 +14,7 @@
 - **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
 - **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0)
 - **정확도:** PCC 0.975 vs HF (packed_ternary 고유 한계, lm_head bfp4 영향 0.005)
-- **Dual RoPE:** fused (~48 t/s) / manual (~21 t/s), `--no-fused-rope` 옵션
+- **Dual RoPE:** fused (~52 t/s) / manual (~21 t/s), `--no-fused-rope` 옵션
 
 ### 성능 진화 요약
 | 단계 | t/s | 주요 변화 |
@@ -35,6 +36,7 @@
 | 18. **lm_head bfp4** | **43.17** | bf16→bfp4 (657→164 MB). DRAM BW 절반, PCC 0.9992 vs bf16 무손실 |
 | 19. **ROW_MAJOR argmax** | **47.68** | to_layout(RM) + argmax(RM). TILE 4.39→RM 2.26 ms. branchless bf16 비교 커널 |
 | 20. **streaming decode O(1)** | **48.18** | tokenizer.decode 전체 시퀀스 재디코딩 → per-token O(1) 변경 |
+| 21. **L1 norm→matmul + SDPA L1** | **51.58** | 120 norm→matmul 중간값 + SDPA 출력을 L1 유지. DRAM 왕복 제거 |
 
 ---
 
@@ -156,7 +158,8 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 ## 성능 참조 (최종)
 | dtype | avg t/s | p50 ms | p50 t/s | storage (2.4B) |
 |---|---:|---:|---:|---:|
-| **packed_ternary (current)** | **48.18** | **19.3** | **51.8** | **~600 MB** |
+| **packed_ternary (current)** | **51.58** | **17.8** | **56.2** | **~600 MB** |
+| packed_ternary (pre-L1) | 48.18 | 19.3 | 51.8 | ~600 MB |
 | packed_ternary (pre-session) | 37.52 | 25 | 40 | ~600 MB |
 | packed_ternary (Track A final) | 34.81 | 26 | 38.5 | ~600 MB |
 | bfp4 production | 30.15 | 31 | 32.3 | ~1.2 GB |
@@ -164,14 +167,24 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 
 측정 조건: batch32 + trace + fused RoPE + 128 tokens.
 
-### Trace kernel 내부 분해 (17.6 ms, 2026-04-16 측정)
+### Trace kernel 내부 분해 (추정 ~16.4 ms, L1 norm 적용 후)
 | 항목 | ms | % |
 |---|---:|---:|
-| RMSNorm (121×~0.06) | ~7.0 | 40% |
-| ternary matmul (120×) | ~6.3 | 36% |
-| argmax RM (to_layout + argmax) | ~1.8 | 10% |
-| lm_head bfp4 | 0.75 | 4% |
-| glue (SDPA, heads, RoPE, slice, add) | ~1.7 | 10% |
+| RMSNorm (121×~0.06) | ~6.5 | 40% |
+| ternary matmul (120×) | ~4.5 | 27% |
+| argmax RM (to_layout + argmax) | ~1.8 | 11% |
+| lm_head bfp4 | 0.75 | 5% |
+| glue (SDPA, heads, RoPE, slice, add) | ~1.5 | 9% |
+| non-trace overhead | ~1.3 | 8% |
+
+### L1 메모리 최적화 실험 결과 (2026-04-16)
+| 변경 | 결과 | 효과 |
+|---|---:|---|
+| **norm→matmul 중간값 L1** | **51.12** | **+6.1%** — 120 norm 출력이 L1에서 matmul 입력으로 직접 전달 |
+| **+ SDPA 출력 L1** | **51.58** | **+7.1%** — SDPA→reshape→sub_norm 체인이 L1에서 동작 |
+| ttnn.add(residual) L1 | 47.58 | **-1.2%** — DRAM+L1 혼합 입력으로 역효과 |
+| final_norm L1 | 47.41 | **-1.6%** — slice(L1)→matmul(lm_head) 경로 역효과 |
+| gate_up mcast heuristic (72 cores) | 50.77 | **-0.7%** — L1 norm이 이미 activation 증폭 해결 |
 
 ---
 
