@@ -641,25 +641,28 @@ class Batch32Generator:
             kv_cache = self._kv_caches[layer_idx]
             prev_hidden = hidden
 
-            # Input LayerNorm → L1 output for fast ternary_matmul read
-            normed = layer.input_layernorm(hidden, memory_config=_norm_mem)
-
-            # Fused QKV matmul
+            # Fused RMSNorm + QKV matmul: the ternary matmul kernel computes
+            # RMSNorm(hidden) * gamma inline, eliminating a separate kernel launch.
             attention = layer.self_attn
             if attention._qkv_use_packed_ternary:
                 qkv_fused = ttnn.experimental.ternary_matmul(
-                    normed,
+                    hidden,
                     attention.qkv_fused_weight,
                     use_packed_ternary=True,
-                )
-            elif self._decode_matmul_kernel_config is not None:
-                qkv_fused = ttnn.matmul(
-                    normed,
-                    attention.qkv_fused_weight,
-                    compute_kernel_config=self._decode_matmul_kernel_config,
+                    norm_weight=layer.input_layernorm.weight,
+                    norm_epsilon=layer.input_layernorm.eps,
                 )
             else:
-                qkv_fused = ttnn.matmul(normed, attention.qkv_fused_weight)
+                normed = layer.input_layernorm(hidden, memory_config=_norm_mem)
+                if self._decode_matmul_kernel_config is not None:
+                    qkv_fused = ttnn.matmul(
+                        normed,
+                        attention.qkv_fused_weight,
+                        compute_kernel_config=self._decode_matmul_kernel_config,
+                    )
+                else:
+                    qkv_fused = ttnn.matmul(normed, attention.qkv_fused_weight)
+                ttnn.deallocate(normed)
             attn_output_proj, _ = attention._forward_decode_1bkd(
                 qkv_fused,
                 kv_cache,
@@ -668,7 +671,6 @@ class Batch32Generator:
                 PADDED_BATCH,
                 current_pos_tensor=current_pos_tensor,
             )
-            ttnn.deallocate(normed)
 
             # Residual
             hidden_attn = ttnn.add(hidden, attn_output_proj)

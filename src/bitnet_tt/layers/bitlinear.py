@@ -276,12 +276,22 @@ class Linear:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
-    def __call__(self, x: ttnn.Tensor) -> ttnn.Tensor:
+    def __call__(
+        self,
+        x: ttnn.Tensor,
+        norm_weight: ttnn.Tensor | None = None,
+        norm_epsilon: float | None = None,
+    ) -> ttnn.Tensor:
         """
         Forward pass with pre-quantized and pre-transposed weights.
 
         Args:
             x: Input tensor of shape (batch, seq_len, in_features)
+            norm_weight: Optional RMSNorm gamma tensor for fused norm+matmul.
+                When provided together with norm_epsilon, the ternary matmul
+                kernel computes RMSNorm(x) * gamma inline before the matmul,
+                eliminating a separate kernel launch.
+            norm_epsilon: Optional epsilon for the fused RMSNorm.
 
         Returns:
             Output tensor of shape (batch, seq_len, out_features)
@@ -292,6 +302,8 @@ class Linear:
         if self._use_packed_ternary:
             out = ttnn.experimental.ternary_matmul(
                 x, self.weight, use_packed_ternary=True,
+                norm_weight=norm_weight,
+                norm_epsilon=norm_epsilon,
             )
         elif self._compute_kernel_config is not None:
             out = ttnn.matmul(
