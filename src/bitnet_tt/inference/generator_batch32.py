@@ -982,7 +982,8 @@ class Batch32Generator:
             self._trace_inputs["cos"],
             self._trace_inputs["sin"],
         )
-        self._trace_argmax_output = ttnn.argmax(self._trace_output, dim=-1)
+        trace_logits_rm = ttnn.to_layout(self._trace_output, ttnn.ROW_MAJOR_LAYOUT)
+        self._trace_argmax_output = ttnn.argmax(trace_logits_rm, dim=-1)
         self._set_kv_cache_length(current_pos + 1)
 
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
@@ -1184,11 +1185,14 @@ class Batch32Generator:
             )
 
         # Fast path: greedy argmax on device (non-trace ops).
+        # ROW_MAJOR argmax is ~2× faster than TILE on large vocab tensors.
         if temperature <= 0.0 or top_k is None or top_k <= 1:
             try:
-                token_indices = ttnn.argmax(last_row, dim=-1)
+                row_rm = ttnn.to_layout(last_row, ttnn.ROW_MAJOR_LAYOUT)
+                token_indices = ttnn.argmax(row_rm, dim=-1)
                 token_id = int(ttnn.to_torch(token_indices).reshape(-1)[0].item())
                 ttnn.deallocate(token_indices)
+                ttnn.deallocate(row_rm)
                 if not use_direct_logits:
                     ttnn.deallocate(last_row)
                 return token_id
