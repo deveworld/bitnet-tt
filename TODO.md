@@ -113,11 +113,13 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 
 ---
 
-## Track C: multi_core_reuse_optimized 포팅 — 🔄 Future
+## Track C: multi_core_reuse_optimized 포팅 — ⚠️ Reduced priority
 **목표:** Activation + weight 둘 다 multicast + 2D core grid reuse 패턴으로
 매트멀 팩토리 재작성. DRAM 대역폭을 `Kt × Nt` → `Kt + Nt` 수준으로 축소.
 
-**예상 이득:** +3~6 t/s (ternary matmul = trace kernel의 36%, 2× speedup 시 ~3 ms 절감)
+**예상 이득 (재평가):** +1~2 t/s (L1 norm이 activation DRAM 증폭을 이미 해결.
+mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 확인.
+남은 이득은 weight column sharing만으로 제한됨.)
 
 **범위:**
 - tt-metal 프로덕션 `matmul_multi_core_reuse_optimized` 약 3300줄 참고
@@ -185,6 +187,14 @@ bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 | ttnn.add(residual) L1 | 47.58 | **-1.2%** — DRAM+L1 혼합 입력으로 역효과 |
 | final_norm L1 | 47.41 | **-1.6%** — slice(L1)→matmul(lm_head) 경로 역효과 |
 | gate_up mcast heuristic (72 cores) | 50.77 | **-0.7%** — L1 norm이 이미 activation 증폭 해결 |
+| lm_head matmul 출력 L1 | FAIL | trace 중 L1 할당 초과 (8.2MB TILE output) |
+
+### 미래 커널 레벨 최적화 (C++ 필요)
+| 최적화 | 예상 효과 | 내용 |
+|---|---|---|
+| RMSNorm+matmul 커널 퓨전 | -2~3ms | norm compute를 weight DMA와 overlap |
+| lm_head+argmax 커널 퓨전 | -1~2ms | matmul pack 단계에서 partial max 추적, 128K logits 미생성 |
+| Track C weight column sharing | -1~2ms | weight column-wise mcast (activation은 L1로 이미 해결) |
 
 ---
 
