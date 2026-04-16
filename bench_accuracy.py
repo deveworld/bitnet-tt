@@ -43,7 +43,7 @@ def topk_overlap(a: np.ndarray, b: np.ndarray, k: int) -> float:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dtype", default="bf16", choices=["bf16", "bfp8", "bfp4"])
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "bfp8", "bfp4", "packed_ternary"])
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--decode-steps", type=int, default=16)
     args = ap.parse_args()

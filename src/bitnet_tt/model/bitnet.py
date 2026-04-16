@@ -138,7 +138,13 @@ class BitNetModel:
         self.norm.load_weights(norm_weight)
         # Pre-transpose LM head: (vocab, hidden) -> (hidden, vocab)
         lm_head_t = lm_head_weight.T.astype(np.float32).copy()
-        lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
+        # bfp4 halves DRAM BW for lm_head but PCC drops to 0.992 vs bf16
+        # and argmax can diverge. Use bfp8 as a safer middle ground.
+        _lm_dtype_map = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b, "bfp4": ttnn.bfloat4_b}
+        lm_head_dtype = _lm_dtype_map.get(
+            "bfp8" if self._weight_dtype not in ("bf16",) else "bf16",
+            ttnn.bfloat8_b,
+        )
         self.lm_head_weight = ttnn.from_torch(
             torch.from_numpy(lm_head_t),
             dtype=lm_head_dtype,
