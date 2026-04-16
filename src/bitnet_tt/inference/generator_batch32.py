@@ -670,15 +670,15 @@ class Batch32Generator:
             )
             ttnn.deallocate(normed)
 
-            # Residual
-            hidden_attn = ttnn.add(hidden, attn_output_proj)
+            # Residual — keep in L1 so the entire layer pipeline stays L1-resident.
+            hidden_attn = ttnn.add(hidden, attn_output_proj, memory_config=_norm_mem)
             ttnn.deallocate(attn_output_proj)
 
             # FFN
             residual = hidden_attn
             hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
             hidden_mlp = layer.mlp(hidden_normed, mode="decode")
-            hidden = ttnn.add(residual, hidden_mlp)
+            hidden = ttnn.add(residual, hidden_mlp, memory_config=_norm_mem)
             ttnn.deallocate(hidden_normed)
             ttnn.deallocate(hidden_mlp)
             ttnn.deallocate(residual)
@@ -690,8 +690,9 @@ class Batch32Generator:
             ttnn.deallocate(cos_shared)
             ttnn.deallocate(sin_shared)
 
-        # Final norm + LM head
-        hidden = self.model.norm(hidden)
+        # Final norm + LM head.  L1 output for the same reason as layer
+        # norms: the downstream slice + matmul reads from L1 instead of DRAM.
+        hidden = self.model.norm(hidden, memory_config=_norm_mem)
         # Only batch row 0 contributes to user-visible output. Running the LM
         # head on all 32 padded rows adds unnecessary decode work.
         hidden_single = ttnn.slice(
