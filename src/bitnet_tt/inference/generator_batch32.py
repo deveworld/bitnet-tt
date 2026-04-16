@@ -699,20 +699,14 @@ class Batch32Generator:
             [0, 0, 0, 0],
             [1, 1, 1, self.config.hidden_size],
         )
-        # L1 output: the downstream to_layout(RM) + argmax reads ~8 MB of
-        # TILE data. With L1 interleaved (~75 KB/core) the reads come from
-        # local SRAM instead of DRAM, reducing both latency and BW contention.
-        _lm_mem = ttnn.L1_MEMORY_CONFIG
         if self._decode_matmul_kernel_config is not None:
             logits = ttnn.matmul(
                 hidden_single,
                 self.model.lm_head_weight,
                 compute_kernel_config=self._decode_matmul_kernel_config,
-                memory_config=_lm_mem,
             )
         else:
-            logits = ttnn.matmul(hidden_single, self.model.lm_head_weight,
-                                memory_config=_lm_mem)
+            logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
         ttnn.deallocate(hidden_single)
         logits = ttnn.reshape(logits, (1, 1, self.config.vocab_size))
 
