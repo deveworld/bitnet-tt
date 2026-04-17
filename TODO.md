@@ -2,8 +2,9 @@
 
 ## 현재 상태 (2026-04-17)
 
-### 달성 — p50 11.7 ms / 68.6 t/s (min 11.0 ms, 64 tok), bfp4 대비 +127%
-- **p50 11.7 ms, min 11.0 ms, decode_tps ≈ 68.57 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head, 64-tok) — Blackhole p150a
+### 달성 — p50 11.6 ms / 70.5 t/s (min 10.9 ms, 64 tok), bfp4 대비 +134%
+- **p50 11.6 ms, min 10.9 ms, decode_tps ≈ 70.51 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks, 64-tok) — Blackhole p150a
+- **LM head chunks L1**: split lm_head의 4 chunk 출력을 L1에 유지 → concat/to_layout/argmax 체인 DRAM 라운드트립 제거. -40 μs/step.
 - **Split lm_head matmul (4-way)**: 단일 matmul이 vocab=128256 전체에 맞춰 per_core config를 잡아 ~2.2 ms/step 소요되던 것을 4개 chunk로 쪼개 각각 tight per-core config 적용. 측정: 2197 → 722 μs (-67%). trace kernel 11.9 → 10.4 ms.
 - **Shard grid tuning**: H=2560은 y=2,x=8 (16 cores), H=6912은 y=3,x=8 (24 cores)로 per-core width 축소 → 멀티코어 reduction이 per-core sum 비용 dominant. 28 μs/call (H=2560), 34 μs/call (H=6912). -0.3 ms/step.
 - **Sharded rms_norm**: `ttnn.rms_norm`이 width-sharded 입력에 대해 자동으로 multicore 커널 디스패치. `RMSNorm.enable_sharded_fast_path()`로 91개 non-fused norm 모두에 적용 (reshard → rms_norm → sharded_to_interleaved). 56 → 33 μs/call (-41%), trace kernel 14.7 → 12.1 ms (-2.6 ms).
@@ -50,6 +51,7 @@
 | 24. **Sharded multicore rms_norm** | **62.66 (p50 13.5ms)** | `ttnn.rms_norm`이 width-sharded 입력에 대해 자동 multicore 경로. 91 non-fused norms 모두 sharded 경로 사용 (reshard→rms→desharded). 56→33 μs/call, trace kernel -2.6 ms. |
 | 25. **Shard grid tuning** | **63.46 (p50 13.2ms)** | H=2560 y=2x=8 (16 cores), H=6912 y=3x=8 (24 cores). 측정 기반 코어 그리드 최적화. -0.3 ms/step. |
 | 26. **Split lm_head (4-way)** | **68.57 (p50 11.7ms)** | vocab matmul 4 chunk으로 쪼개 per-core config 최적화. 2197→722 μs (-67%), trace kernel -1.5 ms. |
+| 27. **LM head chunks L1** | **70.51 (p50 11.6ms)** | split lm_head chunk 출력을 L1 유지. -40 μs/step. |
 
 ---
 
@@ -225,7 +227,8 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 ## 성능 참조 (최종)
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | storage (2.4B) |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary (current, 2026-04-17 +split lm_head, 64 tok)** | **11.7** | **85.5** | **11.0** | **90.9** | **68.57** | **~600 MB** |
+| **packed_ternary (current, 2026-04-17 +L1 chunks, 64 tok)** | **11.6** | **86.2** | **10.9** | **91.7** | **70.51** | **~600 MB** |
+| packed_ternary (2026-04-17 +split lm_head, 64 tok) | 11.7 | 85.5 | 11.0 | 90.9 | 68.57 | ~600 MB |
 | packed_ternary (2026-04-17 +tuned shard grid, 64 tok) | 13.2 | 75.8 | 12.4 | 80.6 | 63.46 | ~600 MB |
 | packed_ternary (2026-04-17 +sharded rms_norm, 64 tok) | 13.5 | 74.1 | 12.8 | 78.1 | 62.66 | ~600 MB |
 | packed_ternary (2026-04-17 +multicore argmax, 64 tok) | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
