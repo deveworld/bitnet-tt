@@ -359,18 +359,37 @@ class RMSNorm:
         weight_2d = weight.reshape(1, 1, 1, -1).astype(np.float32)
         self.weight = numpy_to_ttnn(weight_2d, self.device)
 
+    # Preferred core grids per hidden size. Measured sweep on BH p150a:
+    # H=2560  best at y=2,x=8  (16 cores, 28.2 us vs 31.6 us for y=1,x=8)
+    # H=6912  best at y=3,x=8  (24 cores, 33.7 us vs 36.9 us for y=1,x=8)
+    # Grids that span more rows keep per-core width small enough that the
+    # multicore reduction dominates per-core sum cost.
+    _GRID_OVERRIDES = {
+        2560: (2, 8),
+        6912: (3, 8),
+    }
+
     def enable_sharded_fast_path(self, num_cores: int = 8) -> bool:
         """Pre-compute a width-sharded spec for the multicore rms_norm path.
 
-        Returns True if the spec is valid for this hidden size, False if
-        the hidden size does not split evenly into ``num_cores`` chunks
-        of tile-aligned width.
+        Uses a size-specific preferred grid when available; otherwise falls
+        back to a single row of ``num_cores`` cores. Returns False when no
+        valid tile-aligned grid exists for this hidden size.
         """
-        if self.hidden_size % (32 * num_cores) != 0:
-            return False
+        if self.hidden_size in self._GRID_OVERRIDES:
+            y, x = self._GRID_OVERRIDES[self.hidden_size]
+        else:
+            y, x = 1, num_cores
+        nc = y * x
+        if self.hidden_size % (32 * nc) != 0:
+            # Fallback to single-row with num_cores
+            y, x = 1, num_cores
+            nc = num_cores
+            if self.hidden_size % (32 * nc) != 0:
+                return False
         self._shard_cfg = ttnn.create_sharded_memory_config(
-            shape=(32, self.hidden_size // num_cores),
-            core_grid=ttnn.CoreGrid(y=1, x=num_cores),
+            shape=(32, self.hidden_size // nc),
+            core_grid=ttnn.CoreGrid(y=y, x=x),
             strategy=ttnn.ShardStrategy.WIDTH,
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
