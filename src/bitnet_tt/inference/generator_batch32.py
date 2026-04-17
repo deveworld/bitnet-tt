@@ -677,18 +677,10 @@ class Batch32Generator:
 
             # FFN
             residual = hidden_attn
-            if layer.mlp.gate_up_proj._use_packed_ternary:
-                hidden_mlp = layer.mlp(
-                    hidden_attn,
-                    mode="decode",
-                    norm_weight=layer.post_attention_layernorm.weight,
-                    norm_epsilon=layer.post_attention_layernorm.eps,
-                )
-            else:
-                hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
-                hidden_mlp = layer.mlp(hidden_normed, mode="decode")
-                ttnn.deallocate(hidden_normed)
+            hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
+            hidden_mlp = layer.mlp(hidden_normed, mode="decode")
             hidden = ttnn.add(residual, hidden_mlp)
+            ttnn.deallocate(hidden_normed)
             ttnn.deallocate(hidden_mlp)
             ttnn.deallocate(residual)
             if layer_idx > 0:
