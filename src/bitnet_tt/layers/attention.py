@@ -575,6 +575,18 @@ class MultiHeadAttention:
             use_height_and_width_as_shard_shape=True,
         )
 
+        # HEIGHT_SHARDED config for SDPA decode output, shaped so
+        # nlp_concat_heads_decode can consume it directly (it requires
+        # a sharded input with padded_heads=32). 32 batch-rows × 32 cores.
+        padded_heads = ((self.num_heads + 31) // 32) * 32
+        self._sdpa_output_sharded_config = ttnn.create_sharded_memory_config(
+            shape=(padded_heads, self.head_dim),
+            core_grid=ttnn.CoreGrid(y=4, x=8),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+
         # 128x128 rotation matrix for prefill adjacent-pair RoPE
         # rot[2k, 2k+1] = -1, rot[2k+1, 2k] = 1 for each pair
         rot_mat_128 = torch.zeros(1, 1, self.head_dim, self.head_dim)
@@ -1165,15 +1177,22 @@ class MultiHeadAttention:
         if pos_created_locally:
             ttnn.deallocate(pos_tensor_local)
 
-        # 7. Keep SDPA output in 1BKD form to avoid extra decode-time
-        # permute/transpose churn between attention and the next layer.
-        padded_batch = ((batch_size + 31) // 32) * 32
-        attn_output = ttnn.reshape(
-            attn_output_1bkd,
-            (1, 1, batch_size, self.hidden_size),
-            (1, 1, padded_batch, self.hidden_size),
+        # 7. Concat heads via nlp_concat_heads_decode. SDPA's GQA path can
+        # only emit interleaved output, so we reshard into the HEIGHT_SHARDED
+        # layout the concat_heads kernel expects, then desharded back for
+        # the downstream sub-norm.
+        attn_sdpa_sharded = ttnn.to_memory_config(
+            attn_output_1bkd, self._sdpa_output_sharded_config
         )
         ttnn.deallocate(attn_output_1bkd)
+        attn_concat_sharded = ttnn.experimental.nlp_concat_heads_decode(
+            attn_sdpa_sharded, num_heads=self.num_heads
+        )
+        ttnn.deallocate(attn_sdpa_sharded)
+        attn_output = ttnn.sharded_to_interleaved(
+            attn_concat_sharded, ttnn.L1_MEMORY_CONFIG
+        )
+        ttnn.deallocate(attn_concat_sharded)
 
         # 8. Apply sub-norm and output projection.
         # L1 output keeps the norm result close to the downstream ternary_matmul
