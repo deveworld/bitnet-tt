@@ -641,8 +641,7 @@ class Batch32Generator:
             kv_cache = self._kv_caches[layer_idx]
             prev_hidden = hidden
 
-            # Fused RMSNorm + QKV matmul: the ternary matmul kernel computes
-            # RMSNorm(hidden) * gamma inline, eliminating a separate kernel launch.
+            # Fused RMSNorm + QKV matmul
             attention = layer.self_attn
             if attention._qkv_use_packed_ternary:
                 qkv_fused = ttnn.experimental.ternary_matmul(
@@ -678,10 +677,18 @@ class Batch32Generator:
 
             # FFN
             residual = hidden_attn
-            hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
-            hidden_mlp = layer.mlp(hidden_normed, mode="decode")
+            if layer.mlp.gate_up_proj._use_packed_ternary:
+                hidden_mlp = layer.mlp(
+                    hidden_attn,
+                    mode="decode",
+                    norm_weight=layer.post_attention_layernorm.weight,
+                    norm_epsilon=layer.post_attention_layernorm.eps,
+                )
+            else:
+                hidden_normed = layer.post_attention_layernorm(hidden_attn, memory_config=_norm_mem)
+                hidden_mlp = layer.mlp(hidden_normed, mode="decode")
+                ttnn.deallocate(hidden_normed)
             hidden = ttnn.add(residual, hidden_mlp)
-            ttnn.deallocate(hidden_normed)
             ttnn.deallocate(hidden_mlp)
             ttnn.deallocate(residual)
             if layer_idx > 0:

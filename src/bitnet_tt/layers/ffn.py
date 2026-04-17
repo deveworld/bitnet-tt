@@ -126,18 +126,29 @@ class FeedForward:
         if ffn_sub_norm_weight is not None:
             self.ffn_sub_norm.load_weights(ffn_sub_norm_weight)
 
-    def __call__(self, x: ttnn.Tensor, mode: str = "prefill") -> ttnn.Tensor:
+    def __call__(
+        self,
+        x: ttnn.Tensor,
+        mode: str = "prefill",
+        norm_weight: ttnn.Tensor | None = None,
+        norm_epsilon: float | None = None,
+    ) -> ttnn.Tensor:
         """
         Forward pass.
 
         Args:
             x: Input tensor of shape (batch, seq_len, hidden_size)
             mode: "prefill" or "decode" (kept for API compatibility)
+            norm_weight: Optional RMSNorm gamma for fused pre-matmul norm
+                into gate_up_proj (packed_ternary path only).
+            norm_epsilon: Optional epsilon paired with norm_weight.
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
-        gate_up = self.gate_up_proj(x)  # scale=1.0, no post-matmul scale
+        gate_up = self.gate_up_proj(
+            x, norm_weight=norm_weight, norm_epsilon=norm_epsilon
+        )  # scale=1.0, no post-matmul scale
 
         split_start = [0] * len(gate_up.shape)
         gate_end = list(gate_up.shape)
@@ -174,10 +185,15 @@ class FeedForward:
         ttnn.deallocate(up)
 
         # Apply sub-norm before down projection (BitNet-specific!)
-        # In decode mode, keep norm output in L1 so the downstream
-        # ternary_matmul reader avoids a DRAM round-trip.
+        # In decode mode with packed_ternary weights, the ternary_matmul
+        # kernel fuses RMSNorm + matmul in-kernel, eliminating the separate
+        # norm launch.
+        if mode == "decode" and self.down_proj._use_packed_ternary:
+            return self.down_proj(
+                hidden,
+                norm_weight=self.ffn_sub_norm.weight,
+                norm_epsilon=self.ffn_sub_norm.eps,
+            )
         norm_mem = ttnn.L1_MEMORY_CONFIG if mode == "decode" else None
         hidden = self.ffn_sub_norm(hidden, memory_config=norm_mem)
-
-        # Down projection
         return self.down_proj(hidden)

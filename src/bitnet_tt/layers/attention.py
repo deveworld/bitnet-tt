@@ -1176,10 +1176,19 @@ class MultiHeadAttention:
         ttnn.deallocate(attn_output_1bkd)
 
         # 8. Apply sub-norm and output projection.
-        # L1 output keeps the norm result close to the downstream ternary_matmul
-        # reader, avoiding a DRAM round-trip for the activation tensor.
-        attn_output = self.attn_sub_norm(attn_output, memory_config=ttnn.L1_MEMORY_CONFIG)
-        output = self.o_proj(attn_output)
+        # When the o_proj uses packed_ternary weights, the ternary_matmul
+        # kernel fuses RMSNorm + matmul in-kernel, eliminating the separate
+        # norm launch. Otherwise keep the L1 norm hop to avoid a DRAM
+        # round-trip into the matmul reader.
+        if self.o_proj._use_packed_ternary:
+            output = self.o_proj(
+                attn_output,
+                norm_weight=self.attn_sub_norm.weight,
+                norm_epsilon=self.attn_sub_norm.eps,
+            )
+        else:
+            attn_output = self.attn_sub_norm(attn_output, memory_config=ttnn.L1_MEMORY_CONFIG)
+            output = self.o_proj(attn_output)
 
         return output, past_key_value
 
