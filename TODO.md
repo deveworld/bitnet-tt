@@ -1,20 +1,25 @@
 # TODO
 
-## 현재 상태 (2026-04-16)
+## 현재 상태 (2026-04-17)
 
-### 달성 — 51.58 t/s (p50 56.2 t/s), bfp4 대비 +71.1%
-- **51.58 t/s** decode avg (batch32 + trace + fused RoPE, p50=17.8ms=56.2 t/s) — Blackhole p150a
-- **bfp4 production (30.15) 대비 +71.1%**, storage는 절반 (~600MB vs ~1.2GB)
-- **L1 norm→matmul 경로**: 120개 RMSNorm 출력 + SDPA 출력을 L1에 유지 → DRAM 왕복 제거
-- **In-trace greedy argmax**: sample_token 6.37→0.16 ms (argmax가 trace 커널 안에서 실행)
-- **lm_head bfp4**: DRAM BW 절반 (1.81→0.75 ms, PCC 0.9992 vs bf16 → 무손실)
-- **ROW_MAJOR argmax**: TILE 4.39→RM 2.26 ms (branchless bf16 비교 커널 포함)
-- **QKV/O_proj/FFN 전부 packed_ternary**: attention 경로도 2-bit
-- **K-block pipelining**: in0_block_w = Kt/2로 cb0/cb1 double-buffer → DMA/compute overlap
-- **True 2-bit DRAM** storage (BFP2_b 포맷 + L1 exp 합성)
-- **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0)
-- **정확도:** PCC 0.975 vs HF (packed_ternary 고유 한계, lm_head bfp4 영향 0.005)
-- **Dual RoPE:** fused (~52 t/s) / manual (~21 t/s), `--no-fused-rope` 옵션
+### 달성 — p50 15.5 ms / 55.8 t/s (min 15.0 ms, 64 tok), bfp4 대비 +85%
+- **p50 15.5 ms, min 15.0 ms, decode_tps ≈ 55.8 t/s** (batch32 + trace + fused RoPE + multicore argmax, 64-tok) — Blackhole p150a
+- **Multicore argmax (trace-primed)**: `ttnn.argmax(..., use_multicore=True)`로 vocab-dim reduction을 코어 그리드 전체로 병렬화. 첫 호출 시 write가 trace 내에서 거부되므로 warmup 경로에서 한 번 호출해 상태 초기화. 1.99 → 0.076 ms (26×), 단계당 -1.68 ms.
+- **Fused RMSNorm + ternary_matmul (QKV)**: RMSNorm이 matmul 커널 안에서 실행됨. QKV만 적용 (o_proj/gate_up/down_proj는 trace-level 회귀로 기본 L1-norm 경로 유지)
+- **BFP2 exp init을 첫 블록 DMA와 병렬화**: ~4 µs의 L1 stores를 ~30 µs DMA latency 뒤에 숨김
+- **Gamma DMA 단일 배치**: fused reader들이 Kt 번의 barrier를 1번으로 축소
+- **Phase 1a tile-regs 병합**: square + accumulate를 `binary_dest_reuse_tiles<ELWADD, DEST_TO_SRCA>`로 한 cycle에 처리
+- **bfp4 production (30.15) 대비 +89%**, storage는 절반 (~600MB vs ~1.2GB)
+- **L1 norm→matmul 경로**: 121개 RMSNorm 중 QKV 제외한 ~97개 출력이 L1에 유지
+- **In-trace greedy argmax**: sample_token 6.37→0.16 ms
+- **lm_head bfp4**: DRAM BW 절반 (1.81→0.75 ms, PCC 0.9992 vs bf16)
+- **ROW_MAJOR argmax**: TILE 4.39→RM 2.26 ms
+- **QKV/O_proj/FFN 전부 packed_ternary**
+- **K-block pipelining**: in0_block_w = Kt/2, cb0/cb1 double-buffer
+- **True 2-bit DRAM** storage (BFP2_b + L1 exp 합성)
+- **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0). fused-norm mcast 변형 `reader_ternary_norm_sender.cpp` / `_receiver.cpp` 도 작동.
+- **정확도:** PCC 0.975 vs HF, fused vs 비-fused 경로 PCC > 0.9997 (max_diff 4–6 at std≈26)
+- **Dual RoPE:** fused / manual, `--no-fused-rope` 옵션
 
 ### 성능 진화 요약
 | 단계 | t/s | 주요 변화 |
@@ -37,6 +42,8 @@
 | 19. **ROW_MAJOR argmax** | **47.68** | to_layout(RM) + argmax(RM). TILE 4.39→RM 2.26 ms. branchless bf16 비교 커널 |
 | 20. **streaming decode O(1)** | **48.18** | tokenizer.decode 전체 시퀀스 재디코딩 → per-token O(1) 변경 |
 | 21. **L1 norm→matmul + SDPA L1** | **51.58** | 120 norm→matmul 중간값 + SDPA 출력을 L1 유지. DRAM 왕복 제거 |
+| 22. **Fused RMSNorm + ternary_matmul (QKV)** | **~50.4 (p50 17.5ms = 57.1 t/s)** | QKV 경로의 RMSNorm이 matmul 커널 안에서 실행. BFP2 exp init을 첫 블록 DMA와 병렬화. Gamma DMA 단일 배치. Phase 1a tile-regs 병합. |
+| 23. **Multicore argmax (trace-primed)** | **55.83 (p50 15.5ms)** | `ttnn.argmax(use_multicore=True)` vocab reduction을 110 cores로 병렬화. 첫 호출 write가 trace capture 내에서 거부되므로 warmup 경로에서 호출해 상태 초기화. 1.99→0.076 ms (26×) 단독 측정, 전체 -1.68 ms. |
 
 ---
 
@@ -139,6 +146,58 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 
 ---
 
+## Track D: Fused RMSNorm + ternary_matmul — ✅ DONE (QKV only)
+
+### 완료 (2026-04-17)
+- [x] Fused compute kernel `fused_norm_ternary_mm_compute.cpp`
+  - Phase 1 RMSNorm: `REDUCE_ROW` + `mul_tiles_bcast_cols` (scalar 위치 문제
+    해결), gamma는 `mul_tiles_bcast_rows` (batch-32 행 브로드캐스트)
+  - Phase 1a tile-regs 병합: square+accumulate 1 cycle
+  - Phase 2 normalize + gamma
+  - Phase 3 matmul (기존 matmul_block)
+- [x] Unicast fused reader `reader_ternary_norm_act.cpp`
+- [x] Mcast fused sender/receiver `reader_ternary_norm_{sender,receiver}.cpp`
+  (cb_raw 대상, 모든 Kt 타일을 한 번의 mcast로)
+- [x] BFP2 exp init을 첫 weight-block DMA와 병렬화 (writer)
+- [x] Gamma DMA 단일 배치 + 단일 barrier (Kt≤128 제약: cb_gamma = Kt tiles)
+- [x] Program factory: fuse_norm 경로, Mt/Kt/Nt runtime args, gamma accessor
+- [x] `ttnn.experimental.ternary_matmul`에 `norm_weight`/`norm_epsilon` 추가
+- [x] `Linear.__call__`이 norm_weight 통과
+- [x] `generator_batch32.py`: QKV에서 fused 경로 사용
+
+### 설계 메모
+- o_proj/gate_up/down_proj는 trace-level에서 회귀. baseline이 이미
+  L1 norm→matmul 경로라서 fused 커널의 단일 launch 이득이 상쇄됨.
+  QKV는 residual stream이 DRAM에서 오므로 ($cb\_raw$ DMA는 어차피 필요)
+  fused가 net positive. 자세한 실험 결과는 `memory/project_fused_norm_result.md`.
+- down_proj (K=6912, Kt=216)는 cb_raw + cb_gamma + cb_in0 = 432KB × 3 = 1.3MB로
+  L1 초과. Python 레이어에서 `Kt ≤ 128` 가드. 현재는 사용 안 함.
+
+---
+
+## Track E: Attention core-range 분할 — 🚧 계획 단계
+
+### 목표
+두 개의 tt-metal fused op가 K/V (또는 Q/K)가 겹치지 않는 코어 범위에 있길
+요구합니다:
+- `ttnn.experimental.rotary_embedding_llama_fused_qk` (~0.4 ms 예상)
+- `ttnn.experimental.paged_fused_update_cache` (~0.3 ms 예상)
+
+결합 ~0.7 ms/step = p50 17.5 → ~16.8 ms = ~60 t/s 도달 가능.
+
+### 차단 원인
+`nlp_create_qkv_heads_decode`가 Q/K/V를 모두 같은 코어 그리드에 내보냄
+(`attention.py:1039`, `attention.py:1082-1085` 주석 참조).
+
+### 권장 접근
+**Option A (post-split re-shard)**: `nlp_create_qkv_heads_decode` 이후
+`to_memory_config`로 Q, K, V를 disjoint shard spec에 재배치. Python-only
+변경 — tt-metal 수정 없음.
+
+전체 설계 및 성공 기준: `docs/plan_attention_core_range_split.md`.
+
+---
+
 ## RoPE
 - [x] `rotary_embedding_llama` decode mode 통합 (fused RoPE)
 - [x] Q/K weight permutation (HF half-split → TT adjacent-pair)
@@ -158,26 +217,32 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 ---
 
 ## 성능 참조 (최종)
-| dtype | avg t/s | p50 ms | p50 t/s | storage (2.4B) |
-|---|---:|---:|---:|---:|
-| **packed_ternary (current)** | **51.58** | **17.8** | **56.2** | **~600 MB** |
-| packed_ternary (pre-L1) | 48.18 | 19.3 | 51.8 | ~600 MB |
-| packed_ternary (pre-session) | 37.52 | 25 | 40 | ~600 MB |
-| packed_ternary (Track A final) | 34.81 | 26 | 38.5 | ~600 MB |
-| bfp4 production | 30.15 | 31 | 32.3 | ~1.2 GB |
-| bf16 | ~16 | ~62 | ~16 | ~4.8 GB |
+| dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | storage (2.4B) |
+|---|---:|---:|---:|---:|---:|---:|
+| **packed_ternary (current, 2026-04-17 +multicore argmax, 64 tok)** | **15.5** | **64.5** | **15.0** | **66.7** | **55.83** | **~600 MB** |
+| packed_ternary (2026-04-17 fused QKV-norm, 64 tok) | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
+| packed_ternary (2026-04-16, 128 tok)             | 17.8    | 56.2    | —       | —       | — | ~600 MB |
+| packed_ternary (pre-L1)                          | 19.3    | 51.8    | —       | —       | ~600 MB |
+| packed_ternary (pre-session)                     | 25      | 40      | —       | —       | ~600 MB |
+| packed_ternary (Track A final)                   | 26      | 38.5    | —       | —       | ~600 MB |
+| bfp4 production                                  | 31      | 32.3    | —       | —       | ~1.2 GB |
+| bf16                                             | ~62     | ~16     | —       | —       | ~4.8 GB |
 
-측정 조건: batch32 + trace + fused RoPE + 128 tokens.
+측정 조건: batch32 + trace + fused RoPE.
 
-### Trace kernel 내부 분해 (추정 ~16.4 ms, L1 norm 적용 후)
+### Trace kernel 내부 분해 (실측 14.7 ms, multicore argmax 적용 후)
 | 항목 | ms | % |
 |---|---:|---:|
-| RMSNorm (121×~0.06) | ~6.5 | 40% |
-| ternary matmul (120×) | ~4.5 | 27% |
-| argmax RM (to_layout + argmax) | ~1.8 | 11% |
+| RMSNorm (non-fused norms: ~91×) | ~3.0 | 20% |
+| ternary matmul (120×, QKV는 norm 포함) | ~4.7 | 32% |
+| argmax RM (to_layout + argmax multicore) | 0.08 | 1% |
 | lm_head bfp4 | 0.75 | 5% |
-| glue (SDPA, heads, RoPE, slice, add) | ~1.5 | 9% |
-| non-trace overhead | ~1.3 | 8% |
+| glue (SDPA, heads, RoPE, slice, add) | ~5 | 34% |
+| non-trace overhead | ~0.8 | 5% |
+
+이 분해는 추정치. 실측은 category-sorted 비-trace profile (`profile_decode.py`)에서
+rope/create_qkv_heads/slice_gate_up이 각각 top 3 (~180μs in non-trace).
+trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 — 단일 병목 없음.
 
 ### L1 메모리 최적화 실험 결과 (2026-04-16)
 | 변경 | 결과 | 효과 |
@@ -190,11 +255,12 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 | lm_head matmul 출력 L1 | FAIL | trace 중 L1 할당 초과 (8.2MB TILE output) |
 
 ### 미래 커널 레벨 최적화 (C++ 필요)
-| 최적화 | 예상 효과 | 내용 |
+| 최적화 | 예상 효과 | 상태 |
 |---|---|---|
-| RMSNorm+matmul 커널 퓨전 | -2~3ms | norm compute를 weight DMA와 overlap |
-| lm_head+argmax 커널 퓨전 | -1~2ms | matmul pack 단계에서 partial max 추적, 128K logits 미생성 |
-| Track C weight column sharing | -1~2ms | weight column-wise mcast (activation은 L1로 이미 해결) |
+| RMSNorm+matmul 커널 퓨전 | -0.3ms (QKV) / 나머지 회귀 | ✅ QKV 적용 완료 (Track D) |
+| Attention core-range 분할 → `rotary_embedding_llama_fused_qk` + `paged_fused_update_cache` | -0.7ms 예상 | 🚧 계획 단계 (Track E, 설계 문서: `docs/plan_attention_core_range_split.md`) |
+| lm_head+argmax 커널 퓨전 | -1~2ms | ✅ 사실상 해결 (multicore argmax로 1.68 ms 회수) |
+| Track C weight column sharing | +1~2 t/s (재평가) | 재평가 — L1 norm이 activation 증폭을 이미 해결 |
 
 ---
 

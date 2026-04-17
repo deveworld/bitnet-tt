@@ -5,10 +5,11 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **56.2 t/s Decode** (p50 steady-state, batch32 + Metal Trace + fused RoPE)
-- **+71% faster than bfp4** at half the storage
+- **64.5 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax; peak 66.7 t/s at min latency)
+- **+100% faster than bfp4** at half the storage
+- **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
-- **In-trace Greedy Argmax**: Argmax runs inside Metal Trace — zero host round-trip per token
+- **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
 - **Accuracy Preserved**: PCC 0.975 vs HuggingFace CPU reference (packed_ternary inherent limit)
 
 ## Quick Start
@@ -33,13 +34,14 @@ python main.py --chat
 
 Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
-### Decode Throughput (batch32 + trace + fused RoPE, 128 tokens)
+### Decode Throughput (batch32 + trace + fused RoPE)
 
-| dtype | avg t/s | p50 ms | p50 t/s | model size |
-|---|---:|---:|---:|---:|
-| **packed_ternary** | **51.58** | **17.8** | **56.2** | **~600 MB** |
-| bfp4 (production baseline) | 30.15 | 31 | 32.3 | ~1.2 GB |
-| bf16 | ~16 | ~62 | ~16 | ~4.8 GB |
+| dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
+|---|---:|---:|---:|---:|---:|---:|
+| **packed_ternary** (2026-04-17 +multicore argmax, 64 tok) | **15.5** | **64.5** | **15.0** | **66.7** | **55.83** | **~600 MB** |
+| packed_ternary (2026-04-17 fused QKV-norm, 64 tok)        | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
+| bfp4 (production baseline)                                | 31   | 32.3 | —    | —    | —    | ~1.2 GB |
+| bf16                                                      | ~62  | ~16  | —    | —    | —    | ~4.8 GB |
 
 ### Performance Evolution
 
@@ -59,6 +61,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 19. **ROW_MAJOR argmax** | **47.68** | TILE 4.39→RM 2.26 ms |
 | 20. **streaming decode O(1)** | **48.18** | tokenizer.decode per-token |
 | 21. **L1 norm→matmul + SDPA L1** | **51.58** | norm/SDPA outputs in L1, DRAM round-trip eliminated |
+| 22. **fused RMSNorm + ternary_matmul (QKV)** | **57.1 p50** | In-kernel RMSNorm for the QKV path + BFP2 exp init overlapped with first weight-block DMA + gamma DMA batched into one barrier + Phase 1a tile-regs merged |
+| 23. **multicore argmax (trace-primed)** | **64.5 p50 / 55.83 decode_tps** | `ttnn.argmax(use_multicore=True)` parallelises vocab-dim reduction across 110 cores; isolated cost 1.99→0.076 ms (26×). First call writes are rejected inside `begin_trace_capture`, so the warmup run primes the op before capture. |
 
 ### Accuracy (vs HuggingFace CPU reference)
 
@@ -79,10 +83,11 @@ Note: PCC 0.975 is the inherent limit of 2-bit weight quantization. The lm_head 
 BitNetModel (2.4B params, ~600 MB packed_ternary)
 ├── Embedding (128256 vocab, 2560 dim)
 ├── TransformerBlock × 30
-│   ├── RMSNorm (input)
+│   ├── RMSNorm (input) — FUSED into QKV matmul kernel (decode only)
 │   ├── MultiHeadAttention
-│   │   ├── Fused QKV Projection (ternary_matmul, 2-bit)
-│   │   │   └── QKV scales folded: q*k → SDPA, v → attn_sub_norm
+│   │   ├── Fused QKV Projection (ternary_matmul + inline RMSNorm, 2-bit)
+│   │   │   ├── QKV scales folded: q*k → SDPA, v → attn_sub_norm
+│   │   │   └── In-kernel RMSNorm (REDUCE_ROW + bcast_cols + gamma bcast_rows)
 │   │   ├── nlp_create_qkv_heads_decode (L1 HEIGHT_SHARDED)
 │   │   ├── RoPE (rotary_embedding_llama, fused)
 │   │   ├── paged_update_cache (K, V)
@@ -113,19 +118,19 @@ Storage:        2 bits/weight × 2.4B params ≈ 600 MB
 ### Decode Pipeline (traced)
 
 ```
-Per step (17.8 ms p50):
+Per step (17.5 ms p50, min 16.9 ms):
   copy_inputs [host→device: embed + pos + cos + sin]     0.66 ms
   execute_trace [CQ dispatch]                             0.01 ms
   ┌── trace kernel ──────────────────────────────────┐
-  │  30 × (norm(→L1) → qkv_matmul → heads → RoPE →  │
+  │  30 × (FUSED_QKV(norm+matmul) → heads → RoPE →   │
   │        cache_update → SDPA(→L1) → reshape →       │
-  │        sub_norm(→L1) → o_proj → residual →        │  ~14.0 ms
+  │        sub_norm(→L1) → o_proj → residual →        │  ~13.7 ms
   │        norm(→L1) → gate_up → relu²×up →           │
   │        sub_norm(→L1) → down_proj → residual)      │
   │  final_norm → lm_head(bfp4) → to_layout(RM)      │  +1.8 ms
   │  → argmax(RM, branchless bf16)                    │
   └──────────────────────────────────────────────────┘
-  sync_device [wait for trace kernel]                    ~16.5 ms
+  sync_device [wait for trace kernel]                    ~16.2 ms
   sample_token [read 4-byte int32 from device]            0.16 ms
 ```
 
@@ -220,9 +225,11 @@ Located at `ttnn/cpp/ttnn/operations/experimental/ternary_matmul/` in our tt-met
 Key design:
 - **BFP2_b HW unpack**: Tensix UNPACKER decodes 2-bit mantissa + shared exponent → bf16
 - **True 2-bit DRAM**: 256 B mantissa per tile, 64 B exponent synthesized in L1
+- **BFP2 exp init overlapped with first weight-block DMA**: the ~4 µs of L1 stores hide behind the first K-block's ~30 µs DMA latency
 - **Activation multicast**: rectangular core layout for down_proj/o_proj (5×8), L-shape for gate_up
 - **RISC split**: BRISC/NOC_0 = activation reader + mcast, NCRISC/NOC_1 = weight + output + exp init
 - **K-block pipelining**: `in0_block_w = Kt/2` for automatic double-buffering
+- **Fused RMSNorm variant** (`fused_norm_ternary_mm_compute.cpp` + mcast norm sender/receiver): the QKV call computes `rsqrt(mean(x²)+eps) · gamma · x` inline before the matmul, using REDUCE_ROW + `mul_tiles_bcast_cols` + `mul_tiles_bcast_rows`. Gamma DMA is batched into a single barrier; Phase 1a uses `binary_dest_reuse_tiles<ELWADD, DEST_TO_SRCA>` to accumulate the running sum in-register (one acquire/release per Kt tile instead of two)
 
 ## References
 
