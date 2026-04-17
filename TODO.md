@@ -272,10 +272,13 @@ trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 — 단
 ### 미래 커널 레벨 최적화 (C++ 필요)
 | 최적화 | 예상 효과 | 상태 |
 |---|---|---|
-| RMSNorm+matmul 커널 퓨전 | -0.3ms (QKV) / 나머지 회귀 | ✅ QKV 적용 완료 (Track D) |
-| Attention core-range 분할 → `rotary_embedding_llama_fused_qk` + `paged_fused_update_cache` | -0.7ms 예상 | 🚧 계획 단계 (Track E, 설계 문서: `docs/plan_attention_core_range_split.md`) |
+| RMSNorm+matmul 커널 퓨전 | -0.3ms (QKV) / 나머지 회귀 | ✅ QKV 적용 완료 (Track D). 재확인 (2026-04-17): sharded rms_norm 도입 이후에도 o_proj fused 재시도 회귀 (+1.1 ms). 포기. |
+| Attention core-range 분할 (fused_qk + paged_fused_update) | 실측 -0.18 ms 최대 | 🚧 infrastructure 필요 (2*batch cos/sin/trans_mat 정비). 2× rotary_embedding_llama 26 μs 실측 기준 이득 marginal. |
 | lm_head+argmax 커널 퓨전 | -1~2ms | ✅ 사실상 해결 (multicore argmax로 1.68 ms 회수) |
-| Track C weight column sharing | +1~2 t/s (재평가) | 재평가 — L1 norm이 activation 증폭을 이미 해결 |
+| Split lm_head | - | ✅ 1.5 ms 회수 (4-way + L1 chunks). |
+| Sharded rms_norm (width multicore) | - | ✅ 2.6 ms 회수 (91 norms × 25 μs 절감, tune grid 추가 0.3 ms). |
+| nlp_concat_heads_decode (SDPA out) | - | ✅ 0.27 ms 회수 (reshape 대체). |
+| Track C weight column sharing | +1~2 t/s (재평가) | 재평가 — L1 norm이 activation 증폭을 이미 해결. |
 
 ---
 
