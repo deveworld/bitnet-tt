@@ -186,9 +186,14 @@ class FeedForward:
 
         # Apply sub-norm before down projection (BitNet-specific!)
         # In decode mode with packed_ternary weights, the ternary_matmul
-        # kernel fuses RMSNorm + matmul in-kernel, eliminating the separate
-        # norm launch.
-        if mode == "decode" and self.down_proj._use_packed_ternary:
+        # kernel can fuse RMSNorm + matmul in-kernel, eliminating the
+        # separate norm launch. But for down_proj, K = intermediate_size
+        # (Kt = 216 for K=6912) makes the fused kernel's cb_raw + cb_in0
+        # activation buffers dominate L1 (~864 KB/core), regressing
+        # steady-state throughput despite the per-call microbench win.
+        # Threshold: only fuse when Kt <= 128 tiles.
+        Kt = self.down_proj.in_features // 32
+        if mode == "decode" and self.down_proj._use_packed_ternary and Kt <= 128:
             return self.down_proj(
                 hidden,
                 norm_weight=self.ffn_sub_norm.weight,
