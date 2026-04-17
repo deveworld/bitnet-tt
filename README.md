@@ -5,8 +5,8 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **86.2 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks; peak 91.7 t/s at min latency)
-- **+167% faster than bfp4** at half the storage
+- **88.5 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode; peak 93.5 t/s at min latency)
+- **+174% faster than bfp4** at half the storage
 - **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
 - **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
@@ -38,7 +38,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary** (2026-04-17 +L1 chunks, 64 tok)        | **11.6** | **86.2** | **10.9** | **91.7** | **70.51** | **~600 MB** |
+| **packed_ternary** (2026-04-17 +concat_heads_decode, 64 tok) | **11.3** | **88.5** | **10.7** | **93.5** | **70.98** | **~600 MB** |
+| packed_ternary (2026-04-17 +L1 chunks, 64 tok)            | 11.6 | 86.2 | 10.9 | 91.7 | 70.51 | ~600 MB |
 | packed_ternary (2026-04-17 +split lm_head, 64 tok)        | 11.7 | 85.5 | 11.0 | 90.9 | 68.57 | ~600 MB |
 | packed_ternary (2026-04-17 +tuned shard grid, 64 tok)     | 13.2 | 75.8 | 12.4 | 80.6 | 63.46 | ~600 MB |
 | packed_ternary (2026-04-17 +sharded rms_norm, 64 tok)     | 13.5 | 74.1 | 12.8 | 78.1 | 62.66 | ~600 MB |
@@ -71,6 +72,7 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 25. **tune shard grid per hidden size** | **75.8 p50 / 63.46 decode_tps** | Measured sweep: H=2560 best at y=2,x=8 (16 cores, 28 us), H=6912 best at y=3,x=8 (24 cores, 34 us) vs the single-row y=1,x=8 default. |
 | 26. **split lm_head matmul** | **85.5 p50 / 68.57 decode_tps** | Vocab-dim split lm_head into 4 chunks + concat. Full-vocab matmul picks a per-core config sized for 128256 and runs at 2.2 ms in trace; 4-way split picks tighter per-chunk configs that total 0.72 ms. |
 | 27. **lm_head chunk outputs to L1** | **86.2 p50 / 70.51 decode_tps** | Chunks and concat stay in L1 so the downstream to_layout+argmax chain doesn't round-trip through DRAM (-40 us/step). |
+| 28. **nlp_concat_heads_decode after SDPA** | **88.5 p50 / 70.98 decode_tps** | Replaces ttnn.reshape for SDPA output. SDPA GQA can't emit sharded output so we reshard first; the concat_heads kernel still nets -9 us/layer vs reshape (-0.27 ms/step). |
 
 ### Accuracy (vs HuggingFace CPU reference)
 
