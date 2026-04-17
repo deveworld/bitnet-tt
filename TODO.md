@@ -2,8 +2,9 @@
 
 ## 현재 상태 (2026-04-17)
 
-### 달성 — p50 15.5 ms / 55.8 t/s (min 15.0 ms, 64 tok), bfp4 대비 +85%
-- **p50 15.5 ms, min 15.0 ms, decode_tps ≈ 55.8 t/s** (batch32 + trace + fused RoPE + multicore argmax, 64-tok) — Blackhole p150a
+### 달성 — p50 13.5 ms / 62.7 t/s (min 12.8 ms, 64 tok), bfp4 대비 +108%
+- **p50 13.5 ms, min 12.8 ms, decode_tps ≈ 62.66 t/s** (batch32 + trace + fused RoPE + multicore argmax + sharded rms_norm, 64-tok) — Blackhole p150a
+- **Sharded rms_norm**: `ttnn.rms_norm`이 width-sharded 입력에 대해 자동으로 multicore 커널 디스패치. `RMSNorm.enable_sharded_fast_path()`로 91개 non-fused norm 모두에 적용 (reshard → rms_norm → sharded_to_interleaved). 56 → 33 μs/call (-41%), trace kernel 14.7 → 12.1 ms (-2.6 ms).
 - **Multicore argmax (trace-primed)**: `ttnn.argmax(..., use_multicore=True)`로 vocab-dim reduction을 코어 그리드 전체로 병렬화. 첫 호출 시 write가 trace 내에서 거부되므로 warmup 경로에서 한 번 호출해 상태 초기화. 1.99 → 0.076 ms (26×), 단계당 -1.68 ms.
 - **Fused RMSNorm + ternary_matmul (QKV)**: RMSNorm이 matmul 커널 안에서 실행됨. QKV만 적용 (o_proj/gate_up/down_proj는 trace-level 회귀로 기본 L1-norm 경로 유지)
 - **BFP2 exp init을 첫 블록 DMA와 병렬화**: ~4 µs의 L1 stores를 ~30 µs DMA latency 뒤에 숨김
@@ -44,6 +45,7 @@
 | 21. **L1 norm→matmul + SDPA L1** | **51.58** | 120 norm→matmul 중간값 + SDPA 출력을 L1 유지. DRAM 왕복 제거 |
 | 22. **Fused RMSNorm + ternary_matmul (QKV)** | **~50.4 (p50 17.5ms = 57.1 t/s)** | QKV 경로의 RMSNorm이 matmul 커널 안에서 실행. BFP2 exp init을 첫 블록 DMA와 병렬화. Gamma DMA 단일 배치. Phase 1a tile-regs 병합. |
 | 23. **Multicore argmax (trace-primed)** | **55.83 (p50 15.5ms)** | `ttnn.argmax(use_multicore=True)` vocab reduction을 110 cores로 병렬화. 첫 호출 write가 trace capture 내에서 거부되므로 warmup 경로에서 호출해 상태 초기화. 1.99→0.076 ms (26×) 단독 측정, 전체 -1.68 ms. |
+| 24. **Sharded multicore rms_norm** | **62.66 (p50 13.5ms)** | `ttnn.rms_norm`이 width-sharded 입력에 대해 자동 multicore 경로. 91 non-fused norms 모두 sharded 경로 사용 (reshard→rms→desharded). 56→33 μs/call, trace kernel -2.6 ms. |
 
 ---
 
@@ -219,7 +221,8 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 ## 성능 참조 (최종)
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | storage (2.4B) |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary (current, 2026-04-17 +multicore argmax, 64 tok)** | **15.5** | **64.5** | **15.0** | **66.7** | **55.83** | **~600 MB** |
+| **packed_ternary (current, 2026-04-17 +sharded rms_norm, 64 tok)** | **13.5** | **74.1** | **12.8** | **78.1** | **62.66** | **~600 MB** |
+| packed_ternary (2026-04-17 +multicore argmax, 64 tok) | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
 | packed_ternary (2026-04-17 fused QKV-norm, 64 tok) | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
 | packed_ternary (2026-04-16, 128 tok)             | 17.8    | 56.2    | —       | —       | — | ~600 MB |
 | packed_ternary (pre-L1)                          | 19.3    | 51.8    | —       | —       | ~600 MB |
@@ -230,15 +233,15 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 
 측정 조건: batch32 + trace + fused RoPE.
 
-### Trace kernel 내부 분해 (실측 14.7 ms, multicore argmax 적용 후)
+### Trace kernel 내부 분해 (실측 12.1 ms, sharded rms_norm 적용 후)
 | 항목 | ms | % |
 |---|---:|---:|
-| RMSNorm (non-fused norms: ~91×) | ~3.0 | 20% |
-| ternary matmul (120×, QKV는 norm 포함) | ~4.7 | 32% |
+| RMSNorm (91× sharded multicore) | ~3.0 | 25% |
+| ternary matmul (120×, QKV는 norm 포함) | ~4.0 | 33% |
 | argmax RM (to_layout + argmax multicore) | 0.08 | 1% |
-| lm_head bfp4 | 0.75 | 5% |
-| glue (SDPA, heads, RoPE, slice, add) | ~5 | 34% |
-| non-trace overhead | ~0.8 | 5% |
+| lm_head bfp4 | 0.75 | 6% |
+| glue (SDPA, heads, RoPE, slice, add, sharded_to_interleaved) | ~3.5 | 29% |
+| non-trace overhead | ~1.4 | 11% |
 
 이 분해는 추정치. 실측은 category-sorted 비-trace profile (`profile_decode.py`)에서
 rope/create_qkv_heads/slice_gate_up이 각각 top 3 (~180μs in non-trace).

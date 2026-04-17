@@ -5,8 +5,8 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **64.5 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax; peak 66.7 t/s at min latency)
-- **+100% faster than bfp4** at half the storage
+- **74.1 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + sharded rms_norm; peak 78.1 t/s at min latency)
+- **+129% faster than bfp4** at half the storage
 - **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
 - **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
@@ -38,7 +38,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary** (2026-04-17 +multicore argmax, 64 tok) | **15.5** | **64.5** | **15.0** | **66.7** | **55.83** | **~600 MB** |
+| **packed_ternary** (2026-04-17 +sharded rms_norm, 64 tok) | **13.5** | **74.1** | **12.8** | **78.1** | **62.66** | **~600 MB** |
+| packed_ternary (2026-04-17 +multicore argmax, 64 tok)     | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
 | packed_ternary (2026-04-17 fused QKV-norm, 64 tok)        | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
 | bfp4 (production baseline)                                | 31   | 32.3 | —    | —    | —    | ~1.2 GB |
 | bf16                                                      | ~62  | ~16  | —    | —    | —    | ~4.8 GB |
@@ -63,6 +64,7 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 21. **L1 norm→matmul + SDPA L1** | **51.58** | norm/SDPA outputs in L1, DRAM round-trip eliminated |
 | 22. **fused RMSNorm + ternary_matmul (QKV)** | **57.1 p50** | In-kernel RMSNorm for the QKV path + BFP2 exp init overlapped with first weight-block DMA + gamma DMA batched into one barrier + Phase 1a tile-regs merged |
 | 23. **multicore argmax (trace-primed)** | **64.5 p50 / 55.83 decode_tps** | `ttnn.argmax(use_multicore=True)` parallelises vocab-dim reduction across 110 cores; isolated cost 1.99→0.076 ms (26×). First call writes are rejected inside `begin_trace_capture`, so the warmup run primes the op before capture. |
+| 24. **sharded rms_norm (width-sharded multicore)** | **74.1 p50 / 62.66 decode_tps** | `ttnn.rms_norm` auto-dispatches a multicore kernel on width-sharded input; isolated cost 56→33 us/call. All 91 non-fused norms reshard input → run → convert back, via `RMSNorm.enable_sharded_fast_path()`. |
 
 ### Accuracy (vs HuggingFace CPU reference)
 
