@@ -521,6 +521,19 @@ class Batch32Generator:
         # Store embedding weight on host for trace execution
         self._embedding_weight_host = ttnn.to_torch(model.embed_tokens.weight)
 
+        # Enable the sharded multicore rms_norm path on every non-fused
+        # RMSNorm in the model. ttnn.rms_norm dispatches a single-core
+        # kernel on interleaved input (~56 us / call on [1,1,32,2560]);
+        # with a width-sharded input it drops to ~33 us / call. Per decode
+        # step we have 30x post_attention_layernorm + 30x attn_sub_norm
+        # + 30x ffn_sub_norm + 1x final_norm = 91 calls, so the per-call
+        # saving compounds.
+        for layer in self.model.layers:
+            layer.post_attention_layernorm.enable_sharded_fast_path()
+            layer.self_attn.attn_sub_norm.enable_sharded_fast_path()
+            layer.mlp.ffn_sub_norm.enable_sharded_fast_path()
+        self.model.norm.enable_sharded_fast_path()
+
         # KV caches (allocated per generation)
         self._kv_caches: Optional[list[KVCache]] = None
 

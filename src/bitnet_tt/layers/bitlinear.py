@@ -342,6 +342,12 @@ class RMSNorm:
         self.device = device
         self.eps = eps
         self.weight: ttnn.Tensor | None = None
+        # Optional sharded fast path: when set, __call__ reshards input to
+        # _shard_cfg, runs rms_norm on the sharded tensor (which dispatches
+        # a multicore kernel), then converts back to the caller's requested
+        # memory_config. ttnn.rms_norm single-core kernel is ~56 us per
+        # call on [1,1,32,2560]; sharded multicore is ~33 us.
+        self._shard_cfg: "ttnn.MemoryConfig | None" = None
 
     def load_weights(self, weight: NDArray[np.floating]) -> None:
         """
@@ -352,6 +358,24 @@ class RMSNorm:
         """
         weight_2d = weight.reshape(1, 1, 1, -1).astype(np.float32)
         self.weight = numpy_to_ttnn(weight_2d, self.device)
+
+    def enable_sharded_fast_path(self, num_cores: int = 8) -> bool:
+        """Pre-compute a width-sharded spec for the multicore rms_norm path.
+
+        Returns True if the spec is valid for this hidden size, False if
+        the hidden size does not split evenly into ``num_cores`` chunks
+        of tile-aligned width.
+        """
+        if self.hidden_size % (32 * num_cores) != 0:
+            return False
+        self._shard_cfg = ttnn.create_sharded_memory_config(
+            shape=(32, self.hidden_size // num_cores),
+            core_grid=ttnn.CoreGrid(y=1, x=num_cores),
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        return True
 
     def __call__(self, x: ttnn.Tensor, memory_config=None) -> ttnn.Tensor:
         """
@@ -365,5 +389,18 @@ class RMSNorm:
         Returns:
             Normalized tensor
         """
+        if self._shard_cfg is not None:
+            x_sh = ttnn.to_memory_config(x, self._shard_cfg)
+            out_sh = ttnn.rms_norm(
+                x_sh,
+                epsilon=self.eps,
+                weight=self.weight,
+                memory_config=self._shard_cfg,
+            )
+            ttnn.deallocate(x_sh)
+            out_mem = memory_config if memory_config is not None else ttnn.L1_MEMORY_CONFIG
+            out = ttnn.sharded_to_interleaved(out_sh, out_mem)
+            ttnn.deallocate(out_sh)
+            return out
         return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight,
                              memory_config=memory_config)
