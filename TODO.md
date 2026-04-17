@@ -2,8 +2,9 @@
 
 ## 현재 상태 (2026-04-17)
 
-### 달성 — p50 13.2 ms / 63.5 t/s (min 12.4 ms, 64 tok), bfp4 대비 +111%
-- **p50 13.2 ms, min 12.4 ms, decode_tps ≈ 63.46 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm, 64-tok) — Blackhole p150a
+### 달성 — p50 11.7 ms / 68.6 t/s (min 11.0 ms, 64 tok), bfp4 대비 +127%
+- **p50 11.7 ms, min 11.0 ms, decode_tps ≈ 68.57 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head, 64-tok) — Blackhole p150a
+- **Split lm_head matmul (4-way)**: 단일 matmul이 vocab=128256 전체에 맞춰 per_core config를 잡아 ~2.2 ms/step 소요되던 것을 4개 chunk로 쪼개 각각 tight per-core config 적용. 측정: 2197 → 722 μs (-67%). trace kernel 11.9 → 10.4 ms.
 - **Shard grid tuning**: H=2560은 y=2,x=8 (16 cores), H=6912은 y=3,x=8 (24 cores)로 per-core width 축소 → 멀티코어 reduction이 per-core sum 비용 dominant. 28 μs/call (H=2560), 34 μs/call (H=6912). -0.3 ms/step.
 - **Sharded rms_norm**: `ttnn.rms_norm`이 width-sharded 입력에 대해 자동으로 multicore 커널 디스패치. `RMSNorm.enable_sharded_fast_path()`로 91개 non-fused norm 모두에 적용 (reshard → rms_norm → sharded_to_interleaved). 56 → 33 μs/call (-41%), trace kernel 14.7 → 12.1 ms (-2.6 ms).
 - **Multicore argmax (trace-primed)**: `ttnn.argmax(..., use_multicore=True)`로 vocab-dim reduction을 코어 그리드 전체로 병렬화. 첫 호출 시 write가 trace 내에서 거부되므로 warmup 경로에서 한 번 호출해 상태 초기화. 1.99 → 0.076 ms (26×), 단계당 -1.68 ms.
@@ -48,6 +49,7 @@
 | 23. **Multicore argmax (trace-primed)** | **55.83 (p50 15.5ms)** | `ttnn.argmax(use_multicore=True)` vocab reduction을 110 cores로 병렬화. 첫 호출 write가 trace capture 내에서 거부되므로 warmup 경로에서 호출해 상태 초기화. 1.99→0.076 ms (26×) 단독 측정, 전체 -1.68 ms. |
 | 24. **Sharded multicore rms_norm** | **62.66 (p50 13.5ms)** | `ttnn.rms_norm`이 width-sharded 입력에 대해 자동 multicore 경로. 91 non-fused norms 모두 sharded 경로 사용 (reshard→rms→desharded). 56→33 μs/call, trace kernel -2.6 ms. |
 | 25. **Shard grid tuning** | **63.46 (p50 13.2ms)** | H=2560 y=2x=8 (16 cores), H=6912 y=3x=8 (24 cores). 측정 기반 코어 그리드 최적화. -0.3 ms/step. |
+| 26. **Split lm_head (4-way)** | **68.57 (p50 11.7ms)** | vocab matmul 4 chunk으로 쪼개 per-core config 최적화. 2197→722 μs (-67%), trace kernel -1.5 ms. |
 
 ---
 
@@ -223,7 +225,8 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 ## 성능 참조 (최종)
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | storage (2.4B) |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary (current, 2026-04-17 +tuned shard grid, 64 tok)** | **13.2** | **75.8** | **12.4** | **80.6** | **63.46** | **~600 MB** |
+| **packed_ternary (current, 2026-04-17 +split lm_head, 64 tok)** | **11.7** | **85.5** | **11.0** | **90.9** | **68.57** | **~600 MB** |
+| packed_ternary (2026-04-17 +tuned shard grid, 64 tok) | 13.2 | 75.8 | 12.4 | 80.6 | 63.46 | ~600 MB |
 | packed_ternary (2026-04-17 +sharded rms_norm, 64 tok) | 13.5 | 74.1 | 12.8 | 78.1 | 62.66 | ~600 MB |
 | packed_ternary (2026-04-17 +multicore argmax, 64 tok) | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
 | packed_ternary (2026-04-17 fused QKV-norm, 64 tok) | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
@@ -236,15 +239,15 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 
 측정 조건: batch32 + trace + fused RoPE.
 
-### Trace kernel 내부 분해 (실측 12.1 ms, sharded rms_norm 적용 후)
+### Trace kernel 내부 분해 (실측 10.4 ms, split lm_head 적용 후)
 | 항목 | ms | % |
 |---|---:|---:|
 | RMSNorm (91× sharded multicore) | ~3.0 | 25% |
 | ternary matmul (120×, QKV는 norm 포함) | ~4.0 | 33% |
 | argmax RM (to_layout + argmax multicore) | 0.08 | 1% |
-| lm_head bfp4 | 0.75 | 6% |
-| glue (SDPA, heads, RoPE, slice, add, sharded_to_interleaved) | ~3.5 | 29% |
-| non-trace overhead | ~1.4 | 11% |
+| lm_head bfp4 (4-way split) | 0.72 | 6% |
+| glue (SDPA, heads, RoPE, slice, add, sharded_to_interleaved) | ~2.5 | 21% |
+| non-trace overhead | ~1.6 | 13% |
 
 이 분해는 추정치. 실측은 category-sorted 비-trace profile (`profile_decode.py`)에서
 rope/create_qkv_heads/slice_gate_up이 각각 top 3 (~180μs in non-trace).
