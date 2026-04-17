@@ -716,6 +716,8 @@ class Batch32Generator:
         # LM head: split along vocab-dim into N chunks to avoid the
         # single-kernel per_core_N blowup that makes the monolithic matmul
         # ~3x slower (microbench: 2.2 ms full vs 0.72 ms with split=4).
+        # Keep chunk outputs in L1 — the downstream concat+to_layout+argmax
+        # chain runs faster when its inputs aren't on DRAM (-40 us/step).
         lm_head_chunks = getattr(self.model, "lm_head_weight_chunks", None)
         if lm_head_chunks is not None:
             chunk_outs = []
@@ -724,9 +726,11 @@ class Batch32Generator:
                     out = ttnn.matmul(
                         hidden_single, w_chunk,
                         compute_kernel_config=self._decode_matmul_kernel_config,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
                     )
                 else:
-                    out = ttnn.matmul(hidden_single, w_chunk)
+                    out = ttnn.matmul(hidden_single, w_chunk,
+                                      memory_config=ttnn.L1_MEMORY_CONFIG)
                 chunk_outs.append(out)
             logits = ttnn.concat(chunk_outs, dim=-1)
             for out in chunk_outs:
