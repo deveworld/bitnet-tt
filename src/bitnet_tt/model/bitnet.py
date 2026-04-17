@@ -142,13 +142,48 @@ class BitNetModel:
         # packed_ternary noise). All three (bf16/bfp8/bfp4) produce the same
         # argmax on real model hidden states. bfp4 halves DRAM BW (1.81→0.75ms).
         lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
-        self.lm_head_weight = ttnn.from_torch(
-            torch.from_numpy(lm_head_t),
-            dtype=lm_head_dtype,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+
+        # Split lm_head weight along vocab dim. A single big ttnn.matmul for
+        # [1, K] x [K, 128256] picks a per-core config sized for the whole
+        # vocab and runs at ~2.2 ms in trace. Splitting into N smaller
+        # matmuls lets each pick a tighter per-core config; the N outputs
+        # concat back to the full logits in ~0.75 ms total (measured sweep:
+        # split=3 757us, split=4 722us). We pick the largest split that keeps
+        # each chunk tile-aligned (128256 % 32 == 0 so any divisor works).
+        V = lm_head_t.shape[1]
+        lm_head_split = 1
+        for candidate in (4, 3, 6, 2):
+            if V % candidate == 0 and (V // candidate) % 32 == 0:
+                lm_head_split = candidate
+                break
+        self._lm_head_split = lm_head_split
+
+        lm_head_tensor = torch.from_numpy(lm_head_t)
+        if lm_head_split == 1:
+            self.lm_head_weight = ttnn.from_torch(
+                lm_head_tensor,
+                dtype=lm_head_dtype,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            self.lm_head_weight_chunks: list[ttnn.Tensor] | None = None
+        else:
+            chunk_N = V // lm_head_split
+            self.lm_head_weight_chunks = [
+                ttnn.from_torch(
+                    lm_head_tensor[:, i * chunk_N:(i + 1) * chunk_N].contiguous(),
+                    dtype=lm_head_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                for i in range(lm_head_split)
+            ]
+            # Keep a canonical reference too; some callers probe
+            # self.lm_head_weight for shape. Use the first chunk by default
+            # and rely on lm_head_weight_chunks being preferred.
+            self.lm_head_weight = self.lm_head_weight_chunks[0]
 
     def __call__(
         self,
@@ -237,7 +272,14 @@ class BitNetModel:
         if self.lm_head_weight is None:
             raise RuntimeError("LM head weights not loaded.")
 
-        logits = ttnn.matmul(hidden_states, self.lm_head_weight)
+        chunks = getattr(self, "lm_head_weight_chunks", None)
+        if chunks is not None:
+            chunk_outs = [ttnn.matmul(hidden_states, w) for w in chunks]
+            logits = ttnn.concat(chunk_outs, dim=-1)
+            for o in chunk_outs:
+                ttnn.deallocate(o)
+        else:
+            logits = ttnn.matmul(hidden_states, self.lm_head_weight)
 
         return logits, updated_caches if use_cache else None
 

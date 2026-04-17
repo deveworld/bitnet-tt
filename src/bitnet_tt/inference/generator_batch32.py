@@ -713,14 +713,33 @@ class Batch32Generator:
             [0, 0, 0, 0],
             [1, 1, 1, self.config.hidden_size],
         )
-        if self._decode_matmul_kernel_config is not None:
-            logits = ttnn.matmul(
-                hidden_single,
-                self.model.lm_head_weight,
-                compute_kernel_config=self._decode_matmul_kernel_config,
-            )
+        # LM head: split along vocab-dim into N chunks to avoid the
+        # single-kernel per_core_N blowup that makes the monolithic matmul
+        # ~3x slower (microbench: 2.2 ms full vs 0.72 ms with split=4).
+        lm_head_chunks = getattr(self.model, "lm_head_weight_chunks", None)
+        if lm_head_chunks is not None:
+            chunk_outs = []
+            for w_chunk in lm_head_chunks:
+                if self._decode_matmul_kernel_config is not None:
+                    out = ttnn.matmul(
+                        hidden_single, w_chunk,
+                        compute_kernel_config=self._decode_matmul_kernel_config,
+                    )
+                else:
+                    out = ttnn.matmul(hidden_single, w_chunk)
+                chunk_outs.append(out)
+            logits = ttnn.concat(chunk_outs, dim=-1)
+            for out in chunk_outs:
+                ttnn.deallocate(out)
         else:
-            logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
+            if self._decode_matmul_kernel_config is not None:
+                logits = ttnn.matmul(
+                    hidden_single,
+                    self.model.lm_head_weight,
+                    compute_kernel_config=self._decode_matmul_kernel_config,
+                )
+            else:
+                logits = ttnn.matmul(hidden_single, self.model.lm_head_weight)
         ttnn.deallocate(hidden_single)
         logits = ttnn.reshape(logits, (1, 1, self.config.vocab_size))
 
