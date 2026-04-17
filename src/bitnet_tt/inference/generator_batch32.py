@@ -975,6 +975,13 @@ class Batch32Generator:
                 self._trace_inputs["cos"],
                 self._trace_inputs["sin"],
             )
+            # Prime argmax(use_multicore=True) program cache / semaphore state
+            # outside trace capture. The op's first call performs host-side
+            # writes that are rejected inside begin_trace_capture.
+            warmup_logits_rm = ttnn.to_layout(warmup_logits, ttnn.ROW_MAJOR_LAYOUT)
+            warmup_argmax = ttnn.argmax(warmup_logits_rm, dim=-1, use_multicore=True)
+            ttnn.deallocate(warmup_logits_rm)
+            ttnn.deallocate(warmup_argmax)
             self._set_kv_cache_length(current_pos + 1)
             ttnn.deallocate(warmup_logits)
             for cache, saved_len in zip(self._kv_caches or [], saved_seq_len):
@@ -991,7 +998,10 @@ class Batch32Generator:
             self._trace_inputs["sin"],
         )
         trace_logits_rm = ttnn.to_layout(self._trace_output, ttnn.ROW_MAJOR_LAYOUT)
-        self._trace_argmax_output = ttnn.argmax(trace_logits_rm, dim=-1)
+        # use_multicore=True parallelizes the vocab-dim reduction across the
+        # core grid instead of running a single-core kernel. Measured delta:
+        # ~1.9 ms -> ~0.08 ms per step (26x) for vocab=128256.
+        self._trace_argmax_output = ttnn.argmax(trace_logits_rm, dim=-1, use_multicore=True)
         self._set_kv_cache_length(current_pos + 1)
 
         ttnn.end_trace_capture(self.device, self._trace_id, cq_id=0)
