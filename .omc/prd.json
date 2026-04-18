@@ -68,7 +68,7 @@
         "Final commit pushed to origin/main and synced on TT server."
       ],
       "passes": true,
-      "notes": "Confirmation 128-tok bench + 32-step accuracy (commit ae1387e): decode_tps=71.89 t/s (baseline 72.93), p50=12.2 ms (baseline 11.8, +0.4 ms), PCC=0.9807 (+0.0054), greedy match=6/32 (baseline ~2/32, 3x). Accuracy gains (PCC +0.0054 >= 0.003 AND match 3x >= 2x) qualify for the constraint exception; p50 regression 0.4 ms is within the 0.5 ms cap. README.md + TODO.md updated (commit c93bc20). Auxiliary bench_accuracy_multi.py (commit 6268be8) adds a 5-prompt robustness harness; its initial run is pending and will be recorded as a follow-up note."
+      "notes": "Confirmation 128-tok bench + 32-step accuracy (commit ae1387e): decode_tps=71.89 t/s (baseline 72.93), p50=12.2 ms (baseline 11.8, +0.4 ms), PCC=0.9807 (+0.0054), greedy match=6/32 (baseline ~2/32, 3x). Accuracy gains (PCC +0.0054 >= 0.003 AND match 3x >= 2x) qualify for the constraint exception; p50 regression 0.4 ms is within the 0.5 ms cap. README.md + TODO.md updated (commit c93bc20). 5-prompt robustness (bench_accuracy_multi, 2026-04-18): argmax match 5/5, mean PCC 0.9374, min PCC 0.7594 on a sharp-logit Tolkien opener whose argmax still matches HF; four out of five prompts clear PCC 0.97. Full breakdown in docs/bfp8_lm_head_multi_prompt.md."
     }
   ]
 }
