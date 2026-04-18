@@ -14,7 +14,20 @@ Performance optimizations based on tt_transformers patterns.
 from typing import Optional
 
 import numpy as np
+import os
 import ttnn
+
+_BITNET_FP32_RESIDUAL = os.environ.get("BITNET_FP32_RESIDUAL", "").strip() in ("1", "true", "yes", "on")
+
+def _residual_add(residual, hidden_states):
+    if not _BITNET_FP32_RESIDUAL:
+        return ttnn.add(residual, hidden_states)
+    r32 = ttnn.typecast(residual, ttnn.float32)
+    h32 = ttnn.typecast(hidden_states, ttnn.float32)
+    out32 = ttnn.add(r32, h32)
+    out = ttnn.typecast(out32, ttnn.bfloat16)
+    ttnn.deallocate(r32); ttnn.deallocate(h32); ttnn.deallocate(out32)
+    return out
 from numpy.typing import NDArray
 
 from bitnet_tt.layers.attention import KVCache, MultiHeadAttention
@@ -198,7 +211,7 @@ class TransformerBlock:
         )
 
         # Residual connection
-        hidden_states = ttnn.add(residual, hidden_states)
+        hidden_states = _residual_add(residual, hidden_states)
 
         # Pre-FFN norm
         residual = hidden_states
@@ -208,6 +221,6 @@ class TransformerBlock:
         hidden_states = self.mlp(hidden_states, mode=mode)
 
         # Residual connection
-        hidden_states = ttnn.add(residual, hidden_states)
+        hidden_states = _residual_add(residual, hidden_states)
 
         return hidden_states, updated_cache
