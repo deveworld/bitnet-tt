@@ -1,74 +1,67 @@
 {
-  "title": "BitNet-TT t/s + PCC joint optimization",
+  "title": "BitNet-TT kernel-level optimization (session 2)",
   "baseline": {
-    "decode_tps": 72.93,
-    "p50_ms": 11.8,
-    "min_ms": 10.7,
-    "pcc_prefill": 0.9753,
-    "top5_overlap": 0.80,
+    "decode_tps": 71.89,
+    "p50_ms": 12.2,
+    "pcc_prefill": 0.9807,
+    "argmax_match_multi_prompt": "5/5",
     "measured_on": "2026-04-18",
-    "commit": "1aa88dd"
+    "commit": "7cf0bbd"
   },
-  "goal": "Ship a measurable improvement in either t/s OR PCC (preferably both) over baseline, verified on p150a.",
+  "goal": "Push past the Python-level ceiling with kernel-adjacent work. Target: p50 <=11.5 ms (>=87 t/s) AND PCC >=0.982. At minimum ship one change that moves either axis measurably.",
   "constraints": [
-    "No tt-metal kernel changes in this iteration (python-level only).",
-    "Must preserve or improve PCC; a regression >0.002 in PCC blocks the change.",
-    "p50 regression up to 0.5 ms is acceptable ONLY when offset by a meaningful accuracy gain (PCC >=0.003 or greedy match ratio >=2x). Speed-only regressions >0.2 ms still block.",
+    "tt-metal changes allowed but require rebuild; isolate to additive ops or feature flags if possible.",
+    "PCC must not regress beyond -0.002 under any circumstance.",
+    "Speed regressions >0.2 ms block unless offset by PCC >=0.003 or match ratio >=2x (same exception as session 1).",
     "All measurements on TT server via ssh TT; code sync via git."
   ],
-  "constraint_notes": "p50 regression constraint relaxed on 2026-04-18 after architect REVISE: the accepted change regressed p50 by 0.4 ms (11.8 -> 12.2) but delivered PCC +0.0054 and 3x greedy match improvement, which satisfies the 'offset by accuracy' exception. The stricter 0.2 ms cap remains for pure-speed experiments that do not improve accuracy.",
   "stories": [
     {
-      "id": "US-001",
-      "title": "Identify remaining optimization surface",
+      "id": "US-101",
+      "title": "cos/sin device-side embedding lookup in trace",
       "priority": 1,
       "acceptanceCriteria": [
-        "An Explore agent scans bench-able levers in src/bitnet_tt/ beyond already-documented wins.",
-        "A codex critic independently verifies the shortlist and ranks candidates by expected t/s/PCC delta.",
-        "Shortlist narrows to a single actionable candidate with measurable delta."
+        "generator_batch32 decode step replaces per-step cos/sin H2D copies with ttnn.embedding lookups against rotary_setup.cos_matrix / sin_matrix inside the trace.",
+        "Trace re-captures cleanly and execute_trace completes on p150a without Python errors.",
+        "Post-change bench_batch32 --max-new 128 decode_tps does NOT regress vs 71.89 (tolerance +/- 0.3 t/s); target +2-3 t/s.",
+        "Post-change bench_accuracy --decode-steps 32 PCC stays within 0.002 of 0.9807."
       ],
-      "passes": true,
-      "notes": "Explore agent (iter 2) produced 12-candidate list. Codex critic (iter 3) independently ranked lm_head dtype sweep as 'valid but limited'; suggested KV cache dtype + H2D consolidation as higher-yield next steps, flagged fused-RoPE as contributing to PCC loss. lm_head dtype sweep picked as iter-3 focus: low risk, direct PCC + t/s measurement per variant."
+      "passes": false
     },
     {
-      "id": "US-002",
-      "title": "Measure PCC delta per lm_head dtype choice",
+      "id": "US-102",
+      "title": "nlp_create_qkv_heads_boltz drop-in experiment",
       "priority": 2,
       "acceptanceCriteria": [
-        "Three dtypes measured on p150a: bfp4 (current), bfp8, bf16, with the same 64-tok bench + 16-step accuracy harness.",
-        "Each variant records p50, decode_tps, prefill PCC, top1/top5/top10, and greedy match count.",
-        "Pareto winner identified with evidence."
+        "attention._forward_decode_1bkd path gains a feature flag choosing between nlp_create_qkv_heads_decode (current) and nlp_create_qkv_heads_boltz (Blackhole variant).",
+        "Both paths produce numerically equivalent Q/K/V (PCC >= 0.9999 vs current) on p150a.",
+        "Pick the faster one as the default based on measured decode_tps on bench_batch32 --max-new 128."
       ],
-      "passes": true,
-      "notes": "Sweep (2026-04-18, commit 5930113): bfp4 p50=11.3/tps=70.88/PCC=0.9753/match=1; bfp8 p50=11.7/tps=68.86/PCC=0.9807/match=6; bf16 p50=12.4/tps=65.67/PCC=0.9807/match=4. bfp8 dominates bf16 across all accuracy metrics AND speed → Pareto winner."
+      "passes": false,
+      "notes": "If boltz variant is a superset OR strict win, integrate. If it regresses or is equivalent, document as a dead-end microbench and leave current op in place."
     },
     {
-      "id": "US-003",
-      "title": "Pick one low-risk optimization candidate from US-001/US-002 findings and implement it",
+      "id": "US-103",
+      "title": "Selective bf16 lm_head weight option for PCC boost",
       "priority": 3,
       "acceptanceCriteria": [
-        "The candidate is documented in .omc/candidate.md with expected delta.",
-        "Implementation is contained in src/bitnet_tt/ (no tt-metal changes).",
-        "Code compiles and bench_batch32.py still runs to completion without error.",
-        "Measured on server: bench_batch32.py --dtype packed_ternary --max-new 128 completes and outputs a RESULT line.",
-        "Measured on server: bench_accuracy.py --dtype packed_ternary --decode-steps 32 outputs a PCC."
+        "BITNET_LM_HEAD_DTYPE=bf16 continues to work and is measured at 128 tok / 32 step on the current HEAD.",
+        "Document whether bf16 lm_head becomes the recommendation when PCC is prioritized (decision goes into docs/ or README)."
       ],
-      "passes": true,
-      "notes": "Candidate: lm_head_dtype bfp4→bfp8. Implemented in commit ae1387e. Sweep measured 3 dtypes (bfp4/bfp8/bf16) with bench + accuracy on p150a. bfp8 chosen as Pareto-optimal."
+      "passes": false,
+      "notes": "This is a documentation-grade story. The env override already exists. Only needs a fresh 128-tok measurement against the new baseline and a written recommendation."
     },
     {
-      "id": "US-004",
-      "title": "Validate the change against baseline and commit or revert",
+      "id": "US-104",
+      "title": "Regression + multi-prompt validation after kernel changes",
       "priority": 4,
       "acceptanceCriteria": [
-        "If the candidate improves PCC by >=0.003 OR greedy match ratio >=2x while p50 regresses by at most 0.5 ms, commit with a clear message citing before/after numbers (constraint exception in constraint_notes).",
-        "If the candidate is speed-only (no accuracy gain), p50 must NOT regress more than 0.2 ms; otherwise revert to 1aa88dd and document the dead end in docs/.",
-        "PCC must not regress beyond -0.002 under any circumstance.",
-        "README.md or TODO.md reflects the outcome.",
-        "Final commit pushed to origin/main and synced on TT server."
+        "Final HEAD passes bench_batch32 --max-new 128 and bench_accuracy --decode-steps 32 on p150a.",
+        "bench_accuracy_multi across 5 prompts keeps argmax match at 5/5 and mean PCC >=0.93.",
+        "README.md / TODO.md record the new baseline and what changed this iteration.",
+        "Final commits pushed to origin/main and synced on TT server."
       ],
-      "passes": true,
-      "notes": "Confirmation 128-tok bench + 32-step accuracy (commit ae1387e): decode_tps=71.89 t/s (baseline 72.93), p50=12.2 ms (baseline 11.8, +0.4 ms), PCC=0.9807 (+0.0054), greedy match=6/32 (baseline ~2/32, 3x). Accuracy gains (PCC +0.0054 >= 0.003 AND match 3x >= 2x) qualify for the constraint exception; p50 regression 0.4 ms is within the 0.5 ms cap. README.md + TODO.md updated (commit c93bc20). 5-prompt robustness (bench_accuracy_multi, 2026-04-18): argmax match 5/5, mean PCC 0.9374, min PCC 0.7594 on a sharp-logit Tolkien opener whose argmax still matches HF; four out of five prompts clear PCC 0.97. Full breakdown in docs/bfp8_lm_head_multi_prompt.md."
+      "passes": false
     }
   ]
 }
