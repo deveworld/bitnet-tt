@@ -138,9 +138,14 @@ class BitNetModel:
         self.norm.load_weights(norm_weight)
         # Pre-transpose LM head: (vocab, hidden) -> (hidden, vocab)
         lm_head_t = lm_head_weight.T.astype(np.float32).copy()
-        # bfp4 vs bf16 lm_head: PCC 0.974 vs 0.980 (delta 0.006, within
-        # packed_ternary noise). All three (bf16/bfp8/bfp4) produce the same
-        # argmax on real model hidden states. bfp4 halves DRAM BW (1.81→0.75ms).
+        # lm_head dtype sweep (2026-04-18, 64-tok bench / 16-step accuracy,
+        # packed_ternary weights, commit 5930113):
+        #   bfp4:  p50=11.3ms  decode=70.88 t/s  PCC=0.9753  match=1/16
+        #   bfp8:  p50=11.7ms  decode=68.86 t/s  PCC=0.9807  match=6/16  <- PICK
+        #   bf16:  p50=12.4ms  decode=65.67 t/s  (slower, PCC not >>bfp8)
+        # bfp8 is the Pareto-optimal point: +0.005 PCC and 6x greedy match
+        # improvement for only -2 t/s vs bfp4. Argmax is still correct on
+        # real hidden states (top1 match=True across all three).
         # BITNET_LM_HEAD_DTYPE env override ∈ {bf16, bfp8, bfp4} for sweep.
         import os
         _env_lh = os.environ.get("BITNET_LM_HEAD_DTYPE", "").lower()
@@ -151,7 +156,7 @@ class BitNetModel:
         elif _env_lh in ("bfp4", "bfp4_b", "bfloat4_b"):
             lm_head_dtype = ttnn.bfloat4_b
         else:
-            lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
+            lm_head_dtype = ttnn.bfloat8_b if self._weight_dtype != "bf16" else ttnn.bfloat16
 
         # Split lm_head weight along vocab dim. A single big ttnn.matmul for
         # [1, K] x [K, 128256] picks a per-core config sized for the whole
