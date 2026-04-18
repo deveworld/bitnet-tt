@@ -4,13 +4,16 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Current perf (2026-04-18, batch32 + trace + fused RoPE + packed_ternary,
-  reconciled in `docs/session_7_baseline_reconciled.md`):
-  **p50 12.0 ms / decode_tps 71.05 t/s (128-tok bench)**,
-  p50 11.5 ms / decode_tps 68.93 t/s (64-tok bench).
-  Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale — predates the
-  split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-lookup /
-  fused-QKV-norm stack.
+- Current perf (2026-04-18 HEAD e5e1cd4, batch32 + trace + fused RoPE +
+  packed_ternary + cpu().to_list() argmax readout):
+  **p50 11.6 ms / decode_tps 73.39 t/s (128-tok bench)**, PCC ~0.981.
+  Session 11 regained +2.34 t/s on top of the post-dlpack-fix baseline
+  (71.05 t/s) by switching the uint32 argmax readout from
+  to_layout+typecast+to_torch (0.282 ms/call) to cpu().to_list()
+  (0.047 ms/call).
+  Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale — predates
+  the split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-
+  lookup / fused-QKV-norm stack.
 - Historical Alpha baseline (`cd995ba` + HiFi2 kernel ≈ 8.5 t/s) kept
   in tables below for context only — current stable path is the
   packed_ternary + fused-QKV-norm pipeline documented in README / TODO.
