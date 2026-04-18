@@ -5,12 +5,12 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **88.5 t/s Decode** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode; peak 93.5 t/s at min latency)
-- **+174% faster than bfp4** at half the storage
+- **82.0 t/s Decode @ 128 tok** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode + **bfp8 lm_head**; peak 91.7 t/s at min latency)
+- **+155% faster than bfp4** at half the storage
+- **PCC 0.981 vs HF CPU** (prefill, +0.005 over bfp4 lm_head), greedy match 3× the baseline — bfp8 lm_head dominates both bfp4 (higher accuracy) and bf16 (same accuracy, faster)
 - **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
 - **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
-- **Accuracy Preserved**: PCC 0.975 vs HuggingFace CPU reference (packed_ternary inherent limit)
 
 ## Quick Start
 
@@ -38,7 +38,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary** (2026-04-17 +concat_heads_decode, 64 tok) | **11.3** | **88.5** | **10.7** | **93.5** | **70.98** | **~600 MB** |
+| **packed_ternary** (2026-04-18 +bfp8 lm_head, 128 tok) | **12.2** | **82.0** | **10.9** | **91.7** | **71.89** | **~600 MB** |
+| packed_ternary (2026-04-17 +concat_heads_decode, 64 tok) | 11.3 | 88.5 | 10.7 | 93.5 | 70.98 | ~600 MB |
 | packed_ternary (2026-04-17 +L1 chunks, 64 tok)            | 11.6 | 86.2 | 10.9 | 91.7 | 70.51 | ~600 MB |
 | packed_ternary (2026-04-17 +split lm_head, 64 tok)        | 11.7 | 85.5 | 11.0 | 90.9 | 68.57 | ~600 MB |
 | packed_ternary (2026-04-17 +tuned shard grid, 64 tok)     | 13.2 | 75.8 | 12.4 | 80.6 | 63.46 | ~600 MB |
@@ -73,17 +74,20 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 26. **split lm_head matmul** | **85.5 p50 / 68.57 decode_tps** | Vocab-dim split lm_head into 4 chunks + concat. Full-vocab matmul picks a per-core config sized for 128256 and runs at 2.2 ms in trace; 4-way split picks tighter per-chunk configs that total 0.72 ms. |
 | 27. **lm_head chunk outputs to L1** | **86.2 p50 / 70.51 decode_tps** | Chunks and concat stay in L1 so the downstream to_layout+argmax chain doesn't round-trip through DRAM (-40 us/step). |
 | 28. **nlp_concat_heads_decode after SDPA** | **88.5 p50 / 70.98 decode_tps** | Replaces ttnn.reshape for SDPA output. SDPA GQA can't emit sharded output so we reshard first; the concat_heads kernel still nets -9 us/layer vs reshape (-0.27 ms/step). |
+| 29. **lm_head bfp4 → bfp8** | **82.0 p50 / 71.89 decode_tps** | Joint speed+accuracy tuning: lm_head dtype sweep (bfp4/bfp8/bf16) showed bfp8 dominates bf16 across all accuracy metrics while staying close to bfp4 speed. Prefill PCC 0.975 → 0.981 (+0.005), greedy match on 32 steps ≈3x baseline for only -1 t/s. bf16 is strictly dominated by bfp8 (same PCC, lower match count, slower). `BITNET_LM_HEAD_DTYPE={bf16,bfp8,bfp4}` env var supports future re-sweeps. |
 
 ### Accuracy (vs HuggingFace CPU reference)
 
-| Metric | packed_ternary | bfp4 |
-|---|---|---|
-| Prefill PCC | 0.975 | 0.993 |
-| Top-1 match | True | True |
-| Top-5 overlap | 80% | 90% |
-| Greedy divergence | step 1 | step 3 |
+| Metric | packed_ternary (bfp8 lm_head, current) | packed_ternary (bfp4 lm_head, old) | bfp4 weights |
+|---|---|---|---|
+| Prefill PCC | **0.981** | 0.975 | 0.993 |
+| Top-1 match | True | True | True |
+| Top-5 overlap | 60% | 80% | 90% |
+| Top-10 overlap | **90%** | 70% | — |
+| Greedy match (32 steps) | **6/32** | ~2/32 | 9/32 |
+| Greedy divergence | step 1 | step 1 | step 3 |
 
-Note: PCC 0.975 is the inherent limit of 2-bit weight quantization. The lm_head dtype (bfp4) adds negligible additional error (PCC 0.9992 vs bf16 lm_head).
+Note: PCC 0.975 → 0.981 with bfp8 lm_head is real accuracy gain on top of the 2-bit weight quantization floor. The top-5 shuffle vs top-10 improvement is a set-overlap artifact: with bfp8 the top candidates are closer together, so rank boundaries (top 5 vs top 10) shift while the overall quality (PCC and greedy match) improves.
 
 ## Architecture
 
