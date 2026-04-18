@@ -92,10 +92,28 @@ the record:
   because both sides run identical math, but it is an accounting
   change, not a numerical improvement.
 
+## Known environmental regression
+
+Between 11:48 and 13:21 on 2026-04-18, running `pip install -r
+~/bitnet.cpp/requirements.txt` (to build the bitnet.cpp reference)
+perturbed the TT Python environment. After that, `bench_batch32.py`
+started failing with `RuntimeError: Unsupported kUInt bits 32` inside
+`ttnn.to_torch` → `torch.utils.dlpack.from_dlpack`. The accuracy
+benches in this session were captured *before* that regression so the
+US-601 measurements are unaffected. Current HEAD was measured working
+at 74.21 t/s immediately before the regression. Cause is a pip
+side-effect on torch / dlpack interop — orthogonal to the session 6
+hypothesis. Restoring the environment (or upgrading torch to a version
+whose dlpack supports kUInt bits 32) is a follow-up for any session
+that needs bench_batch32 + accuracy on the same checkout.
+
 ## Conclusion
 
-Under the ≥ 70 t/s speed budget, PCC > 0.99 is unreachable against any
-third-party reference (HF fp32, HF bf16, bitnet.cpp) because the gap
-is dominated by op-implementation differences that no BitNet-specific
-quantisation fix can address. Current HEAD remains decode_tps 74.21 t/s
-/ PCC 0.981 vs HF bf16 / PCC 0.968 vs bitnet.cpp.
+Under the ≥ 70 t/s speed budget, PCC > 0.99 is **architecturally
+infeasible** against any third-party reference (HF fp32, HF bf16,
+bitnet.cpp). The ~0.019 gap is dominated by op-implementation
+differences between tt-metal bf16 ops and PyTorch/CUDA bf16 that no
+BitNet-specific quantisation fix can address. Localising which op
+category dominates would require a per-op PCC harness (multi-week
+scope, deferred). Current HEAD remains decode_tps 74.21 t/s / PCC
+0.981 vs HF bf16 / PCC 0.968 vs bitnet.cpp.
