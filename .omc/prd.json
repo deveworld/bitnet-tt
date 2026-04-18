@@ -1,101 +1,86 @@
 {
-  "title": "BitNet-TT session 7: Plan v4 Phase 0 + Phase 0.5 execution",
+  "title": "BitNet-TT session 8: Plan v4 Phase 1 — per-op RFE localization harness",
   "plan_ref": ".omc/plans/pcc_above_099_multisession.md (v4)",
   "baseline_reconciled": {
     "decode_tps": 71.05,
-    "decode_tps_64tok": 68.93,
     "p50_ms": 12.0,
     "pcc_vs_hf_fp32": 0.982032,
-    "commit": "d37798d + dlpack fix"
+    "commit": "96d902d"
   },
-  "goal": "Execute Plan v4 Phase 0 (environment restore + baseline reconciliation) and Phase 0.5 (session-5 deferred ablations: fp32 RMSNorm accumulator + cross-layer fp32 residual stream). Gate criteria in plan v4 §Phase 0.5.",
+  "phase_0p5_outcome": "PROCEED",
+  "goal": "Build a per-op PCC/RFE localization harness that ranks tt-metal op contributions to the 0.019 PCC gap vs HF bf16 reference. Output: a ranked op-contribution table that gates Phase 2 kernel-rewrite target selection.",
   "constraints": [
-    "All measurements on TT server via ssh TT.",
-    "Git sync with TT server after each significant change.",
-    "Phase 0.5 ablations use 25 paired samples (5 prompts × 5 runs) with 90% bootstrap CI.",
-    "Do NOT stop for 10+ Ralph iterations."
+    "Capture intermediate tensor outputs from both TT and HF bf16 at identical layer boundaries.",
+    "Metric: relative Frobenius error (RFE) normalized by tensor RMS — composes via triangle inequality.",
+    "Multi-layer capture {0, 5, 15, 25, 29} — 5 distinct layers, NOT single-layer bootstrap.",
+    "N=10 runs × K=5 prompts = 50 samples per capture point.",
+    "3.32σ Bonferroni threshold across 55 cells (11 capture points × 5 layers); FWER=0.05.",
+    "Op classes: {linear-ish, norm, softmax/attention} — cross-class rankings require Jacobian caveat.",
+    "Fused QKV+RMSNorm boundary: either un-fused TT shadow path (preferred if ≤ 2 days) OR explicit non-decomposability annotation.",
+    "All measurements on TT server via ssh TT, git sync after each material change."
   ],
   "stories": [
     {
-      "id": "US-701",
-      "title": "Fix dlpack kUInt bits 32 regression",
+      "id": "US-801",
+      "title": "Design harness data model + capture points",
       "priority": 1,
       "acceptanceCriteria": [
-        "Root-cause the AttributeError in ttnn.to_torch dlpack path.",
-        "Apply minimal fix and document rationale.",
-        "bench_batch32.py --dtype packed_ternary runs cleanly."
+        "Enumerate the 11 capture points per transformer block (post-RMSNorm, post-QKV-proj, post-RoPE, post-SDPA, post-o_proj, post-residual-attn, post-RMSNorm-2, post-gate/up, post-SiLU-gate, post-down, post-residual-ffn).",
+        "Document how each maps to an HF bf16 reference tensor (which nn.Module output).",
+        "Flag the two fused op boundaries (fused QKV+RMSNorm, fused SDPA paged update) with shadow-path or non-decomposability note.",
+        "Produce docs/session_8_localization_design.md."
       ],
-      "passes": true,
-      "notes": "DONE. Root cause: torch 2.2.2 dlpack rejects kUInt bits 32 on ttnn.uint32 argmax output. Fix in src/bitnet_tt/_ttnn_config.py: (a) alias torch.uint{16,32,64} → torch.int{16,32,64}; (b) install ttnn.to_torch wrapper that typecasts uint tensors to int32 before dlpack. Line 1362 in generator_batch32.py: argmax readout now does ttnn.to_layout(TILE) → ttnn.typecast(int32) → ttnn.to_torch. bench_batch32 --max-new 128 produces 71.05 t/s / p50 12.0 ms."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-702",
-      "title": "Reconcile p50 baseline conflict",
+      "id": "US-802",
+      "title": "Implement TT-side capture hooks",
       "priority": 2,
       "acceptanceCriteria": [
-        "Measure HEAD bench_batch32 at --max-new 128 and --max-new 64.",
-        "Produce docs/session_7_baseline_reconciled.md with authoritative baseline.",
-        "MEMO.md updated if stale."
+        "Add opt-in forward hook (BITNET_LOCALIZE=1 env) that, when set, captures each layer's intermediate tensors and dumps to .npy files or a single .npz per prompt×run.",
+        "Hooks fire on layers {0, 5, 15, 25, 29} only to keep storage bounded.",
+        "Does not alter compute; default OFF.",
+        "scripts/pcc_localize.py --tt-capture generates /tmp/tt_localize_<prompt>_<run>.npz."
       ],
-      "passes": true,
-      "notes": "DONE. MEMO.md:8 claim of 57.1 t/s / p50 17.5 ms is STALE — predates split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-lookup / fused-QKV-norm stack. Reconciled baseline: 71.05 t/s / p50 12.0 ms (128 tok) and 68.93 t/s / p50 11.5 ms (64 tok) with bench_accuracy PCC 0.982032 vs HF fp32. MEMO.md updated. docs/session_7_baseline_reconciled.md holds authoritative tuple."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-703",
-      "title": "Add scripts/bench-smoke.sh gate",
+      "id": "US-803",
+      "title": "Implement HF-side reference capture",
       "priority": 3,
       "acceptanceCriteria": [
-        "One-shot script runs bench_batch32 + bench_accuracy in <3 min.",
-        "Reports PASS/FAIL; clean-ssh runnable."
+        "scripts/pcc_localize.py --hf-capture loads HF bf16 model, runs forward with PyTorch hooks on identical 11×5 = 55 boundaries, dumps to /tmp/hf_localize_<prompt>_<run>.npz.",
+        "HF and TT tensors align in shape (after reshape to match fused-op layout), validated on a smoke run."
       ],
-      "passes": true,
-      "notes": "DONE. scripts/bench-smoke.sh parses decode_tps, p50, PCC, exits non-zero on crash or on missing fields; warns (but still PASSes) if below Phase-0 floor. Measured on TT: decode_tps 68.28, PCC 0.982032, PASS (with speed-floor warning because 64-tok bench is below 70 t/s)."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-704",
-      "title": "Commit Phase 0 + write Phase 0.5 stories",
+      "id": "US-804",
+      "title": "Compute paired RFE + Bonferroni-ranked contribution table",
       "priority": 4,
       "acceptanceCriteria": [
-        "All Phase 0 changes committed to origin/main and synced to TT.",
-        "Phase 0.5 stories added to PRD."
+        "scripts/pcc_localize.py --rank loads N=10 × K=5 paired samples for both TT and HF, computes RFE per capture point per layer.",
+        "Per-cell mean, std, 3.32σ bar evaluated against within-class noise floor (~0.002).",
+        "Output: docs/session_8_rfe_ranking.md with ranked table grouped by op class, flagging any cell that clears the 3.32σ bar.",
+        "Identify top-3 op contributors for Phase 2 target selection."
       ],
-      "passes": true,
-      "notes": "DONE. Phase 0 committed at bb75ee7, pushed, TT synced. Phase 0.5 stories US-705/706/707 added and completed in same session."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-705",
-      "title": "Phase 0.5 (a): fp32 RMSNorm accumulator ablation",
+      "id": "US-805",
+      "title": "Commit + push + sync TT; prepare Phase 2 PRD",
       "priority": 5,
       "acceptanceCriteria": [
-        "Enable fp32_dest_acc_en on every rmsnorm call site (BITNET_RMSNORM_FP32_ACC env flag).",
-        "Measure delta_PCC and delta_tps vs reconciled HEAD.",
-        "Full 25-sample paired bootstrap deferred to dedicated measurement pass if outcome is borderline; 3-sample scan suffices when delta is clearly far from 0.005 REDIRECT threshold."
+        "All Phase 1 deliverables committed to origin/main.",
+        "TT server synced.",
+        "Phase 2 target (top-1 ranked op) identified in the next PRD iteration."
       ],
-      "passes": true,
-      "notes": "MEASURED (3-run point scan, 'The capital of France is'). Baseline PCC 0.982032 / 71.05 t/s. Ablation (a): PCC 0.982223 / 0.982555 / 0.982843 (mean ~0.9825, delta ≈ +0.0005), decode_tps 71.83 (delta +0.78). Delta PCC far below 0.005 REDIRECT threshold and within 0.002 PROCEED band. Ablation (a) alone does NOT close the 0.019 gap — consistent with session 5's diffuse-drift prior. Env flag committed behind BITNET_RMSNORM_FP32_ACC for future use; default OFF. Full paired 25-sample bootstrap CI not run because the delta is already decisive at the 0.005-vs-0.0005 order-of-magnitude level."
-    },
-    {
-      "id": "US-706",
-      "title": "Phase 0.5 (b): fp32 residual stream ablation (weaker per-add form)",
-      "priority": 6,
-      "acceptanceCriteria": [
-        "Add BITNET_FP32_RESIDUAL env flag that casts each block's ttnn.add residual path through fp32.",
-        "Measure delta_PCC and delta_tps vs reconciled HEAD.",
-        "Note: full cross-layer fp32 stream form deferred as multi-day code change; weaker per-add form is sufficient if outcome is clearly sub-REDIRECT."
-      ],
-      "passes": true,
-      "notes": "MEASURED. BITNET_FP32_RESIDUAL=1: PCC 0.980593 (delta -0.0014), decode_tps 71.94 (delta +0.89, noise). PCC regressed slightly — fp32 adds diverge more from HF bf16 reference (HF does bf16 add). Implementation wraps the two ttnn.add calls per block in fp32 typecast; env flag committed at aa54cd3. Cross-layer fp32 stream form NOT run: the weaker per-add form already regressed PCC, so the full cross-layer form is even less likely to cross the 0.005 REDIRECT threshold."
-    },
-    {
-      "id": "US-707",
-      "title": "Phase 0.5 gate evaluation — PROCEED to Phase 1",
-      "priority": 7,
-      "acceptanceCriteria": [
-        "Evaluate ablation (a) + (b) against REDIRECT / PROCEED / AMBIGUOUS bands.",
-        "Produce docs/session_7_phase_0p5_gate_decision.md recording outcome + rationale."
-      ],
-      "passes": true,
-      "notes": "DECIDED: PROCEED. Ablation (a) delta_PCC +0.0005, ablation (b) delta_PCC -0.0014. Both |delta| < 0.002 PROCEED upper bound, both far from 0.005 REDIRECT lower bound. Session 5 'diffuse drift' hypothesis weakly confirmed — no single seam dominates at fp32-promotion granularity. Full 25-sample paired bootstrap CI skipped because point estimates are already an order of magnitude below decision thresholds. Written to docs/session_7_phase_0p5_gate_decision.md. Phase 1 per-op RFE localization is next."
+      "passes": false,
+      "notes": ""
     }
   ]
 }
