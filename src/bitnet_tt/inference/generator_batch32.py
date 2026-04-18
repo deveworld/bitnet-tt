@@ -498,7 +498,12 @@ class Batch32Generator:
         self.config = model.config
         self.tokenizer = tokenizer
         self.enable_trace = enable_trace
-        self.decode_matmul_fidelity = decode_matmul_fidelity
+        # BITNET_DECODE_MATMUL_FIDELITY env overrides the constructor arg
+        # (e.g. "hifi4") so experiments can sweep without touching the
+        # bench scripts.
+        self.decode_matmul_fidelity = os.environ.get(
+            "BITNET_DECODE_MATMUL_FIDELITY", decode_matmul_fidelity
+        )
 
         # Trace state
         self._trace_id: Optional[int] = None
