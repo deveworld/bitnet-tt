@@ -57,9 +57,25 @@ class BitNetModel:
             device=device,
         )
 
+        # Mixed-precision override: BITNET_BF16_LAYERS="0,29" keeps those
+        # layers in bf16 while the rest use `weight_dtype`. Used to trade
+        # a little speed for PCC when the baseline quantization limit is
+        # the blocker. Empty / unset string disables the override.
+        bf16_spec = os.environ.get("BITNET_BF16_LAYERS", "").strip()
+        self._bf16_layers: set[int] = set()
+        if bf16_spec:
+            for tok in bf16_spec.split(","):
+                tok = tok.strip()
+                if tok:
+                    try:
+                        self._bf16_layers.add(int(tok))
+                    except ValueError:
+                        pass
+
         # Transformer layers
         self.layers: list[TransformerBlock] = []
         for layer_idx in range(config.num_layers):
+            layer_dtype = "bf16" if layer_idx in self._bf16_layers else weight_dtype
             self.layers.append(
                 TransformerBlock(
                     hidden_size=config.hidden_size,
@@ -72,7 +88,7 @@ class BitNetModel:
                     rms_norm_eps=config.rms_norm_eps,
                     layer_idx=layer_idx,
                     use_lofi_mlp=use_lofi_mlp,
-                    weight_dtype=weight_dtype,
+                    weight_dtype=layer_dtype,
                     use_fused_rope=use_fused_rope,
                 )
             )

@@ -1,68 +1,64 @@
 {
-  "title": "BitNet-TT kernel-level optimization (session 2)",
+  "title": "BitNet-TT stretch: 80 t/s + PCC >0.99",
   "baseline": {
-    "decode_tps": 71.89,
-    "p50_ms": 12.2,
+    "decode_tps": 73.90,
+    "p50_ms": 11.7,
     "pcc_prefill": 0.9807,
-    "argmax_match_multi_prompt": "5/5",
     "measured_on": "2026-04-18",
-    "commit": "7cf0bbd"
+    "commit": "b46485c"
   },
-  "goal": "Push past the Python-level ceiling with kernel-adjacent work. Target: p50 <=11.5 ms (>=87 t/s) AND PCC >=0.982. At minimum ship one change that moves either axis measurably.",
+  "goal": "Hit decode_tps >= 80 t/s AND prefill PCC > 0.99. Delta required: +6.1 t/s and +0.01 PCC. These pull in opposite directions (higher precision usually slows things down), so the session has to find speed wins that can absorb any precision cost.",
   "constraints": [
-    "tt-metal changes allowed but require rebuild; isolate to additive ops or feature flags if possible.",
-    "PCC must not regress beyond -0.002 under any circumstance.",
-    "Speed regressions >0.2 ms block unless offset by PCC >=0.003 or match ratio >=2x (same exception as session 1).",
-    "All measurements on TT server via ssh TT; code sync via git."
+    "tt-metal changes allowed.",
+    "Argmax match on single-prompt accuracy bench must stay True.",
+    "All measurements on TT server via ssh TT.",
+    "Any regression that pushes p50 > 12.5 ms with no PCC gain must be reverted."
   ],
   "stories": [
     {
-      "id": "US-101",
-      "title": "cos/sin device-side embedding lookup in trace",
+      "id": "US-201",
+      "title": "Measure PCC with bf16-weight attention at layer 0 only",
       "priority": 1,
       "acceptanceCriteria": [
-        "generator_batch32 decode step replaces per-step cos/sin H2D copies with ttnn.embedding lookups against rotary_setup.cos_matrix / sin_matrix inside the trace.",
-        "Trace re-captures cleanly and execute_trace completes on p150a without Python errors.",
-        "Post-change bench_batch32 --max-new 128 decode_tps does NOT regress vs 71.89 (tolerance +/- 0.3 t/s); target +2-3 t/s.",
-        "Post-change bench_accuracy --decode-steps 32 PCC stays within 0.002 of 0.9807."
+        "A single transformer layer (layer 0) can be built with bf16 weights for the attention projections (Q/K/V/O) while the rest stays packed_ternary.",
+        "bench_accuracy --decode-steps 32 reports the new PCC for this configuration.",
+        "bench_batch32 --max-new 128 reports the speed cost of the mix.",
+        "If PCC gain >= 0.005 and speed cost <= 2 t/s, keep it behind a feature flag; otherwise revert."
       ],
-      "passes": true,
-      "notes": "Implemented via Batch32RotarySetup.lookup_decode_cos_sin + _use_cos_sin_lookup flag in Batch32Generator (commit c94fb8f). Microbench (test_cos_sin_lookup.py) shows PCC=1.0 / max|Δ|=0 vs _get_cos_sin_torch reference across 9 positions. 128-tok bench with lookup ON (BITNET_DECODE_COS_SIN_LOOKUP=1): decode_tps=73.90 (vs 71.89 baseline: +2.01 t/s, +2.8%), p50=11.7 ms (vs 12.2: -0.5 ms). 32-step accuracy with lookup ON: PCC=0.980679, top1=True, top5=0.60, top10=0.90, match=6/32 — bit-identical to lookup-OFF baseline, so the lookup is numerically lossless."
+      "passes": false
     },
     {
-      "id": "US-102",
-      "title": "nlp_create_qkv_heads_boltz drop-in experiment",
+      "id": "US-202",
+      "title": "Extend per-layer bf16 mix to last layer and lm_head precursor path if needed",
       "priority": 2,
       "acceptanceCriteria": [
-        "Determine whether nlp_create_qkv_heads_boltz is compatible with the current batch-32 decode tensor layout used in attention._forward_decode_1bkd.",
-        "If compatible: integrate behind a feature flag and measure. If incompatible: document why and close as dead end."
+        "If US-201 alone cannot clear PCC > 0.99, add layer (N-1) in bf16 and re-measure.",
+        "Feature flag BITNET_BF16_LAYERS controls which layers use bf16 weights (comma-separated).",
+        "Whichever combination hits PCC > 0.99 is the winning configuration."
       ],
-      "passes": true,
-      "notes": "CLOSED 2026-04-18 as not applicable. nlp_create_qkv_heads_boltz expects [B, 1, S, 3*head_dim*num_heads] (prefill-shape with a sequence dim) and pre-transposes K heads, whereas the decode path feeds [1, 1, batch=32, qkv_dim] tensors to nlp_create_qkv_heads_decode that produce [1, batch, num_heads|num_kv_heads, head_dim] sharded outputs. Swapping ops would require reshaping in/out around the heads step — the reshape overhead would wipe out any kernel savings, and the decode-optimized variant also has the sharded output format the downstream RoPE/SDPA chain wants. No integration; keep nlp_create_qkv_heads_decode."
+      "passes": false
     },
     {
-      "id": "US-103",
-      "title": "Selective bf16 lm_head weight option for PCC boost",
+      "id": "US-203",
+      "title": "Eliminate the remaining embed / pos H2D copies per decode step",
       "priority": 3,
       "acceptanceCriteria": [
-        "BITNET_LM_HEAD_DTYPE=bf16 continues to work and is measured at 128 tok / 32 step on the current HEAD.",
-        "Document whether bf16 lm_head becomes the recommendation when PCC is prioritized (decision goes into docs/ or README)."
+        "pos_tensor is advanced on-device inside the trace (or removed entirely by computing position inside the kernel).",
+        "embed is either pre-staged or looked up from a device-resident embedding table inside the trace.",
+        "Post-change bench_batch32 decode_tps improves by >= 1 t/s vs 73.90 without argmax regression."
       ],
-      "passes": true,
-      "notes": "CLOSED 2026-04-18: the session 1 sweep (commit ae1387e) already measured bf16 lm_head at 12.4 ms p50 / 65.67 decode_tps with PCC 0.9807 and greedy match 4/16. bfp8 and bf16 produced identical PCC and bfp8 had higher match count at faster speed, so bf16 is strictly Pareto-dominated. No additional measurement or documentation is needed — the existing recommendation in bitnet.py comments and README accuracy table already reflects this. `BITNET_LM_HEAD_DTYPE=bf16` remains available for re-verification but is not the production default."
+      "passes": false
     },
     {
-      "id": "US-104",
-      "title": "Regression + multi-prompt validation after kernel changes",
+      "id": "US-204",
+      "title": "Hit the 80 t/s + PCC > 0.99 target (or document exact ceiling)",
       "priority": 4,
       "acceptanceCriteria": [
-        "Final HEAD passes bench_batch32 --max-new 128 and bench_accuracy --decode-steps 32 on p150a.",
-        "bench_accuracy_multi across 5 prompts keeps argmax match at 5/5 and mean PCC >=0.93.",
-        "README.md / TODO.md record the new baseline and what changed this iteration.",
-        "Final commits pushed to origin/main and synced on TT server."
+        "Combined configuration measured on p150a at 128 tok and 32-step accuracy.",
+        "If target met: README.md + TODO.md updated and new baseline committed.",
+        "If target missed: docs/ records the exact ceiling reached plus the specific blocker preventing further gain (kernel limit, precision floor, etc.)."
       ],
-      "passes": true,
-      "notes": "bench_batch32 --max-new 128 on commit c94fb8f: decode_tps=73.90, p50=11.7ms. bench_accuracy --decode-steps 32 (same commit): PCC=0.980679 (bit-identical to lookup-off), top1=True, greedy match 6/32 (also bit-identical). Because the lookup step is numerically lossless (verified: PCC=1.0 / max|Δ|=0 microbench, and identical end-to-end PCC to session 1 multi-prompt baseline), the 5-prompt argmax-5/5 / mean PCC 0.9374 result from session 1 (docs/bfp8_lm_head_multi_prompt.md) carries over unchanged — the lookup does not mutate any downstream tensor bit. README.md updated in commit 86b3391 with the new top-line throughput and Step 30 of the evolution ladder."
+      "passes": false
     }
   ]
 }
