@@ -15,6 +15,7 @@ Performance optimizations:
 Based on tt_transformers patterns.
 """
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -147,7 +148,6 @@ class BitNetModel:
         # improvement for only -2 t/s vs bfp4. Argmax is still correct on
         # real hidden states (top1 match=True across all three).
         # BITNET_LM_HEAD_DTYPE env override ∈ {bf16, bfp8, bfp4} for sweep.
-        import os
         _env_lh = os.environ.get("BITNET_LM_HEAD_DTYPE", "").lower()
         if _env_lh == "bf16":
             lm_head_dtype = ttnn.bfloat16
