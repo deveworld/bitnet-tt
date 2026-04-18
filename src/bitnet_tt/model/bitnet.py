@@ -141,7 +141,17 @@ class BitNetModel:
         # bfp4 vs bf16 lm_head: PCC 0.974 vs 0.980 (delta 0.006, within
         # packed_ternary noise). All three (bf16/bfp8/bfp4) produce the same
         # argmax on real model hidden states. bfp4 halves DRAM BW (1.81→0.75ms).
-        lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
+        # BITNET_LM_HEAD_DTYPE env override ∈ {bf16, bfp8, bfp4} for sweep.
+        import os
+        _env_lh = os.environ.get("BITNET_LM_HEAD_DTYPE", "").lower()
+        if _env_lh == "bf16":
+            lm_head_dtype = ttnn.bfloat16
+        elif _env_lh in ("bfp8", "bfp8_b", "bfloat8_b"):
+            lm_head_dtype = ttnn.bfloat8_b
+        elif _env_lh in ("bfp4", "bfp4_b", "bfloat4_b"):
+            lm_head_dtype = ttnn.bfloat4_b
+        else:
+            lm_head_dtype = ttnn.bfloat4_b if self._weight_dtype != "bf16" else ttnn.bfloat16
 
         # Split lm_head weight along vocab dim. A single big ttnn.matmul for
         # [1, K] x [K, 128256] picks a per-core config sized for the whole
