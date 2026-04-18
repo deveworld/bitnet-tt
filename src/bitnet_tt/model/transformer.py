@@ -19,6 +19,27 @@ import ttnn
 
 _BITNET_FP32_RESIDUAL = os.environ.get("BITNET_FP32_RESIDUAL", "").strip() in ("1", "true", "yes", "on")
 
+# Phase 1 localization hook — collects intermediate tensors when
+# BITNET_LOCALIZE is set. The harness (scripts/pcc_localize.py) reads
+# the module-level `_localize_captures` dict after a single prefill.
+_BITNET_LOCALIZE = os.environ.get("BITNET_LOCALIZE", "").strip() in ("1", "true", "yes", "on")
+_BITNET_LOCALIZE_LAYERS = set()
+for _tok in os.environ.get("BITNET_LOCALIZE_LAYERS", "0,5,15,25,29").split(","):
+    _tok = _tok.strip()
+    if _tok.isdigit():
+        _BITNET_LOCALIZE_LAYERS.add(int(_tok))
+_localize_captures: dict = {}
+
+
+def _maybe_capture(layer_idx, name, tensor):
+    if not _BITNET_LOCALIZE or layer_idx not in _BITNET_LOCALIZE_LAYERS:
+        return
+    try:
+        _localize_captures[f"L{layer_idx}.{name}"] = ttnn.to_torch(tensor).float().numpy().copy()
+    except Exception as exc:  # capture failure is non-fatal
+        _localize_captures[f"L{layer_idx}.{name}__err"] = str(exc)
+
+
 def _residual_add(residual, hidden_states):
     if not _BITNET_FP32_RESIDUAL:
         return ttnn.add(residual, hidden_states)
@@ -190,10 +211,12 @@ class TransformerBlock:
         Returns:
             Tuple of (output tensor, updated KV-Cache if use_cache else None)
         """
+        _maybe_capture(self.layer_idx, "block_input", hidden_states)
         residual = hidden_states
 
         # Pre-attention norm
         hidden_states = self.input_layernorm(hidden_states)
+        _maybe_capture(self.layer_idx, "post_input_norm", hidden_states)
 
         # Self-attention (includes attn_sub_norm before o_proj)
         hidden_states, updated_cache = self.self_attn(
@@ -209,18 +232,23 @@ class TransformerBlock:
             pos_tensor=pos_tensor,
             cos_sin_tensors=cos_sin_tensors,
         )
+        _maybe_capture(self.layer_idx, "post_self_attn", hidden_states)
 
         # Residual connection
         hidden_states = _residual_add(residual, hidden_states)
+        _maybe_capture(self.layer_idx, "post_attn_residual", hidden_states)
 
         # Pre-FFN norm
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _maybe_capture(self.layer_idx, "post_post_attn_norm", hidden_states)
 
         # FFN (includes ffn_sub_norm before down_proj)
         hidden_states = self.mlp(hidden_states, mode=mode)
+        _maybe_capture(self.layer_idx, "post_mlp", hidden_states)
 
         # Residual connection
         hidden_states = _residual_add(residual, hidden_states)
+        _maybe_capture(self.layer_idx, "block_output", hidden_states)
 
         return hidden_states, updated_cache

@@ -32,7 +32,15 @@ PROMPTS = [
     "In 2024, we",
 ]
 CAPTURE_LAYERS = [0, 5, 15, 25, 29]
-CAPTURE_POINTS = ["block_input", "post_input_norm", "block_output"]
+CAPTURE_POINTS = [
+    "block_input",
+    "post_input_norm",
+    "post_self_attn",
+    "post_attn_residual",
+    "post_post_attn_norm",
+    "post_mlp",
+    "block_output",
+]
 OUT_DIR = Path("/tmp/bitnet_localize")
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -77,6 +85,9 @@ def capture_hf(prompt: str, tag: str) -> dict[str, np.ndarray]:
         layer = model.model.layers[li]
         handles.append(layer.register_forward_pre_hook(_mk_pre_hook(f"L{li}.block_input")))
         handles.append(layer.input_layernorm.register_forward_hook(_mk_hook(f"L{li}.post_input_norm")))
+        handles.append(layer.self_attn.register_forward_hook(_mk_hook(f"L{li}.post_self_attn")))
+        handles.append(layer.post_attention_layernorm.register_forward_hook(_mk_hook(f"L{li}.post_post_attn_norm")))
+        handles.append(layer.mlp.register_forward_hook(_mk_hook(f"L{li}.post_mlp")))
         handles.append(layer.register_forward_hook(_mk_hook(f"L{li}.block_output")))
 
     enc = tok(prompt, return_tensors="pt")
@@ -92,55 +103,28 @@ def capture_hf(prompt: str, tag: str) -> dict[str, np.ndarray]:
 
 
 def capture_tt(prompt: str, tag: str) -> dict[str, np.ndarray]:
-    """Run TT model with captures via TransformerBlock.__call__ monkey-patch."""
-    import bitnet_tt  # noqa: F401  (triggers dlpack + uint compat shim)
+    """Run TT model with in-tree BITNET_LOCALIZE hook (transformer.py)."""
+    # Force env flag BEFORE importing bitnet_tt so the module-level
+    # _BITNET_LOCALIZE guard picks it up.
+    os.environ["BITNET_LOCALIZE"] = "1"
+    os.environ["BITNET_LOCALIZE_LAYERS"] = ",".join(str(i) for i in CAPTURE_LAYERS)
+
+    import bitnet_tt  # noqa: F401
     import ttnn
     from bitnet_tt.utils.device import get_device
     from bitnet_tt.utils.weights import load_bitnet_weights, load_weights_to_model
     from bitnet_tt.model.bitnet import create_model
     from bitnet_tt.inference.generator_batch32 import Batch32Generator
+    from bitnet_tt.model import transformer as tr
     from transformers import AutoTokenizer
+
+    tr._localize_captures.clear()
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     device = get_device()
     state_dict, config = load_bitnet_weights(MODEL_ID)
     model = create_model(config, device, weight_dtype="packed_ternary")
     load_weights_to_model(model, state_dict)
-
-    captured: dict[str, np.ndarray] = {}
-
-    # Monkey-patch transformer block forward to capture at the 3 points.
-    from bitnet_tt.model import transformer as tr
-
-    orig_forward = tr.TransformerBlock.__call__
-
-    def _wrap_forward(self, hidden_states, *args, **kwargs):
-        layer_idx = getattr(self, "_localize_idx", None)
-        if layer_idx in CAPTURE_LAYERS:
-            try:
-                captured[f"L{layer_idx}.block_input"] = (
-                    ttnn.to_torch(hidden_states).float().numpy()
-                )
-            except Exception as e:
-                captured[f"L{layer_idx}.block_input__err"] = str(e)  # type: ignore
-        out = orig_forward(self, hidden_states, *args, **kwargs)
-        if layer_idx in CAPTURE_LAYERS:
-            out_t = out[0] if isinstance(out, tuple) else out
-            try:
-                captured[f"L{layer_idx}.block_output"] = (
-                    ttnn.to_torch(out_t).float().numpy()
-                )
-            except Exception as e:
-                captured[f"L{layer_idx}.block_output__err"] = str(e)  # type: ignore
-        return out
-
-    tr.TransformerBlock.__call__ = _wrap_forward  # type: ignore
-    for i, layer in enumerate(model.layers):
-        layer._localize_idx = i  # type: ignore
-
-    # (post_input_norm is skipped in this MVP — it lives inside TransformerBlock.__call__
-    # and requires a second monkey-patch. Add in a follow-up iteration if top-level
-    # capture reveals the block as the dominant-RFE unit.)
 
     gen = Batch32Generator(model, tokenizer=tok, enable_trace=False)
     gen._ensure_kv_caches(max_seq_len=256)
@@ -149,10 +133,10 @@ def capture_tt(prompt: str, tag: str) -> dict[str, np.ndarray]:
     ids_np = enc["input_ids"].numpy().astype(np.int64)
     _ = gen._prefill_batch32(ids_np)
 
+    captured = {k: v for k, v in tr._localize_captures.items() if not k.endswith("__err")}
+    errs = {k: v for k, v in tr._localize_captures.items() if k.endswith("__err")}
     np.savez(OUT_DIR / f"tt_{tag}.npz", **captured)
-    print(f"[TT] captured {len(captured)} tensors for tag={tag}")
-
-    tr.TransformerBlock.__call__ = orig_forward  # restore
+    print(f"[TT] captured {len(captured)} tensors for tag={tag} (errs={len(errs)})")
     return captured
 
 
