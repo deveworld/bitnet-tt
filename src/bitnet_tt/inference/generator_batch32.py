@@ -559,6 +559,15 @@ class Batch32Generator:
         # KV caches (allocated per generation)
         self._kv_caches: Optional[list[KVCache]] = None
 
+        # Device-side cos/sin lookup: skip the per-step cos/sin H2D copies
+        # and derive them from pos_tensor via ttnn.embedding inside the
+        # captured trace. Opt-in via BITNET_DECODE_COS_SIN_LOOKUP=1 during
+        # the initial measurement phase, then flip the default on or off
+        # based on what p150a shows. Set to "0" to force the old H2D path.
+        import os as _os
+        _lookup_env = _os.environ.get("BITNET_DECODE_COS_SIN_LOOKUP", "1")
+        self._use_cos_sin_lookup = _lookup_env not in ("0", "false", "False")
+
         if self.tokenizer is None:
             self._load_default_tokenizer()
 
@@ -657,6 +666,17 @@ class Batch32Generator:
         # ops per decode step. Caller owns the lifetime and deallocates
         # after the layer loop.
         first_attn = self.model.layers[0].self_attn
+        head_dim = self.config.head_dim
+        # Optionally look up cos/sin from a device-resident LUT via
+        # ttnn.embedding, killing the per-step H2D copies. The lookup
+        # runs inside the captured trace; pos_tensor is already on
+        # device and gets typecast from int32 to uint32 for embedding.
+        if cos is None or sin is None or self._use_cos_sin_lookup:
+            pos_u32 = ttnn.typecast(current_pos_tensor, ttnn.uint32)
+            cos_raw, sin_raw = self.rotary_setup.lookup_decode_cos_sin(pos_u32)
+            ttnn.deallocate(pos_u32)
+            cos = ttnn.reshape(cos_raw, (1, PADDED_BATCH, 1, head_dim))
+            sin = ttnn.reshape(sin_raw, (1, PADDED_BATCH, 1, head_dim))
         if first_attn.use_fused_rope:
             cos_shared = ttnn.to_memory_config(cos, first_attn._rope_cos_sin_config)
             sin_shared = ttnn.to_memory_config(sin, first_attn._rope_cos_sin_config)
@@ -994,9 +1014,15 @@ class Batch32Generator:
         pos_host = self._get_pos_host_tensor(current_pos)
         ttnn.copy_host_to_device_tensor(pos_host, inputs["pos_tensor"])
 
-        cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
-        ttnn.copy_host_to_device_tensor(cos_host, inputs["cos"])
-        ttnn.copy_host_to_device_tensor(sin_host, inputs["sin"])
+        # When cos/sin come from the device-side LUT, skip the two
+        # H2D dispatches that would otherwise refresh inputs["cos"] /
+        # inputs["sin"]. The trace does the embedding lookup from
+        # pos_tensor directly, so the device slots for cos/sin are
+        # never read after trace capture.
+        if not self._use_cos_sin_lookup:
+            cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
+            ttnn.copy_host_to_device_tensor(cos_host, inputs["cos"])
+            ttnn.copy_host_to_device_tensor(sin_host, inputs["sin"])
 
     def _ensure_decode_inputs(self) -> dict:
         """Lazily allocate reusable non-trace decode inputs."""
