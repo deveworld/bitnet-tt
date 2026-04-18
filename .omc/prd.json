@@ -1,70 +1,106 @@
 {
-  "title": "BitNet-TT session 6: match bitnet.cpp — INT8 activation quant feasibility",
-  "baseline": {
-    "decode_tps": 74.21,
-    "p50_ms": 11.7,
-    "pcc_vs_hf_fp32": 0.980679,
-    "pcc_vs_hf_bf16": 0.981319,
-    "pcc_vs_bitnetcpp": 0.967860,
-    "measured_on": "2026-04-18",
-    "commit": "a0490ae"
+  "title": "BitNet-TT session 7: Plan v4 Phase 0 + Phase 0.5 execution",
+  "plan_ref": ".omc/plans/pcc_above_099_multisession.md (v4)",
+  "baseline_reconciled": {
+    "decode_tps": 71.05,
+    "decode_tps_64tok": 68.93,
+    "p50_ms": 12.0,
+    "pcc_vs_hf_fp32": 0.982032,
+    "commit": "d37798d + dlpack fix"
   },
-  "goal": "Determine whether implementing per-token INT8 absmax activation quantisation inside ternary_matmul (matching bitnet.cpp / HF AutoBitLinear semantics) can close the PCC gap to bitnet.cpp while staying above 70 t/s.",
+  "goal": "Execute Plan v4 Phase 0 (environment restore + baseline reconciliation) and Phase 0.5 (session-5 deferred ablations: fp32 RMSNorm accumulator + cross-layer fp32 residual stream). Gate criteria in plan v4 §Phase 0.5.",
   "constraints": [
-    "tt-metal kernel changes authorised.",
-    "Every experiment records decode_tps + PCC vs bitnet.cpp + argmax match.",
     "All measurements on TT server via ssh TT.",
-    "Before committing weeks of kernel work, verify numerical feasibility with a host-side ablation of the same hypothesis."
+    "Git sync with TT server after each significant change.",
+    "Phase 0.5 ablations use 25 paired samples (5 prompts × 5 runs) with 90% bootstrap CI.",
+    "Do NOT stop for 10+ Ralph iterations."
   ],
   "stories": [
     {
-      "id": "US-601",
-      "title": "Verify whether INT8 activation quantisation could close the PCC gap before any kernel work",
+      "id": "US-701",
+      "title": "Fix dlpack kUInt bits 32 regression",
       "priority": 1,
       "acceptanceCriteria": [
-        "Inspect HF AutoBitLinear to confirm it already applies per-token INT8 absmax ActQuant on every forward.",
-        "Toggle ActQuant ON vs OFF in HF bf16 reference and compare TT PCC against each variant.",
-        "If the ActQuant toggle changes TT PCC by < 0.01, conclude INT8 quantisation is NOT the cause of the gap and kernel work is not justified.",
-        "If it changes TT PCC by > 0.01, proceed with the kernel implementation (US-602 / US-603)."
+        "Root-cause the AttributeError in ttnn.to_torch dlpack path.",
+        "Apply minimal fix and document rationale.",
+        "bench_batch32.py --dtype packed_ternary runs cleanly."
       ],
       "passes": true,
-      "notes": "MEASURED. HF AutoBitLinear source confirms it applies ActQuant (per-token INT8 absmax symmetric) on every forward. Ran TT vs HF bf16 with ActQuant toggled: ON -> PCC 0.981319, OFF -> PCC 0.980143. Delta = +0.0012, which is noise-level. Conclusion: INT8 activation quantisation is NOT the cause of the ~0.019 PCC gap. The real source is op-level numerical implementation differences between tt-metal and PyTorch/CUDA bf16 (SDPA, RMSNorm, RoPE, reduction order) — not the BitNet-specific activation quant scheme. Implementing INT8 act quant in the kernel would at best move PCC by the same 0.001 delta. US-602 / US-603 kernel work is therefore NOT justified and is closed without implementation."
+      "notes": "DONE. Root cause: torch 2.2.2 dlpack rejects kUInt bits 32 on ttnn.uint32 argmax output. Fix in src/bitnet_tt/_ttnn_config.py: (a) alias torch.uint{16,32,64} → torch.int{16,32,64}; (b) install ttnn.to_torch wrapper that typecasts uint tensors to int32 before dlpack. Line 1362 in generator_batch32.py: argmax readout now does ttnn.to_layout(TILE) → ttnn.typecast(int32) → ttnn.to_torch. bench_batch32 --max-new 128 produces 71.05 t/s / p50 12.0 ms."
     },
     {
-      "id": "US-602",
-      "title": "Kernel: add INT8 per-token absmax activation quantisation to ternary_matmul",
+      "id": "US-702",
+      "title": "Reconcile p50 baseline conflict",
       "priority": 2,
       "acceptanceCriteria": [
-        "If US-601 returned 'gap is INT8-quant-related': implement the kernel.",
-        "If US-601 returned 'gap is NOT INT8-quant-related': mark this story obsolete with the measured evidence."
+        "Measure HEAD bench_batch32 at --max-new 128 and --max-new 64.",
+        "Produce docs/session_7_baseline_reconciled.md with authoritative baseline.",
+        "MEMO.md updated if stale."
       ],
       "passes": true,
-      "notes": "OBSOLETE by US-601 evidence. Toggling the full INT8 activation quant path on the HF reference only moves PCC by 0.0012. Reproducing the same quant step in the TT kernel would at best close the same 0.001-level delta, not the 0.019 gap. Weeks of kernel work would not reach PCC > 0.99 under the current tt-metal op set. Story closed without implementation."
+      "notes": "DONE. MEMO.md:8 claim of 57.1 t/s / p50 17.5 ms is STALE — predates split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-lookup / fused-QKV-norm stack. Reconciled baseline: 71.05 t/s / p50 12.0 ms (128 tok) and 68.93 t/s / p50 11.5 ms (64 tok) with bench_accuracy PCC 0.982032 vs HF fp32. MEMO.md updated. docs/session_7_baseline_reconciled.md holds authoritative tuple."
     },
     {
-      "id": "US-603",
-      "title": "End-to-end: wire the quantised kernel into BitLinear, measure speed + PCC",
+      "id": "US-703",
+      "title": "Add scripts/bench-smoke.sh gate",
       "priority": 3,
       "acceptanceCriteria": [
-        "Gated on US-602 being viable; US-601 already falsified that precondition.",
-        "If re-opened, same acceptance: decode_tps >= 70 AND PCC vs bitnet.cpp > 0.99."
+        "One-shot script runs bench_batch32 + bench_accuracy in <3 min.",
+        "Reports PASS/FAIL; clean-ssh runnable."
       ],
       "passes": true,
-      "notes": "NOT APPLICABLE because US-602 was closed by US-601 evidence. No kernel was implemented; no new integration measurement to run."
+      "notes": "DONE. scripts/bench-smoke.sh parses decode_tps, p50, PCC, exits non-zero on crash or on missing fields; warns (but still PASSes) if below Phase-0 floor. Measured on TT: decode_tps 68.28, PCC 0.982032, PASS (with speed-floor warning because 64-tok bench is below 70 t/s)."
     },
     {
-      "id": "US-604",
-      "title": "Document session 6 outcome with corrected hypothesis",
+      "id": "US-704",
+      "title": "Commit Phase 0 + write Phase 0.5 stories for next iteration",
       "priority": 4,
       "acceptanceCriteria": [
-        "docs/session_6_int8_act.md captures the US-601 ablation result and the negative verdict on the INT8-quant hypothesis.",
-        "Session doc records the environmental regression (bitnet.cpp pip install breaking bench_batch32 via dlpack kUInt bits 32) so future sessions know the state of the TT env.",
-        "README / MEMO reflect that the ~0.019 PCC gap vs any reference is architecturally infeasible under current tt-metal op set.",
-        "bench_vs_bitnetcpp.py, bench_vs_hf_noquant.py, extract_logits.cpp committed for future use.",
-        "Commit + push to origin/main, sync TT server."
+        "All Phase 0 changes committed to origin/main and synced to TT.",
+        "Phase 0.5 stories added to this PRD for next Ralph iteration (fp32 RMSNorm ablation + cross-layer fp32 residual ablation + paired bootstrap CI gate)."
       ],
-      "passes": true,
-      "notes": "DONE. docs/session_6_int8_act.md includes the US-601 ablation table, the bitnet.cpp outlier analysis, the environmental regression note, and the explicit architectural-infeasibility conclusion. bench_vs_bitnetcpp.py + bench_vs_hf_noquant.py committed at cc155df. generator_batch32.py int64->int32 patch committed. Architect review APPROVED session 6 closure on US-601 evidence alone (15x margin between measured Δ +0.001 and required Δ +0.019)."
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-705",
+      "title": "Phase 0.5 (a): fp32 RMSNorm accumulator ablation",
+      "priority": 5,
+      "acceptanceCriteria": [
+        "Enable fp32_dest_acc_en on every rmsnorm call site (or closest equivalent compute_kernel_config flag).",
+        "Run bench_accuracy with 5 prompts × 5 runs = 25 paired samples vs reconciled HEAD.",
+        "Compute 90% percentile bootstrap CI on delta_PCC.",
+        "Record (delta_PCC_mean, delta_PCC_90CI_lower, delta_PCC_90CI_upper, delta_tps)."
+      ],
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-706",
+      "title": "Phase 0.5 (b): cross-layer fp32 residual stream ablation",
+      "priority": 6,
+      "acceptanceCriteria": [
+        "Patch forward pass so the residual-stream tensor stays in fp32 across all 30 transformer blocks; only downcast to bf16 at final pre-lm_head boundary.",
+        "Op inputs remain bf16; op outputs upcast to fp32 before residual add.",
+        "Run same 25 paired samples + bootstrap CI.",
+        "Wall-clock abort: if per-sample wall-clock > 5× normal prefill, drop to 3×3 = 9 samples with 80% CI; hard abort if 9-sample run > 1 day."
+      ],
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-707",
+      "title": "Phase 0.5 gate evaluation — REDIRECT / PROCEED / AMBIGUOUS",
+      "priority": 7,
+      "acceptanceCriteria": [
+        "REDIRECT if either ablation's lower 90% CI bound on delta_PCC ≥ 0.005.",
+        "PROCEED (to Phase 1 per-op RFE) if both ablations' upper 90% CI bounds < 0.002.",
+        "AMBIGUOUS → run combined (a)+(b), re-gate; still ambiguous → conservative REDIRECT.",
+        "If REDIRECT: insert tt-metal fp32_dest_acc_en feasibility catalog (~1 day); <80% seam coverage → hybrid fallback.",
+        "Produce docs/session_7_phase_0p5_gate_decision.md recording outcome + rationale."
+      ],
+      "passes": false,
+      "notes": ""
     }
   ]
 }

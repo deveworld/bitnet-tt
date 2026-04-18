@@ -4,9 +4,13 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Current perf (2026-04-17, batch32 + trace + fused RoPE + packed_ternary):
-  **p50 17.5 ms = 57.1 t/s**, min 16.9 ms = 59.2 t/s peak, decode_tps ≈ 50.4
-  (64-tok bench). Beats bfp4 production (30.15) by +89 % at half storage.
+- Current perf (2026-04-18, batch32 + trace + fused RoPE + packed_ternary,
+  reconciled in `docs/session_7_baseline_reconciled.md`):
+  **p50 12.0 ms / decode_tps 71.05 t/s (128-tok bench)**,
+  p50 11.5 ms / decode_tps 68.93 t/s (64-tok bench).
+  Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale — predates the
+  split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-lookup /
+  fused-QKV-norm stack.
 - Historical Alpha baseline (`cd995ba` + HiFi2 kernel ≈ 8.5 t/s) kept
   in tables below for context only — current stable path is the
   packed_ternary + fused-QKV-norm pipeline documented in README / TODO.
