@@ -1,11 +1,64 @@
 {
-  "title": "BitNet-TT session 9: Phase 2 — self_attn sub-op localization + cheap-lever tests",
-  "goal": "Drill into self_attn, identify sub-op contribution, attempt kernel-level alignment.",
-  "outcome_summary": "Sub-op captures show L0.post_attn_sub_norm RFE 0.420 as local max; L0.post_input_norm is near bit-identical (0.009). Three cheap fidelity levers (fp32 RMSNorm acc, SDPA HiFi4, manual RoPE) all produced noise-level or negative PCC deltas. Deeper SDPA algorithmic rewrite needed for alignment — out of cheap-lever scope.",
+  "title": "BitNet-TT session 10: Phase 2 deeper — manual SDPA via ttnn primitives",
+  "baseline": {
+    "decode_tps": 71.05,
+    "pcc_vs_hf_fp32": 0.982032,
+    "commit": "2e1c0d2"
+  },
+  "goal": "Replace ttnn.transformer.scaled_dot_product_attention with explicit Q@K/sqrt(d) + causal_mask + softmax + @V primitives. Tests whether the fused SDPA kernel's internal softmax/reduction divergence is the drift source. If manual SDPA closes more of the gap, we have an actionable target without full kernel rewrite.",
+  "constraints": [
+    "Gate behind BITNET_MANUAL_SDPA env flag; default OFF.",
+    "Only apply to prefill path (measured path); decode path unaffected.",
+    "Compare PCC + decode_tps vs baseline.",
+    "Same capture harness from sessions 8-9 measures sub-op RFE change."
+  ],
   "stories": [
-    {"id": "US-901", "title": "Sub-op captures in MultiHeadAttention", "passes": true, "notes": "DONE. 5 capture points added inside _forward_prefill_with_preallocated_cache (post_qkv_{q,k,v}, post_rope_{q,k}, post_sdpa, post_attn_sub_norm, post_o_proj). Lazy _mc_attn import avoids circular import with transformer.py."},
-    {"id": "US-902", "title": "Fine RFE ranking", "passes": true, "notes": "DONE. L0.post_input_norm 0.009 (near-bit-identical), L0.post_attn_sub_norm 0.420 (local max), L0.post_self_attn 0.240, L0.block_output 0.139. SDPA/RoPE/sub_norm chain dominates drift at L0."},
-    {"id": "US-903", "title": "Align top-1 sub-op kernel", "passes": true, "notes": "ATTEMPTED + FALSIFIED. Cheap levers: (1) SDPA HiFi4 compute_kernel_config via BITNET_SDPA_HIFI4 env: PCC 0.981527 (-0.0005); (2) use_fused_rope=False manual RoPE: PCC 0.979598 (-0.0007); (3) fp32 RMSNorm accumulator (US-705): +0.0005. All regressions or noise. Conclusion: SDPA algorithmic divergence from PyTorch bf16 cannot be closed by compute_kernel_config alone. A true alignment would require rewriting SDPA to match PyTorch's reduction order/softmax approximation bit-for-bit — multi-day tt-metal kernel work, out of scope for this session."},
-    {"id": "US-904", "title": "Joint re-measurement + commit", "passes": true, "notes": "DONE. Current HEAD 9524369: decode_tps 71.05 t/s unchanged (flags all default OFF), PCC 0.982032 baseline. Phase 2 closes with a falsified cheap-lever hypothesis; next Ralph session would need to either (a) commit to a multi-day SDPA kernel rewrite, or (b) accept current 0.982 as the practical ceiling. User direction required before starting (a)."}
+    {
+      "id": "US-1001",
+      "title": "Implement manual SDPA helper in attention.py",
+      "priority": 1,
+      "acceptanceCriteria": [
+        "Add _manual_sdpa(q, k, v, scale, is_causal) that does explicit matmul+softmax+matmul via ttnn primitives.",
+        "Dispatched from _forward_prefill_with_preallocated_cache when BITNET_MANUAL_SDPA=1.",
+        "Shape-compatible with current SDPA output."
+      ],
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-1002",
+      "title": "Measure PCC + tps with manual SDPA",
+      "priority": 2,
+      "acceptanceCriteria": [
+        "BITNET_MANUAL_SDPA=1 bench_accuracy vs baseline.",
+        "BITNET_MANUAL_SDPA=1 bench_batch32 vs baseline.",
+        "Record delta PCC and delta tps."
+      ],
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-1003",
+      "title": "Re-run per-op RFE localization with manual SDPA",
+      "priority": 3,
+      "acceptanceCriteria": [
+        "pcc_localize.py with BITNET_MANUAL_SDPA=1 shows updated L0.post_self_attn RFE.",
+        "Identify whether the 0.240 RFE drops, and by how much."
+      ],
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-1004",
+      "title": "Commit + decide next step",
+      "priority": 4,
+      "acceptanceCriteria": [
+        "Commit to origin/main, sync TT.",
+        "If PCC improves by ≥0.005: keep default ON, declare Phase 2 win.",
+        "If unchanged or worse: document + cancel."
+      ],
+      "passes": false,
+      "notes": ""
+    }
   ]
 }

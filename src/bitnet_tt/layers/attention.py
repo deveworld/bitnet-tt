@@ -28,6 +28,27 @@ from bitnet_tt.config import get_compute_kernel_config
 import os as _os
 _BITNET_SDPA_HIFI4 = _os.environ.get("BITNET_SDPA_HIFI4", "").strip() in ("1", "true", "yes", "on")
 _sdpa_hifi4_cfg = get_compute_kernel_config("hifi4") if _BITNET_SDPA_HIFI4 else None
+_BITNET_MANUAL_SDPA = _os.environ.get("BITNET_MANUAL_SDPA", "").strip() in ("1", "true", "yes", "on")
+
+def _manual_sdpa(query, key, value, scale, seq_len):
+    """Explicit attention via primitives: Q@K^T*scale + causal_mask + softmax + @V."""
+    import torch as _torch
+    # Q@K^T  ->  [b, h, s, s]
+    key_t = ttnn.transpose(key, -1, -2)
+    scores = ttnn.matmul(query, key_t)
+    ttnn.deallocate(key_t)
+    scores = ttnn.multiply(scores, scale)
+    # causal mask: additive -inf on upper triangular (k>=1)
+    mask = _torch.zeros((seq_len, seq_len), dtype=_torch.bfloat16)
+    mask.masked_fill_(_torch.triu(_torch.ones(seq_len, seq_len, dtype=_torch.bool), diagonal=1), float("-inf"))
+    mask_tt = ttnn.from_torch(mask.reshape(1, 1, seq_len, seq_len), device=query.device(), layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+    scores = ttnn.add(scores, mask_tt)
+    ttnn.deallocate(mask_tt)
+    probs = ttnn.softmax(scores, dim=-1)
+    ttnn.deallocate(scores)
+    out = ttnn.matmul(probs, value)
+    ttnn.deallocate(probs)
+    return out
 def _mc_attn(*args, **kwargs):
     from bitnet_tt.model.transformer import _maybe_capture as _mc
     return _mc(*args, **kwargs)
@@ -1413,18 +1434,21 @@ class MultiHeadAttention:
             value_expanded = past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :]
 
         # SDPA (causal attention for prefill)
-        _sdpa_kwargs = {}
-        if _sdpa_hifi4_cfg is not None:
-            _sdpa_kwargs["compute_kernel_config"] = _sdpa_hifi4_cfg
-        attn_output = ttnn.transformer.scaled_dot_product_attention(
-            query,
-            key_expanded,
-            value_expanded,
-            attn_mask=None,
-            is_causal=True,
-            scale=self._sdpa_scale,
-            **_sdpa_kwargs,
-        )
+        if _BITNET_MANUAL_SDPA:
+            attn_output = _manual_sdpa(query, key_expanded, value_expanded, self._sdpa_scale, seq_len)
+        else:
+            _sdpa_kwargs = {}
+            if _sdpa_hifi4_cfg is not None:
+                _sdpa_kwargs["compute_kernel_config"] = _sdpa_hifi4_cfg
+            attn_output = ttnn.transformer.scaled_dot_product_attention(
+                query,
+                key_expanded,
+                value_expanded,
+                attn_mask=None,
+                is_causal=True,
+                scale=self._sdpa_scale,
+                **_sdpa_kwargs,
+            )
         _mc_attn(self.layer_idx, "post_sdpa", attn_output)
 
         # Cleanup expanded tensors
