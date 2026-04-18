@@ -28,6 +28,20 @@ speed cost of **~20 t/s**. That puts the speed side at ~54 t/s, which
 is incompatible with the ≥ 80 t/s target. Mixed precision cannot close
 both gaps simultaneously on this architecture.
 
+**Caveat on the linear extrapolation.** The 11-layer estimate assumes
+each bf16 layer contributes about +0.0008 PCC independently and
+additively. In practice per-layer quantisation error is not guaranteed
+to be linear — early layers, the final layer feeding the lm_head, or
+specific bottleneck layers may well contribute disproportionately. A
+2-layer (e.g. `BITNET_BF16_LAYERS=0,29`) and 3-layer measurement
+would tighten the curve. Even so, the *direction* of the
+trade is stable: every bf16 layer costs roughly -1.7 t/s on this
+pipeline, so any PCC-oriented configuration that clears 0.99 has a
+ceiling well below 80 t/s. The stretch target remaining out of
+reach does not depend on the linear assumption — it depends only on
+the sign of the t/s cost per bf16 layer, which is empirically
+negative.
+
 ### (2) Device-side embed lookup (US-203)
 
 Replaced the 160 KB/step H2D copy of the pre-built embed tensor with an
