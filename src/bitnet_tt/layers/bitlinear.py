@@ -1,3 +1,4 @@
+import os
 """
 BitLinear layer implementation for BitNet b1.58 using TT-NN.
 
@@ -11,6 +12,21 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.utils.quantization import weight_quant_ternary
+
+_BITNET_RMSNORM_FP32_ACC = os.environ.get("BITNET_RMSNORM_FP32_ACC", "").strip() in ("1", "true", "yes", "on")
+
+def _rmsnorm_compute_kernel_config(device):
+    if not _BITNET_RMSNORM_FP32_ACC:
+        return None
+    try:
+        from ttnn import WormholeComputeKernelConfig, MathFidelity
+        return WormholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
+    except Exception:
+        try:
+            from ttnn import BlackholeComputeKernelConfig, MathFidelity
+            return BlackholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
+        except Exception:
+            return None
 
 
 def numpy_to_ttnn(
@@ -415,6 +431,7 @@ class RMSNorm:
                 epsilon=self.eps,
                 weight=self.weight,
                 memory_config=self._shard_cfg,
+                compute_kernel_config=_rmsnorm_compute_kernel_config(self.device),
             )
             ttnn.deallocate(x_sh)
             out_mem = memory_config if memory_config is not None else ttnn.L1_MEMORY_CONFIG
@@ -422,4 +439,5 @@ class RMSNorm:
             ttnn.deallocate(out_sh)
             return out
         return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight,
-                             memory_config=memory_config)
+                             memory_config=memory_config,
+                             compute_kernel_config=_rmsnorm_compute_kernel_config(self.device))
