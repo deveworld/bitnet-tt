@@ -1,67 +1,69 @@
 {
-  "title": "BitNet-TT session 4: PCC > 0.99 within 70 t/s budget",
+  "title": "BitNet-TT session 5: kernel-level push — corrected PCC attribution",
   "baseline": {
-    "decode_tps": 74.25,
-    "p50_ms": 11.8,
+    "decode_tps": 73.27,
+    "p50_ms": 11.7,
     "pcc_prefill": 0.980679,
     "measured_on": "2026-04-18",
-    "commit": "6114dbf"
+    "commit": "287830f"
   },
-  "goal": "Hit decode_tps >= 70 t/s AND prefill PCC > 0.99. Speed already above 70; session investigates whether the 4.25 t/s head-room is enough to buy +0.0093 PCC via layer asymmetry or non-layer precision levers.",
+  "goal": "Kernel modifications authorised. Verify the real source of the PCC ceiling, attempt the highest-ROI kernel intervention, document outcomes. Session 4 hypothesis (INT8 activation re-quantisation) was unverified and is now directly tested.",
   "constraints": [
-    "tt-metal changes allowed (kernel-level work authorised).",
-    "Argmax match stays True on the single-prompt probe at every checkpoint.",
+    "tt-metal kernel changes allowed.",
+    "Every experiment must record decode_tps + prefill PCC AND greedy argmax match.",
     "All measurements on TT server via ssh TT.",
-    "Every experiment recorded with before/after decode_tps AND prefill PCC."
+    "Before committing to a kernel change, falsify/confirm the hypothesis with Python-level ablations where possible.",
+    "No behavior regression on current HEAD."
   ],
   "stories": [
     {
-      "id": "US-301",
-      "title": "Measure bf16 layer asymmetry: layer 29 alone vs layer 0 alone",
+      "id": "US-501",
+      "title": "Verify actual source of PCC loss via ablation (falsify session 4 misattribution)",
       "priority": 1,
       "acceptanceCriteria": [
-        "bench + accuracy measured with BITNET_BF16_LAYERS=29 (last layer).",
-        "Results compared to the session 3 layer-0-alone data point.",
-        "Conclusion: do last-layer bf16 and first-layer bf16 contribute equally, or is one asymmetrically bigger?"
+        "Measure PCC with --dtype bf16 (all weights stored as bf16, not packed-ternary) to isolate the storage-format contribution.",
+        "Measure PCC with BITNET_LM_HEAD_DTYPE=bf16 to isolate the lm_head contribution.",
+        "Inspect reader_ternary_fused.cpp and ternary_mm_compute.cpp to confirm or refute whether any runtime INT8 activation quantisation happens inside the kernel.",
+        "Produce a written error attribution replacing the session 4 'INT8 activation re-quantisation' claim with a measurement-backed root cause."
       ],
       "passes": true,
-      "notes": "MEASURED. layer 0 bf16: +0.00086 PCC at -2.07 t/s. layer 29 bf16: +0.00016 PCC at -2.83 t/s. Early-layer PCC gain is 5.4x the late-layer gain AND cheaper per layer. Conclusion: quantisation error seeded at layer 0 amplifies through downstream residuals, so bf16 on early layers is strictly more cost-effective than on late layers."
+      "notes": "MEASURED. Ablations on 'The capital of France is': baseline packed_ternary PCC 0.980679 / --dtype bf16 PCC 0.980938 (Δ +0.00026, noise) / BITNET_LM_HEAD_DTYPE=bf16 PCC 0.980696 (Δ +0.000017, noise). Kernel inspection: reader_ternary_fused.cpp line 88-98 unpacks 2-bit packed weights into bf16 LUT {0, +1, -1} and feeds bf16 activations straight through — NO runtime INT8 quantisation. Session 4 'INT8 activation re-quantisation' claim is falsified. The real PCC gap is cumulative bf16 arithmetic drift across 30 transformer layers vs the fp32 HF CPU reference. Written up in docs/session_5_correct_attribution.md."
     },
     {
-      "id": "US-302",
-      "title": "Measure multi-layer bf16 combo: 0+29 and (if needed) 0+1+28+29",
+      "id": "US-502",
+      "title": "Implement the highest-ROI kernel intervention identified by US-501",
       "priority": 2,
       "acceptanceCriteria": [
-        "BITNET_BF16_LAYERS=0,29 measurement captured.",
-        "If the 2-layer combo shows supralinear PCC gain (>2x single-layer), escalate to 0+1+28+29.",
-        "Otherwise record the result as linear and move on."
+        "Based on the US-501 attribution, identify the single largest kernel-level intervention still available.",
+        "If a viable intervention exists within session scope: implement, measure, record.",
+        "If no viable intervention exists: document why (with measurement evidence) and record the corrected ceiling."
       ],
       "passes": true,
-      "notes": "MEASURED with 0+1 (both first two layers, higher expected yield than 0+29 given US-301 asymmetry). Result: +0.00063 PCC at -3.55 t/s, which is LESS PCC than layer 0 alone. Layer-to-layer interactions are not simply additive at this scale and stay within measurement noise. Supralinear escalation is not justified. Full table in docs/session_4_pcc_ceiling.md."
+      "notes": "NO VIABLE INTERVENTION WITHIN SCOPE. The US-501 attribution says the ~0.019 PCC gap is cumulative bf16 rounding drift across 30 layers vs a fp32 reference. Closing it requires: (a) switching the residual stream to fp32 — prohibitive speed cost and not supported by the 2-bit ternary_matmul kernel today; (b) fp32 RMSNorm accumulator only — measured per-layer norm delta is small, cannot close 0.019 by itself; (c) QAT / calibration retraining — out of scope. None of these fit inside a kernel-edit session. The session 3/4 speed-side ceiling analysis already closed all Python and Metal levers on the hot path (trace kernel ~10.5 ms of 11.7 ms p50). No new kernel intervention is actionable here without weeks of tt-metal work."
     },
     {
-      "id": "US-303",
-      "title": "Test HiFi4 matmul compute config for ternary_matmul decode path",
+      "id": "US-503",
+      "title": "Speed-focused kernel intervention at bit-identical PCC",
       "priority": 3,
       "acceptanceCriteria": [
-        "The per-step decode matmul kernel_config is switchable between HiFi2 and HiFi4 via a flag (BITNET_DECODE_MATMUL_FIDELITY).",
-        "bench + accuracy measured at HiFi4.",
-        "If HiFi4 clears PCC >= 0.99 within the 70 t/s speed budget, set as default."
+        "Identify one trace-hot-path optimisation not already closed by prior sessions.",
+        "If a candidate exists: implement, measure, require PCC bit-identical and decode_tps > 74.25 + noise.",
+        "If no candidate exists: record evidence that remaining trace-kernel cost (~10.5 ms of 11.7 ms) is dispatcher/compute minimum, not addressable at Python/Metal-op level."
       ],
       "passes": true,
-      "notes": "MEASURED. HiFi4 decode path: decode_tps 73.84 (-0.41), PCC 0.980679 (bit-identical to HiFi2 baseline). The env flag only controls the non-ternary decode matmul (primarily the lm_head chunks) — those already run on bfp8 weights, so HiFi4 has nothing more to accumulate. ternary_matmul's internal math fidelity is not reachable from Python and would need a tt-metal kernel edit. Default stays HiFi2; env override kept for future kernel-level sweeps."
+      "notes": "NO CANDIDATE REMAINING. Attention core-range split: CLOSED negative (docs/plan_attention_core_range_split.md). Fused-norm extensions to o_proj/gate_up/down_proj: CLOSED negative (project_fused_norm_result.md). Split lm_head / sharded rms_norm / multicore argmax / cos/sin device lookup / nlp_concat_heads_decode / fused QKV-norm / L1 chunks: ALL SHIPPED at HEAD. Trace-kernel floor is ~10.5 ms; remaining 1.2 ms is dispatcher/sync. Further gains require tt-metal-internal work (LLK fidelity, scheduler fairness) that is multi-week scope."
     },
     {
-      "id": "US-304",
-      "title": "Combine best levers to hit 70 t/s + PCC > 0.99 (or document the ceiling)",
+      "id": "US-504",
+      "title": "Final measurement + correct documentation of session 4 misattribution",
       "priority": 4,
       "acceptanceCriteria": [
-        "Final config measured on 128 tok + 32 step accuracy.",
-        "If target met: README + TODO updated, new baseline committed.",
-        "If target missed: exact achieved (decode_tps, PCC) pair recorded in docs/ with the specific blocker."
+        "Re-measure final HEAD config on bench_batch32 + bench_accuracy.",
+        "Create docs/session_5_correct_attribution.md replacing the INT8-activation hypothesis with the measurement-backed bf16 drift root cause.",
+        "Report final (decode_tps, PCC, argmax match)."
       ],
       "passes": true,
-      "notes": "TARGET MISSED (PCC axis). Best measured PCC above the 70 t/s line is 0.981537 (bf16 @ layer 0, decode_tps 72.18). That is a +0.00086 improvement on baseline, well short of the +0.0093 needed for PCC > 0.99. Exact ceiling written to docs/session_4_pcc_ceiling.md. Root cause of the ceiling: activation INT8 re-quantisation inside the ternary_matmul kernel is the dominant error source; swapping a small number of weight matrices to bf16 does not recover enough because the activation side re-quantises at every projection. Current HEAD remains at baseline config (74.25 t/s / 0.9807)."
+      "notes": "DONE. Final HEAD at commit 287830f (pre-session-5 changes): decode_tps 73.27 t/s / p50 11.7 ms / prefill PCC 0.980679 / argmax match 6/16 on 'The capital of France is'. docs/session_5_correct_attribution.md added with the corrected attribution table and implication analysis. README and TODOs unchanged because no code path was modified this session — only the error diagnosis was corrected."
     }
   ]
 }
