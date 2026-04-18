@@ -567,6 +567,15 @@ class Batch32Generator:
             "BITNET_DECODE_COS_SIN_LOOKUP", "1"
         ) not in ("0", "false", "False")
 
+        # Device-side embedding lookup: replace the 160 KB/step H2D copy
+        # of pre-built embed tensors with a tiny token_id copy (128 B)
+        # plus an inlined ttnn.embedding inside the trace. Opt-in via
+        # BITNET_EMBED_DEVICE_LOOKUP (default on).
+        self._use_embed_lookup = os.environ.get(
+            "BITNET_EMBED_DEVICE_LOOKUP", "1"
+        ) not in ("0", "false", "False")
+        self._token_id_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
+
         if self.tokenizer is None:
             self._load_default_tokenizer()
 
@@ -940,11 +949,20 @@ class Batch32Generator:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
+        token_id_tensor = ttnn.from_torch(
+            torch.zeros(pos_shape, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
         cos, sin = self.rotary_setup.create_cos_sin_device_tensors(position=0)
 
         return {
             "embeds": embeds,
             "pos_tensor": pos_tensor,
+            "token_id": token_id_tensor,
             "cos": cos,
             "sin": sin,
         }
@@ -972,6 +990,28 @@ class Batch32Generator:
 
         self._embed_host_cache[token_id] = embed_host
         return embed_host
+
+    def _get_token_id_host_tensor(self, token_id: int) -> ttnn.Tensor:
+        """Host [PADDED_BATCH] uint32 tensor with token_id broadcast across
+        all rows. Used by the device-side embedding lookup path so the
+        per-step H2D shrinks from the full 160 KB embed slab to 128 B."""
+        cached = self._token_id_host_cache.get(token_id)
+        if cached is not None:
+            self._token_id_host_cache.move_to_end(token_id)
+            return cached
+
+        token_id_host = ttnn.from_torch(
+            torch.full((PADDED_BATCH,), token_id, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,
+        )
+        while len(self._token_id_host_cache) >= MAX_DECODE_POS_CACHE:
+            _, old_tensor = self._token_id_host_cache.popitem(last=False)
+            ttnn.deallocate(old_tensor)
+
+        self._token_id_host_cache[token_id] = token_id_host
+        return token_id_host
 
     def _get_pos_host_tensor(self, current_pos: int) -> ttnn.Tensor:
         """Get cached host tensor for one decode position."""
@@ -1003,12 +1043,20 @@ class Batch32Generator:
             ttnn.deallocate(tensor)
         self._pos_host_cache.clear()
 
+        for tensor in self._token_id_host_cache.values():
+            ttnn.deallocate(tensor)
+        self._token_id_host_cache.clear()
+
         self.rotary_setup.release_host_cache()
 
     def _copy_decode_inputs(self, inputs: dict, token_id: int, current_pos: int) -> None:
         """Update persistent decode inputs with the next token and position."""
-        embed_host = self._get_embed_host_tensor(token_id)
-        ttnn.copy_host_to_device_tensor(embed_host, inputs["embeds"])
+        if self._use_embed_lookup:
+            token_id_host = self._get_token_id_host_tensor(token_id)
+            ttnn.copy_host_to_device_tensor(token_id_host, inputs["token_id"])
+        else:
+            embed_host = self._get_embed_host_tensor(token_id)
+            ttnn.copy_host_to_device_tensor(embed_host, inputs["embeds"])
 
         pos_host = self._get_pos_host_tensor(current_pos)
         ttnn.copy_host_to_device_tensor(pos_host, inputs["pos_tensor"])
@@ -1022,6 +1070,24 @@ class Batch32Generator:
             cos_host, sin_host = self.rotary_setup.get_cos_sin_host_tensor(current_pos)
             ttnn.copy_host_to_device_tensor(cos_host, inputs["cos"])
             ttnn.copy_host_to_device_tensor(sin_host, inputs["sin"])
+
+    def _resolve_decode_embed(self, inputs: dict) -> ttnn.Tensor:
+        """Return the device tensor the decode step should use as
+        `token_embeds`. When the embed lookup flag is on we derive the
+        [1, 1, 32, hidden] tile-layout tensor from the token_id slot
+        via ttnn.embedding against the model's pre-loaded embedding
+        weight; otherwise we return the persistent embed slot directly.
+        This lets the device-side lookup be captured inside the trace
+        with no change to _decode_step_batch32's signature."""
+        if not self._use_embed_lookup:
+            return inputs["embeds"]
+        raw = ttnn.embedding(inputs["token_id"], self.model.embed_tokens.weight)
+        tile = ttnn.to_layout(raw, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(raw)
+        shaped = ttnn.reshape(
+            tile, (1, 1, PADDED_BATCH, self.config.hidden_size)
+        )
+        return shaped
 
     def _ensure_decode_inputs(self) -> dict:
         """Lazily allocate reusable non-trace decode inputs."""
@@ -1051,13 +1117,18 @@ class Batch32Generator:
         if cache_key not in self._warmed_trace_keys:
             saved_seq_len = [cache.seq_len_cached for cache in self._kv_caches or []]
 
+            warmup_embed = self._resolve_decode_embed(self._trace_inputs)
             warmup_logits = self._decode_step_batch32(
-                self._trace_inputs["embeds"],
+                warmup_embed,
                 current_pos,
                 self._trace_inputs["pos_tensor"],
                 self._trace_inputs["cos"],
                 self._trace_inputs["sin"],
             )
+            if self._use_embed_lookup:
+                # lookup path allocates a fresh embed per call; release it
+                # here (the persistent inputs["embeds"] slot is untouched).
+                ttnn.deallocate(warmup_embed)
             # Prime argmax(use_multicore=True) program cache / semaphore state
             # outside trace capture. The op's first call performs host-side
             # writes that are rejected inside begin_trace_capture.
@@ -1073,13 +1144,18 @@ class Batch32Generator:
 
         self._trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
 
+        trace_embed = self._resolve_decode_embed(self._trace_inputs)
         self._trace_output = self._decode_step_batch32(
-            self._trace_inputs["embeds"],
+            trace_embed,
             current_pos,
             self._trace_inputs["pos_tensor"],
             self._trace_inputs["cos"],
             self._trace_inputs["sin"],
         )
+        if self._use_embed_lookup:
+            # lookup path allocates a fresh embed per call; release it
+            # before end_trace_capture so the trace replays the free.
+            ttnn.deallocate(trace_embed)
         trace_logits_rm = ttnn.to_layout(self._trace_output, ttnn.ROW_MAJOR_LAYOUT)
         # use_multicore=True parallelizes the vocab-dim reduction across the
         # core grid instead of running a single-core kernel. Measured delta:
@@ -1115,13 +1191,16 @@ class Batch32Generator:
         """Run one decode step using reusable device inputs without trace capture."""
         decode_inputs = self._ensure_decode_inputs()
         self._copy_decode_inputs(decode_inputs, token_id, current_pos)
+        embed = self._resolve_decode_embed(decode_inputs)
         logits = self._decode_step_batch32(
-            decode_inputs["embeds"],
+            embed,
             current_pos,
             decode_inputs["pos_tensor"],
             decode_inputs["cos"],
             decode_inputs["sin"],
         )
+        if self._use_embed_lookup:
+            ttnn.deallocate(embed)
         self._set_kv_cache_length(current_pos + 1)
         return logits
 
