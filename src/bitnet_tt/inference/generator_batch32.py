@@ -567,17 +567,11 @@ class Batch32Generator:
             "BITNET_DECODE_COS_SIN_LOOKUP", "1"
         ) not in ("0", "false", "False")
 
-        # Device-side embedding lookup: replace the 160 KB/step H2D copy
-        # with an inlined ttnn.embedding inside the trace. Tested and
-        # found to only net +0.3 t/s on 128-tok bench (the H2D was
-        # already overlapping dispatch) while shifting the decode
-        # trajectory enough to drop greedy match/32 from 6 to 1 on the
-        # "The capital of France is" probe — the device embedding keeps
-        # the fp32 weight precision one op longer than the host bf16
-        # round-trip, so downstream ternary_matmul / rms_norm consume
-        # numerically different bytes. Default off; BITNET_EMBED_DEVICE_LOOKUP=1
-        # to re-enable for future experiments once the dtype mismatch
-        # has been fixed.
+        # Device-side embed lookup (BITNET_EMBED_DEVICE_LOOKUP, default
+        # off). Measured +0.31 t/s but shifted greedy match/32 from 6
+        # to 1 because the device embed keeps fp32 precision one op
+        # longer than the host bf16 round-trip. Full writeup in
+        # docs/session_3_ceiling_analysis.md.
         self._use_embed_lookup = os.environ.get(
             "BITNET_EMBED_DEVICE_LOOKUP", "0"
         ) not in ("0", "false", "False")
