@@ -1,69 +1,69 @@
 {
-  "title": "BitNet-TT session 5: kernel-level push — corrected PCC attribution",
+  "title": "BitNet-TT session 6: match bitnet.cpp — INT8 activation quant feasibility",
   "baseline": {
-    "decode_tps": 73.27,
+    "decode_tps": 74.21,
     "p50_ms": 11.7,
-    "pcc_prefill": 0.980679,
+    "pcc_vs_hf_fp32": 0.980679,
+    "pcc_vs_hf_bf16": 0.981319,
+    "pcc_vs_bitnetcpp": 0.967860,
     "measured_on": "2026-04-18",
-    "commit": "287830f"
+    "commit": "a0490ae"
   },
-  "goal": "Kernel modifications authorised. Verify the real source of the PCC ceiling, attempt the highest-ROI kernel intervention, document outcomes. Session 4 hypothesis (INT8 activation re-quantisation) was unverified and is now directly tested.",
+  "goal": "Determine whether implementing per-token INT8 absmax activation quantisation inside ternary_matmul (matching bitnet.cpp / HF AutoBitLinear semantics) can close the PCC gap to bitnet.cpp while staying above 70 t/s.",
   "constraints": [
-    "tt-metal kernel changes allowed.",
-    "Every experiment must record decode_tps + prefill PCC AND greedy argmax match.",
+    "tt-metal kernel changes authorised.",
+    "Every experiment records decode_tps + PCC vs bitnet.cpp + argmax match.",
     "All measurements on TT server via ssh TT.",
-    "Before committing to a kernel change, falsify/confirm the hypothesis with Python-level ablations where possible.",
-    "No behavior regression on current HEAD."
+    "Before committing weeks of kernel work, verify numerical feasibility with a host-side ablation of the same hypothesis."
   ],
   "stories": [
     {
-      "id": "US-501",
-      "title": "Verify actual source of PCC loss via ablation (falsify session 4 misattribution)",
+      "id": "US-601",
+      "title": "Verify whether INT8 activation quantisation could close the PCC gap before any kernel work",
       "priority": 1,
       "acceptanceCriteria": [
-        "Measure PCC with --dtype bf16 (all weights stored as bf16, not packed-ternary) to isolate the storage-format contribution.",
-        "Measure PCC with BITNET_LM_HEAD_DTYPE=bf16 to isolate the lm_head contribution.",
-        "Inspect reader_ternary_fused.cpp and ternary_mm_compute.cpp to confirm or refute whether any runtime INT8 activation quantisation happens inside the kernel.",
-        "Produce a written error attribution replacing the session 4 'INT8 activation re-quantisation' claim with a measurement-backed root cause."
+        "Inspect HF AutoBitLinear to confirm it already applies per-token INT8 absmax ActQuant on every forward.",
+        "Toggle ActQuant ON vs OFF in HF bf16 reference and compare TT PCC against each variant.",
+        "If the ActQuant toggle changes TT PCC by < 0.01, conclude INT8 quantisation is NOT the cause of the gap and kernel work is not justified.",
+        "If it changes TT PCC by > 0.01, proceed with the kernel implementation (US-602 / US-603)."
       ],
       "passes": true,
-      "notes": "MEASURED. Ablations on 'The capital of France is': baseline packed_ternary PCC 0.980679 / --dtype bf16 PCC 0.980938 (Δ +0.00026, noise) / BITNET_LM_HEAD_DTYPE=bf16 PCC 0.980696 (Δ +0.000017, noise). Kernel inspection: reader_ternary_fused.cpp line 88-98 unpacks 2-bit packed weights into bf16 LUT {0, +1, -1} and feeds bf16 activations straight through — NO runtime INT8 quantisation. Session 4 'INT8 activation re-quantisation' claim is falsified. The real PCC gap is cumulative bf16 arithmetic drift across 30 transformer layers vs the fp32 HF CPU reference. Written up in docs/session_5_correct_attribution.md."
+      "notes": "MEASURED. HF AutoBitLinear source confirms it applies ActQuant (per-token INT8 absmax symmetric) on every forward. Ran TT vs HF bf16 with ActQuant toggled: ON -> PCC 0.981319, OFF -> PCC 0.980143. Delta = +0.0012, which is noise-level. Conclusion: INT8 activation quantisation is NOT the cause of the ~0.019 PCC gap. The real source is op-level numerical implementation differences between tt-metal and PyTorch/CUDA bf16 (SDPA, RMSNorm, RoPE, reduction order) — not the BitNet-specific activation quant scheme. Implementing INT8 act quant in the kernel would at best move PCC by the same 0.001 delta. US-602 / US-603 kernel work is therefore NOT justified and is closed without implementation."
     },
     {
-      "id": "US-502",
-      "title": "Implement the highest-ROI kernel intervention identified by US-501",
+      "id": "US-602",
+      "title": "Kernel: add INT8 per-token absmax activation quantisation to ternary_matmul",
       "priority": 2,
       "acceptanceCriteria": [
-        "Based on the US-501 attribution, identify the single largest kernel-level intervention still available.",
-        "If a viable intervention exists within session scope: implement, measure, record.",
-        "If no viable intervention exists: document why (with measurement evidence) and record the corrected ceiling."
+        "If US-601 returned 'gap is INT8-quant-related': implement the kernel.",
+        "If US-601 returned 'gap is NOT INT8-quant-related': mark this story obsolete with the measured evidence."
       ],
       "passes": true,
-      "notes": "NO VIABLE INTERVENTION WITHIN SCOPE. The US-501 attribution says the ~0.019 PCC gap is cumulative bf16 rounding drift across 30 layers vs a fp32 reference. Closing it requires: (a) switching the residual stream to fp32 — prohibitive speed cost and not supported by the 2-bit ternary_matmul kernel today; (b) fp32 RMSNorm accumulator only — measured per-layer norm delta is small, cannot close 0.019 by itself; (c) QAT / calibration retraining — out of scope. None of these fit inside a kernel-edit session. The session 3/4 speed-side ceiling analysis already closed all Python and Metal levers on the hot path (trace kernel ~10.5 ms of 11.7 ms p50). No new kernel intervention is actionable here without weeks of tt-metal work."
+      "notes": "OBSOLETE by US-601 evidence. Toggling the full INT8 activation quant path on the HF reference only moves PCC by 0.0012. Reproducing the same quant step in the TT kernel would at best close the same 0.001-level delta, not the 0.019 gap. Weeks of kernel work would not reach PCC > 0.99 under the current tt-metal op set. Story closed without implementation."
     },
     {
-      "id": "US-503",
-      "title": "Speed-focused kernel intervention at bit-identical PCC",
+      "id": "US-603",
+      "title": "End-to-end: wire the quantised kernel into BitLinear, measure speed + PCC",
       "priority": 3,
       "acceptanceCriteria": [
-        "Identify one trace-hot-path optimisation not already closed by prior sessions.",
-        "If a candidate exists: implement, measure, require PCC bit-identical and decode_tps > 74.25 + noise.",
-        "If no candidate exists: record evidence that remaining trace-kernel cost (~10.5 ms of 11.7 ms) is dispatcher/compute minimum, not addressable at Python/Metal-op level."
+        "Gated on US-602 being viable; US-601 already falsified that precondition.",
+        "If re-opened, same acceptance: decode_tps >= 70 AND PCC vs bitnet.cpp > 0.99."
       ],
       "passes": true,
-      "notes": "NO CANDIDATE REMAINING. Attention core-range split: CLOSED negative (docs/plan_attention_core_range_split.md). Fused-norm extensions to o_proj/gate_up/down_proj: CLOSED negative (project_fused_norm_result.md). Split lm_head / sharded rms_norm / multicore argmax / cos/sin device lookup / nlp_concat_heads_decode / fused QKV-norm / L1 chunks: ALL SHIPPED at HEAD. Trace-kernel floor is ~10.5 ms; remaining 1.2 ms is dispatcher/sync. Further gains require tt-metal-internal work (LLK fidelity, scheduler fairness) that is multi-week scope."
+      "notes": "NOT APPLICABLE because US-602 was closed by US-601 evidence. No kernel was implemented; no new integration measurement to run."
     },
     {
-      "id": "US-504",
-      "title": "Final measurement + correct documentation of session 4 misattribution",
+      "id": "US-604",
+      "title": "Document session 6 outcome with corrected hypothesis",
       "priority": 4,
       "acceptanceCriteria": [
-        "Re-measure final HEAD config on bench_batch32 + bench_accuracy.",
-        "Create docs/session_5_correct_attribution.md replacing the INT8-activation hypothesis with the measurement-backed bf16 drift root cause.",
-        "Report final (decode_tps, PCC, argmax match)."
+        "docs/session_6_int8_act.md captures the US-601 ablation result and the negative verdict on the INT8-quant hypothesis.",
+        "README / MEMO reflect that the ~0.019 PCC gap vs any reference (HF fp32, HF bf16, bitnet.cpp) is dominated by op-implementation differences, not by a missing quant step.",
+        "bench_vs_bitnetcpp.py, bench_vs_hf_noquant.py, extract_logits.cpp committed for future use.",
+        "Commit + push to origin/main, sync TT server."
       ],
-      "passes": true,
-      "notes": "DONE. Final HEAD at commit 287830f (pre-session-5 changes): decode_tps 73.27 t/s / p50 11.7 ms / prefill PCC 0.980679 / argmax match 6/16 on 'The capital of France is'. docs/session_5_correct_attribution.md added with the corrected attribution table and implication analysis. README and TODOs unchanged because no code path was modified this session — only the error diagnosis was corrected."
+      "passes": false,
+      "notes": ""
     }
   ]
 }

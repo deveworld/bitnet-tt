@@ -1254,7 +1254,7 @@ class Batch32Generator:
         batch_size, seq_len = tokens.shape
 
         tokens_tt = ttnn.from_torch(
-            torch.from_numpy(tokens.astype(np.int64)),
+            torch.from_numpy(tokens.astype(np.int32)),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=self.device,
