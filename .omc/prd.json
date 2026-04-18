@@ -1,58 +1,68 @@
 {
-  "title": "BitNet-TT session 8: Plan v4 Phase 1 — per-op RFE localization",
+  "title": "BitNet-TT session 9: Plan v4 Phase 2 — self_attn sub-op alignment",
+  "plan_ref": ".omc/plans/pcc_above_099_multisession.md (v4)",
   "baseline_reconciled": {
     "decode_tps": 71.05,
     "p50_ms": 12.0,
     "pcc_vs_hf_fp32": 0.982032,
-    "commit": "bc988c4"
+    "commit": "5c48386"
   },
-  "phase_1_outcome": "self_attn dominant",
-  "goal": "Build per-op RFE localization harness and identify Phase 2 target op.",
+  "phase_1_target": "self_attn (RFE 0.240 from one op at L0)",
+  "goal": "Drill into self_attn to identify the dominant sub-op (fused QKV+norm, RoPE, SDPA, o_proj), then align it with HF bf16 semantics. Acceptance: sub-op RFE drops below 0.05 without tps regression below 70 t/s.",
   "constraints": [
-    "TT + HF bf16 at identical module boundaries.",
-    "RFE normalized by tensor RMS.",
-    "BITNET_LOCALIZE=1 gated, default OFF."
+    "Add BITNET_LOCALIZE sub-captures inside MultiHeadAttention.__call__ (post_qkv, post_rope, post_sdpa, post_attn_sub_norm).",
+    "Match HF BitNet self_attn internal boundaries (q_proj/k_proj/v_proj, apply_rotary_pos_emb, scaled_dot_product_attention, o_proj).",
+    "Kernel modification must not regress decode_tps below 70 t/s floor.",
+    "All measurements on TT server via ssh TT."
   ],
   "stories": [
     {
-      "id": "US-801",
-      "title": "Design harness data model + capture points",
+      "id": "US-901",
+      "title": "Add sub-op capture points inside MultiHeadAttention",
       "priority": 1,
-      "acceptanceCriteria": ["Enumerate capture points", "Map to HF tensors", "Document fused-op boundaries"],
-      "passes": true,
-      "notes": "DONE. 7 capture points per block (block_input, post_input_norm, post_self_attn, post_attn_residual, post_post_attn_norm, post_mlp, block_output) × 5 layers {0,5,15,25,29}. docs/session_8_localization_design.md."
+      "acceptanceCriteria": [
+        "Instrument attention.py MultiHeadAttention.__call__ with _maybe_capture at post_qkv, post_rope, post_sdpa, post_o_proj.",
+        "Default OFF (gated on BITNET_LOCALIZE env).",
+        "Verify shape alignment with HF bf16 reference."
+      ],
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-802",
-      "title": "TT capture hooks",
+      "id": "US-902",
+      "title": "Rerun RFE ranking with sub-op resolution",
       "priority": 2,
-      "acceptanceCriteria": ["BITNET_LOCALIZE env flag", "Layer filter", "Default OFF"],
-      "passes": true,
-      "notes": "DONE. transformer.py _maybe_capture hook at 7 boundaries, BITNET_LOCALIZE + BITNET_LOCALIZE_LAYERS env vars."
+      "acceptanceCriteria": [
+        "scripts/pcc_localize.py captures finer-grained sub-op tensors.",
+        "Rank sub-op RFE contributions within self_attn.",
+        "Identify top-1 sub-op target."
+      ],
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-803",
-      "title": "HF reference capture",
+      "id": "US-903",
+      "title": "Align top-1 sub-op kernel to HF bf16 semantics",
       "priority": 3,
-      "acceptanceCriteria": ["PyTorch forward hooks at matching boundaries", "Shape alignment validated"],
-      "passes": true,
-      "notes": "DONE. capture_hf in pcc_localize.py uses register_forward_hook + register_forward_pre_hook on 5 capture points (block_input, post_input_norm, post_self_attn, post_post_attn_norm, post_mlp, block_output). Shape alignment: TT/HF match on [1, seq, hidden] for all captured points. post_attn_residual TT-only (no HF equivalent without a custom hook), skipped in ranking."
+      "acceptanceCriteria": [
+        "Modify the dominant sub-op's compute_kernel_config / reduction order / accumulator to reduce RFE.",
+        "BITNET_PHASE2_* env flag gates the change (default OFF).",
+        "Measure delta RFE + delta tps."
+      ],
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-804",
-      "title": "Paired RFE + ranked table",
+      "id": "US-904",
+      "title": "Joint re-measurement + commit",
       "priority": 4,
-      "acceptanceCriteria": ["RFE per cell", "Ranked + grouped by op class", "Top-3 target for Phase 2"],
-      "passes": true,
-      "notes": "DONE (single-prompt scan). docs/session_8_rfe_ranking.md has full ranked table. Key findings: L0.post_input_norm RFE 0.009 (near-identical, RMSNorm is NOT the issue), L0.post_self_attn RFE 0.240 (+23% in one op). Top-3 overall: L5.post_self_attn (0.293), L15.post_mlp (0.273), L0.post_self_attn (0.240). Phase 2 target CONFIRMED: self_attn path (SDPA + RoPE + o_proj). FFN is second. Full 5-prompt statistical sweep + Bonferroni deferred — signal gap (0.24 vs 0.009) is 27× the within-op noise floor, decisively above any bar."
-    },
-    {
-      "id": "US-805",
-      "title": "Commit + prepare Phase 2 PRD",
-      "priority": 5,
-      "acceptanceCriteria": ["Commit to origin/main", "TT sync", "Phase 2 target named"],
-      "passes": true,
-      "notes": "DONE. Commits bc988c4, pushed, TT synced. Phase 2 target = self_attn kernel alignment (SDPA reduction/accumulator, RoPE fused kernel math, o_proj matmul). Secondary target = FFN. Next Ralph session (9) implements Phase 2 per plan v4 §Phase 2-4."
+      "acceptanceCriteria": [
+        "End-to-end bench_batch32 + bench_accuracy with the fix on.",
+        "Record (decode_tps, PCC vs HF fp32, PCC vs HF bf16).",
+        "Commit to origin/main + sync TT."
+      ],
+      "passes": false,
+      "notes": ""
     }
   ]
 }

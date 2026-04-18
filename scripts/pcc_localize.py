@@ -35,6 +35,11 @@ CAPTURE_LAYERS = [0, 5, 15, 25, 29]
 CAPTURE_POINTS = [
     "block_input",
     "post_input_norm",
+    "post_qkv_query",
+    "post_qkv_key",
+    "post_qkv_value",
+    "post_attn_sub_norm",
+    "post_o_proj",
     "post_self_attn",
     "post_attn_residual",
     "post_post_attn_norm",
@@ -85,6 +90,11 @@ def capture_hf(prompt: str, tag: str) -> dict[str, np.ndarray]:
         layer = model.model.layers[li]
         handles.append(layer.register_forward_pre_hook(_mk_pre_hook(f"L{li}.block_input")))
         handles.append(layer.input_layernorm.register_forward_hook(_mk_hook(f"L{li}.post_input_norm")))
+        handles.append(layer.self_attn.q_proj.register_forward_hook(_mk_hook(f"L{li}.post_qkv_query")))
+        handles.append(layer.self_attn.k_proj.register_forward_hook(_mk_hook(f"L{li}.post_qkv_key")))
+        handles.append(layer.self_attn.v_proj.register_forward_hook(_mk_hook(f"L{li}.post_qkv_value")))
+        handles.append(layer.self_attn.attn_sub_norm.register_forward_hook(_mk_hook(f"L{li}.post_attn_sub_norm")))
+        handles.append(layer.self_attn.o_proj.register_forward_hook(_mk_hook(f"L{li}.post_o_proj")))
         handles.append(layer.self_attn.register_forward_hook(_mk_hook(f"L{li}.post_self_attn")))
         handles.append(layer.post_attention_layernorm.register_forward_hook(_mk_hook(f"L{li}.post_post_attn_norm")))
         handles.append(layer.mlp.register_forward_hook(_mk_hook(f"L{li}.post_mlp")))

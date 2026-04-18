@@ -24,6 +24,13 @@ import ttnn
 from numpy.typing import NDArray
 
 from bitnet_tt.config import get_compute_kernel_config
+
+import os as _os
+_BITNET_SDPA_HIFI4 = _os.environ.get("BITNET_SDPA_HIFI4", "").strip() in ("1", "true", "yes", "on")
+_sdpa_hifi4_cfg = get_compute_kernel_config("hifi4") if _BITNET_SDPA_HIFI4 else None
+def _mc_attn(*args, **kwargs):
+    from bitnet_tt.model.transformer import _maybe_capture as _mc
+    return _mc(*args, **kwargs)
 from bitnet_tt.layers.bitlinear import Linear, RMSNorm, quantize_and_transpose_weight
 from bitnet_tt.utils.rope import precompute_freqs_cis
 
@@ -974,7 +981,9 @@ class MultiHeadAttention:
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
+        _mc_attn(self.layer_idx, "post_attn_sub_norm", attn_output)
         output = self.o_proj(attn_output)
+        _mc_attn(self.layer_idx, "post_o_proj", output)
 
         return output, updated_cache
 
@@ -1312,6 +1321,9 @@ class MultiHeadAttention:
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
+        _mc_attn(self.layer_idx, "post_qkv_query", query)
+        _mc_attn(self.layer_idx, "post_qkv_key", key)
+        _mc_attn(self.layer_idx, "post_qkv_value", value)
 
         # Reshape to BKSD: [batch, heads, seq, head_dim]
         query = ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT)
@@ -1332,6 +1344,8 @@ class MultiHeadAttention:
 
         # Apply RoPE
         query, key = self._apply_rope_manual(query, key, 0, seq_len)
+        _mc_attn(self.layer_idx, "post_rope_query", query)
+        _mc_attn(self.layer_idx, "post_rope_key", key)
 
         past_key_value.seq_len_cached = seq_len
 
@@ -1399,6 +1413,9 @@ class MultiHeadAttention:
             value_expanded = past_key_value.value_cache[:, :kv_heads_slice, :seq_len, :]
 
         # SDPA (causal attention for prefill)
+        _sdpa_kwargs = {}
+        if _sdpa_hifi4_cfg is not None:
+            _sdpa_kwargs["compute_kernel_config"] = _sdpa_hifi4_cfg
         attn_output = ttnn.transformer.scaled_dot_product_attention(
             query,
             key_expanded,
@@ -1406,7 +1423,9 @@ class MultiHeadAttention:
             attn_mask=None,
             is_causal=True,
             scale=self._sdpa_scale,
+            **_sdpa_kwargs,
         )
+        _mc_attn(self.layer_idx, "post_sdpa", attn_output)
 
         # Cleanup expanded tensors
         if self.num_kv_groups > 1:
@@ -1421,7 +1440,9 @@ class MultiHeadAttention:
 
         # Apply sub-norm and output projection
         attn_output = self.attn_sub_norm(attn_output)
+        _mc_attn(self.layer_idx, "post_attn_sub_norm", attn_output)
         output = self.o_proj(attn_output)
+        _mc_attn(self.layer_idx, "post_o_proj", output)
 
         # Mark cache as properly initialized for optimized decode
         past_key_value._preallocated = True
