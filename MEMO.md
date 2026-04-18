@@ -4,9 +4,15 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Stable path: **Alpha baseline (`cd995ba`) + HiFi2 compute kernel (`4b50353`)** → **~8.5 t/s** (8.02-9.69 t/s range) on batch=32.
-- Single-user target: ≥33 t/s (based on tt_transformers Llama 3.1 8B per-user).
-- Focus on decode which is DRAM-bandwidth bound. Utilize Trace/Multi-CQ, DRAM-sharded matmul, lightweight kernels (HiFi2/LoFi).
+- Current perf (2026-04-17, batch32 + trace + fused RoPE + packed_ternary):
+  **p50 17.5 ms = 57.1 t/s**, min 16.9 ms = 59.2 t/s peak, decode_tps ≈ 50.4
+  (64-tok bench). Beats bfp4 production (30.15) by +89 % at half storage.
+- Historical Alpha baseline (`cd995ba` + HiFi2 kernel ≈ 8.5 t/s) kept
+  in tables below for context only — current stable path is the
+  packed_ternary + fused-QKV-norm pipeline documented in README / TODO.
+- Focus now: attention data-path core-range split
+  (`docs/plan_attention_core_range_split.md`) and anything else not
+  already dispatcher-overhead-limited.
 
 ---
 
@@ -138,13 +144,18 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 8. Results/Attempts Summary (Condensed for <1000 lines)
 
+> NOTE: The table below records the *early* bf16/bfp8 attempts. The
+> packed_ternary + fused-QKV-norm pipeline described at the top of
+> this file supersedes all of these. For the current perf-evolution
+> ladder (baseline → 57 t/s p50) see `TODO.md`.
+
 | Attempt | Commit | Result | Speed/Notes |
 | --- | --- | --- | --- |
-| Alpha baseline | `cd995ba` | ✅ | **8.68 t/s** |
+| Alpha baseline | `cd995ba` | ✅ | **8.68 t/s** (historical) |
 | `_forward_simple` (batch=32) | `fd7a1d2` | ✅ Works | 0.80 t/s (slow) |
 | HEIGHT_SHARDED decode | `105f828` etc | ❌ | Failure cause: BitNet `num_heads=20` mismatches CoreGrid 4x8 (32 cores) requirement → shard height mismatch |
 | Fused QKV + LM Head slice | `0e97f48` | ❌ | `ttnn.slice` argument error corrupted output |
-| **HiFi2 kernel applied** | `4b50353` | ✅ | **8.02-9.69 t/s**, quality normal |
+| **HiFi2 kernel applied** | `4b50353` | ✅ | **8.02-9.69 t/s** (historical), quality normal |
 
 Current status: Using Alpha path + HiFi2 compute kernel as default, DRAM-sharded matmul/LM head slice/trace are additional candidates.
 
@@ -215,6 +226,15 @@ cb_pop_front(cb_id, num_tiles);
 ```
 
 ### 11.3 BitNet INT8×INT2 Kernel Pattern (Official GPU Implementation)
+
+> **NOTE (2026-04-18, session 5):** This section describes the **reference
+> GPU kernel** from the BitNet paper's CUDA implementation. It is **not**
+> what the TT-Metal `ternary_matmul` kernel does. The TT kernel keeps
+> activations in bf16 end-to-end, decodes 2-bit weights into a bf16 LUT
+> `{0, +1, -1}`, and runs `matmul_block` on bf16 × bf16 with
+> `fp32_dest_acc_en = true`. There is no runtime INT8 activation
+> quantization step on the TT path. See `docs/session_5_correct_attribution.md`
+> for the ablation evidence and the corrected PCC-error attribution.
 
 **Core Operation**:
 
@@ -354,12 +374,18 @@ ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
 
 ### 12.1 Current Analysis
 
-| Item | Current | Target | Bottleneck |
+> Historical snapshot from the early development phase. All four items
+> below have been addressed — the Trace-mode packed_ternary pipeline
+> runs at p50 17.5 ms / ~57 t/s. Kept here to show the original
+> problem statement; for current optimization targets see Track D / E
+> in `TODO.md`.
+
+| Item | Historic | Current | Resolved by |
 | --- | --- | --- | --- |
-| Speed | 8.5 t/s | **30+ t/s** | DRAM bandwidth, kernel dispatch |
-| Optimization Path | `_forward_simple` (concat) | Trace + In-place | concat blocks trace |
-| HEIGHT_SHARDED | ❌ (num_heads=20) | Custom geometry | 32-core assumption |
-| Weight format | BF16 (fp16) | **2-bit packed** | Memory bandwidth |
+| Speed | 8.5 t/s | **57 t/s p50** | Packed-ternary + trace + L1-norm + fused-QKV-norm |
+| Optimization Path | `_forward_simple` (concat) | Trace (batch32) + in-place paged cache | In-trace argmax, streaming decode |
+| HEIGHT_SHARDED | ❌ (num_heads=20) | ✅ via `nlp_create_qkv_heads_decode` | Decode-specific head-split op |
+| Weight format | BF16 (fp16) | **2-bit packed (BFP2_b)** | Custom `ternary_matmul` op |
 
 ### 12.2 Development Priorities
 
@@ -498,15 +524,19 @@ def update_decode_simple(self, key_states, value_states, current_pos, num_kv_gro
 - `num_heads=20` (BitNet) is incompatible with 32-core grid requirement
 - Options: (A) Pad to 32 heads (1.6x compute overhead), (B) Custom shard geometry
 
-### 12.5 Expected Performance (Updated)
+### 12.5 Expected Performance (Updated — historic plan, all shipped)
 
-| Phase | Implementation | Speed | vs Current |
+> All phases below are done. The actual final number (p50 17.5 ms ≈
+> 57 t/s, decode_tps ~50) is well past the original Phase 3 target.
+
+| Phase | Implementation | Planned speed | Status |
 | --- | --- | --- | --- |
-| Current | concat + BF16 | 8.5 t/s | 1x |
-| **Phase 1 (DONE)** | **In-place (no Trace)** | **5.7 t/s** | **~1x (blocked)** |
-| Phase 1b | In-place + Trace | 17-25 t/s | **2-3x** (needs HEIGHT_SHARDED) |
-| Phase 2 | + Ternary Matmul | 25-35 t/s | **3-4x** |
-| Phase 3 | + Custom QKV | 30-45 t/s | **4-5x** |
+| Current (historic) | concat + BF16 | 8.5 t/s | baseline |
+| Phase 1 | In-place (no Trace) | 5.7 t/s | ✅ done (superseded) |
+| Phase 1b | In-place + Trace | 17-25 t/s | ✅ done |
+| Phase 2 | + Ternary Matmul | 25-35 t/s | ✅ done |
+| Phase 3 | + Custom QKV | 30-45 t/s | ✅ done |
+| Extras (2026-04-17) | + L1 norm/SDPA + fused-QKV-norm | — | ✅ **57 t/s p50** |
 
 ### 12.6 Risks and Alternatives
 
@@ -553,7 +583,11 @@ def update_decode_simple(self, key_states, value_states, current_pos, num_kv_gro
 | Llama 3.2 1B | n150 (WH) | 32 | 80.5 | 2576.0 | Small model |
 | Mistral 7B | n150 (WH) | 32 | 28.7 | 918.4 | |
 
-**BitNet-TT Current**: ~8.5 t/s → **Target 33.1 t/s (3.9x improvement needed)**
+**BitNet-TT Current (2026-04-17)**: **57 t/s p50 / 50.4 t/s decode avg**
+(packed_ternary, batch32, Metal Trace). The original 33.1 t/s Llama target
+has been exceeded by 72 % on a 2.4B model with 2-bit weights. No further
+"fill the gap to 33 t/s" optimization needed — remaining work is
+incremental (attention core-range split, ~0.7 ms → ~60 t/s).
 
 ### 13.2 Key Optimization Techniques Summary
 

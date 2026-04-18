@@ -61,6 +61,13 @@ Under the ≥70 t/s speed budget, none of these paths close 0.019. The
 session 4 measurement ceiling of PCC ≈ 0.981 at ≥70 t/s remains correct
 — only its root cause was wrong.
 
+**Deferred ablation (not run this session).** The fp32-RMSNorm-accumulator
+intervention is reasoned out of scope above from adjacent evidence
+(session-4 HiFi4 result, small per-layer bf16-vs-fp32 norm deltas in the
+on-device RMSNorm path), but it was not directly measured. If accuracy
+work is reopened, that is the smallest-surface lever to ablate first
+before committing to a residual-stream rewrite.
+
 ## Verdict
 
 Replace the "INT8 activation re-quantisation" explanation wherever it
