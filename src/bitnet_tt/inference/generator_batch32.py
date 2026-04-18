@@ -26,6 +26,11 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Tuple
 import numpy as np
 import torch
 import ttnn
+
+def _flatten_first(x):
+    while isinstance(x, list):
+        x = x[0] if x else 0
+    return x
 from numpy.typing import NDArray
 
 from bitnet_tt.config import get_compute_kernel_config
@@ -1359,7 +1364,7 @@ class Batch32Generator:
         # runs as part of the traced kernel so no extra dispatch or CQ sync.
         # Reading the tiny int32 result costs ~0.06 ms vs ~4 ms for post-trace ops.
         if device_argmax is not None and (temperature <= 0.0 or top_k is None or top_k <= 1):
-            return int(ttnn.to_torch(ttnn.typecast(ttnn.to_layout(device_argmax, ttnn.TILE_LAYOUT), ttnn.int32) if device_argmax.dtype == ttnn.uint32 else device_argmax).flatten()[0].item())
+            return (int(_flatten_first(device_argmax.cpu().to_list())) if device_argmax.dtype == ttnn.uint32 else int(ttnn.to_torch(device_argmax).flatten()[0].item()))
 
         use_direct_logits = int(logits.shape[1]) == 1
         last_row = logits
