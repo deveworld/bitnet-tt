@@ -17,6 +17,7 @@ This enables HEIGHT_SHARDED operations that work with trace without allocating b
 Performance target: 30+ t/s (currently 186 t/s for attention-only benchmark)
 """
 
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -559,14 +560,12 @@ class Batch32Generator:
         # KV caches (allocated per generation)
         self._kv_caches: Optional[list[KVCache]] = None
 
-        # Device-side cos/sin lookup: skip the per-step cos/sin H2D copies
-        # and derive them from pos_tensor via ttnn.embedding inside the
-        # captured trace. Opt-in via BITNET_DECODE_COS_SIN_LOOKUP=1 during
-        # the initial measurement phase, then flip the default on or off
-        # based on what p150a shows. Set to "0" to force the old H2D path.
-        import os as _os
-        _lookup_env = _os.environ.get("BITNET_DECODE_COS_SIN_LOOKUP", "1")
-        self._use_cos_sin_lookup = _lookup_env not in ("0", "false", "False")
+        # Device-side cos/sin lookup is on by default; set
+        # BITNET_DECODE_COS_SIN_LOOKUP=0 to revert to the old per-step
+        # H2D copy path.
+        self._use_cos_sin_lookup = os.environ.get(
+            "BITNET_DECODE_COS_SIN_LOOKUP", "1"
+        ) not in ("0", "false", "False")
 
         if self.tokenizer is None:
             self._load_default_tokenizer()
@@ -667,11 +666,11 @@ class Batch32Generator:
         # after the layer loop.
         first_attn = self.model.layers[0].self_attn
         head_dim = self.config.head_dim
-        # Optionally look up cos/sin from a device-resident LUT via
-        # ttnn.embedding, killing the per-step H2D copies. The lookup
-        # runs inside the captured trace; pos_tensor is already on
-        # device and gets typecast from int32 to uint32 for embedding.
-        if cos is None or sin is None or self._use_cos_sin_lookup:
+        # When the device-side LUT is enabled, derive cos/sin from
+        # pos_tensor via ttnn.embedding inside the captured trace. This
+        # kills the two per-step H2D copies that would otherwise refresh
+        # the cos/sin slots before every execute_trace.
+        if self._use_cos_sin_lookup:
             pos_u32 = ttnn.typecast(current_pos_tensor, ttnn.uint32)
             cos_raw, sin_raw = self.rotary_setup.lookup_decode_cos_sin(pos_u32)
             ttnn.deallocate(pos_u32)

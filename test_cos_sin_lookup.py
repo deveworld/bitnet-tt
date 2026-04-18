@@ -47,15 +47,22 @@ def main() -> None:
         cos_ref_np = cos_ref.float().numpy().reshape(-1, head_dim)
         sin_ref_np = sin_ref.float().numpy().reshape(-1, head_dim)
 
-        # Compare first row (all rows are same position)
+        # Compare first row (all rows are same position).
+        # max|Δ| is the primary gate: bit-identical output means the
+        # lookup is a safe drop-in for the H2D path. PCC is informational
+        # and breaks down at positions where cos or sin is constant
+        # (e.g. pos=0 has cos=all-ones → zero variance → PCC denominator
+        # is 0), so it can't be the pass/fail criterion on its own.
+        max_abs = max(
+            np.abs(cos_lut_np[0] - cos_ref_np[0]).max(),
+            np.abs(sin_lut_np[0] - sin_ref_np[0]).max(),
+        )
         cos_pcc = pcc(cos_lut_np[0], cos_ref_np[0])
         sin_pcc = pcc(sin_lut_np[0], sin_ref_np[0])
-        max_abs_cos = np.abs(cos_lut_np[0] - cos_ref_np[0]).max()
-        max_abs_sin = np.abs(sin_lut_np[0] - sin_ref_np[0]).max()
-        ok = cos_pcc > 0.9999 and sin_pcc > 0.9999
+        ok = max_abs == 0.0
         status = "OK" if ok else "FAIL"
-        print(f"  pos={pos:5d}  cos PCC={cos_pcc:.6f}  sin PCC={sin_pcc:.6f}  "
-              f"max|Δ|={max(max_abs_cos, max_abs_sin):.5f}  [{status}]")
+        print(f"  pos={pos:5d}  max|Δ|={max_abs:.5f}  "
+              f"cos PCC={cos_pcc:.6f}  sin PCC={sin_pcc:.6f}  [{status}]")
         if not ok:
             failures += 1
             print("    cos lut first 8:", cos_lut_np[0][:8])
