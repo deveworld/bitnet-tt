@@ -568,11 +568,18 @@ class Batch32Generator:
         ) not in ("0", "false", "False")
 
         # Device-side embedding lookup: replace the 160 KB/step H2D copy
-        # of pre-built embed tensors with a tiny token_id copy (128 B)
-        # plus an inlined ttnn.embedding inside the trace. Opt-in via
-        # BITNET_EMBED_DEVICE_LOOKUP (default on).
+        # with an inlined ttnn.embedding inside the trace. Tested and
+        # found to only net +0.3 t/s on 128-tok bench (the H2D was
+        # already overlapping dispatch) while shifting the decode
+        # trajectory enough to drop greedy match/32 from 6 to 1 on the
+        # "The capital of France is" probe — the device embedding keeps
+        # the fp32 weight precision one op longer than the host bf16
+        # round-trip, so downstream ternary_matmul / rms_norm consume
+        # numerically different bytes. Default off; BITNET_EMBED_DEVICE_LOOKUP=1
+        # to re-enable for future experiments once the dtype mismatch
+        # has been fixed.
         self._use_embed_lookup = os.environ.get(
-            "BITNET_EMBED_DEVICE_LOOKUP", "1"
+            "BITNET_EMBED_DEVICE_LOOKUP", "0"
         ) not in ("0", "false", "False")
         self._token_id_host_cache: OrderedDict[int, ttnn.Tensor] = OrderedDict()
 
