@@ -346,6 +346,28 @@ class Batch32RotarySetup:
         self._host_cos_sin_cache[position] = (cos_host, sin_host)
         return cos_host, sin_host
 
+    def lookup_decode_cos_sin(
+        self, pos_tensor_u32: ttnn.Tensor
+    ) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
+        """Look up cos/sin for a batch of decode positions directly from
+        the pre-uploaded cos_matrix / sin_matrix via ttnn.embedding. This
+        is the device-side alternative to get_cos_sin_host_tensor +
+        per-step copy_host_to_device_tensor — the lookup can live inside
+        a captured trace, eliminating two H2D dispatches per decode step.
+
+        Args:
+            pos_tensor_u32: [batch] uint32 tensor of positions (all equal
+                in batch-32 decode). Already on device.
+
+        Returns:
+            (cos, sin) each shaped [1, batch, head_dim] TILE_LAYOUT,
+            ready to be reshaped to [1, batch, 1, head_dim] and
+            resharded into cos_sin_config by the caller.
+        """
+        cos = ttnn.embedding(pos_tensor_u32, self.cos_matrix, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(pos_tensor_u32, self.sin_matrix, layout=ttnn.TILE_LAYOUT)
+        return cos, sin
+
     def get_sharded_trans_mat(self) -> ttnn.Tensor:
         """Get HEIGHT_SHARDED transformation matrix for rotary_embedding_llama decode mode."""
         return ttnn.to_memory_config(self.transformation_mat, self.trans_mat_config)
