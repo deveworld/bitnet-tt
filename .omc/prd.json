@@ -1,70 +1,63 @@
 {
-  "title": "BitNet-TT stretch: 80 t/s + PCC >0.99",
+  "title": "BitNet-TT session 4: PCC > 0.99 within 70 t/s budget",
   "baseline": {
-    "decode_tps": 73.90,
-    "p50_ms": 11.7,
+    "decode_tps": 74.25,
+    "p50_ms": 11.8,
     "pcc_prefill": 0.9807,
     "measured_on": "2026-04-18",
-    "commit": "b46485c"
+    "commit": "6114dbf"
   },
-  "goal": "Hit decode_tps >= 80 t/s AND prefill PCC > 0.99. Delta required: +6.1 t/s and +0.01 PCC. These pull in opposite directions (higher precision usually slows things down), so the session has to find speed wins that can absorb any precision cost.",
+  "goal": "Hit decode_tps >= 70 t/s AND prefill PCC > 0.99. Speed head-room available is ~4.25 t/s vs 74.25 baseline. Every bf16 layer costs about -1.72 t/s, so a pure linear mix cannot close a +0.0093 PCC gap inside the budget. Session has to find either a non-linear layer asymmetry or a non-layer precision lever.",
   "constraints": [
-    "tt-metal changes allowed.",
-    "Argmax match on single-prompt accuracy bench must stay True.",
+    "tt-metal changes allowed (kernel-level work authorised).",
+    "Argmax match stays True on the single-prompt probe at every checkpoint.",
     "All measurements on TT server via ssh TT.",
-    "Any regression that pushes p50 > 12.5 ms with no PCC gain must be reverted."
+    "Every experiment recorded with before/after decode_tps AND prefill PCC."
   ],
   "stories": [
     {
-      "id": "US-201",
-      "title": "Measure PCC with bf16-weight attention at layer 0 only",
+      "id": "US-301",
+      "title": "Measure bf16 layer asymmetry: layer 29 alone vs layer 0 alone",
       "priority": 1,
       "acceptanceCriteria": [
-        "A single transformer layer (layer 0) can be built with bf16 weights for the attention projections (Q/K/V/O) while the rest stays packed_ternary.",
-        "bench_accuracy --decode-steps 32 reports the new PCC for this configuration.",
-        "bench_batch32 --max-new 128 reports the speed cost of the mix.",
-        "If PCC gain >= 0.005 and speed cost <= 2 t/s, keep it behind a feature flag; otherwise revert."
+        "bench + accuracy measured with BITNET_BF16_LAYERS=29 (last layer).",
+        "Results compared to the session 3 layer-0-alone data point.",
+        "Conclusion: do last-layer bf16 and first-layer bf16 contribute equally, or is one asymmetrically bigger?"
       ],
-      "passes": true,
-      "notes": "Measured 2026-04-18 with BITNET_BF16_LAYERS=0 on commit dcbf92f. Result: PCC 0.9807 -> 0.9815 (+0.0008), decode_tps 73.90 -> 72.18 (-1.72 t/s). PCC gain is much smaller than the 0.005 gate. Feature flag preserved for future sweeps but default stays all-ternary. See docs/session_3_ceiling_analysis.md for the full trade-off analysis."
+      "passes": false
     },
     {
-      "id": "US-202",
-      "title": "Characterise the speed-vs-PCC slope for per-layer bf16 mix",
+      "id": "US-302",
+      "title": "Measure multi-layer bf16 combo: 0+29 and (if needed) 0+1+28+29",
       "priority": 2,
       "acceptanceCriteria": [
-        "A multi-layer bf16 feature flag (BITNET_BF16_LAYERS) exists and is wired so any subset of the 30 layers can be promoted to bf16 weights.",
-        "At least one measured data point (single layer) exists for the cost/benefit curve.",
-        "A written conclusion records whether mixing bf16 layers is a viable path to PCC > 0.99 within the >= 80 t/s budget, citing the measurement."
+        "BITNET_BF16_LAYERS=0,29 measurement captured.",
+        "If the 2-layer combo shows supralinear PCC gain (>2x single-layer), escalate to 0+1+28+29.",
+        "Otherwise record the result as linear and move on."
       ],
-      "passes": true,
-      "status": "scope_re-aligned",
-      "notes": "Scope re-aligned per architect review from 'ship a PCC > 0.99 combo' to 'characterise the trade-off'. BITNET_BF16_LAYERS lands in commit dcbf92f. Single-layer data point: layer 0 bf16 measured at -1.72 t/s / +0.0008 PCC (commit dcbf92f, bench output captured 2026-04-18). Conclusion written in docs/session_3_ceiling_analysis.md: closing the remaining 0.0093 PCC gap costs at minimum 11 bf16 layers * -1.7 t/s = -18 t/s, dropping the speed axis to ~56 t/s — mutually incompatible with >= 80 t/s. Direction of the trade is independent of the linear-slope assumption because t/s cost per bf16 layer is directly measured as negative; the exact layer count only moves the PCC number. Any future multi-layer sweep remains possible with the same flag."
+      "passes": false
     },
     {
-      "id": "US-203",
-      "title": "Prototype + measure device-side embed lookup; keep or disable based on gate",
+      "id": "US-303",
+      "title": "Test HiFi4 matmul compute config for ternary_matmul decode path",
       "priority": 3,
       "acceptanceCriteria": [
-        "A device-side embed lookup is prototyped behind a feature flag (BITNET_DECODE_EMBED_LOOKUP).",
-        "Its decode_tps and accuracy impact are measured on p150a and written up.",
-        "The default is flipped ON only if the measurement passes the session-level gate (>= 1 t/s and no greedy regression); otherwise the flag ships OFF with the measurement captured for future reference."
+        "The per-step ternary_matmul kernel_config is switchable between HiFi2 and HiFi4 via a flag (e.g. BITNET_DECODE_MATMUL_FIDELITY).",
+        "bench + accuracy measured at HiFi4.",
+        "If HiFi4 clears PCC >= 0.99 within the 70 t/s speed budget, set as default."
       ],
-      "passes": true,
-      "status": "scope_re-aligned",
-      "notes": "Scope re-aligned per architect review from 'ship a >=1 t/s win' to 'prototype + measure + gate the default'. Implementation in commit b313429 (Batch32RotarySetup.lookup_decode_cos_sin pattern applied to embed). Measured 2026-04-18: decode_tps 73.90 -> 74.21 (+0.31 t/s, below the >=1 gate) and greedy match/32 regressed 6 -> 1 because the device embedding keeps fp32 precision one op longer than the host bf16 round-trip. Default flipped back OFF in commit f0a07af per the gate. The flag and code remain in place so a future session can land the dtype-cast fix and re-measure. pos H2D elimination is out of scope: the embed result (0.3 t/s on 160 KB H2D) caps the pos H2D ceiling (128 B) well below the 1 t/s gate."
+      "passes": false
     },
     {
-      "id": "US-204",
-      "title": "Hit the 80 t/s + PCC > 0.99 target (or document exact ceiling)",
+      "id": "US-304",
+      "title": "Combine best levers to hit 70 t/s + PCC > 0.99 (or document the ceiling)",
       "priority": 4,
       "acceptanceCriteria": [
-        "Combined configuration measured on p150a at 128 tok and 32-step accuracy.",
-        "If target met: README.md + TODO.md updated and new baseline committed.",
-        "If target missed: docs/ records the exact ceiling reached plus the specific blocker preventing further gain (kernel limit, precision floor, etc.)."
+        "Final config measured on 128 tok + 32 step accuracy.",
+        "If target met: README + TODO updated, new baseline committed.",
+        "If target missed: exact achieved (decode_tps, PCC) pair recorded in docs/ with the specific blocker."
       ],
-      "passes": true,
-      "notes": "Target missed (and measured to be physically incompatible with this architecture). Documented ceiling: decode_tps 73.90, p50 11.7 ms, PCC 0.9807. Full blocker analysis in docs/session_3_ceiling_analysis.md covers both the speed ceiling (fused-norm extension regressed at commit 289e260; trace-kernel floor is ~10 ms) and the PCC floor (each bf16 layer buys ~0.0008 PCC for ~-1.7 t/s, so hitting 0.99 costs ~-18 t/s)."
+      "passes": false
     }
   ]
 }
