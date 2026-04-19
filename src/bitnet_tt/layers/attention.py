@@ -29,6 +29,40 @@ import os as _os
 _BITNET_SDPA_HIFI4 = _os.environ.get("BITNET_SDPA_HIFI4", "").strip() in ("1", "true", "yes", "on")
 _sdpa_hifi4_cfg = get_compute_kernel_config("hifi4") if _BITNET_SDPA_HIFI4 else None
 _BITNET_MANUAL_SDPA = _os.environ.get("BITNET_MANUAL_SDPA", "").strip() in ("1", "true", "yes", "on")
+# Phase K1: kernel-variant selector for prefill SDPA. Default "stock" preserves
+# current behavior. "pytorch_ref" moves Q/K/V to CPU and runs torch.nn.functional
+# SDPA (debug/reference path). Future tags "aligned_softmax", "aligned_qk",
+# "aligned_full" map to tt-metal compute-kernel forks once K2-K4 land.
+_BITNET_SDPA_KERNEL_VARIANT = _os.environ.get("BITNET_SDPA_KERNEL_VARIANT", "stock").strip().lower()
+_SDPA_KERNEL_VARIANTS_KNOWN = {
+    "stock",
+    "pytorch_ref",
+    "aligned_softmax",
+    "aligned_qk",
+    "aligned_full",
+}
+if _BITNET_SDPA_KERNEL_VARIANT not in _SDPA_KERNEL_VARIANTS_KNOWN:
+    raise ValueError(
+        f"BITNET_SDPA_KERNEL_VARIANT={_BITNET_SDPA_KERNEL_VARIANT!r} not in "
+        f"{sorted(_SDPA_KERNEL_VARIANTS_KNOWN)}"
+    )
+
+
+def _pytorch_ref_sdpa(query, key, value, scale, seq_len):
+    """Reference SDPA via torch.nn.functional on CPU. Debug path only."""
+    import torch.nn.functional as _F
+    q_t = ttnn.to_torch(query).to(torch.float32)
+    k_t = ttnn.to_torch(key).to(torch.float32)
+    v_t = ttnn.to_torch(value).to(torch.float32)
+    out_t = _F.scaled_dot_product_attention(
+        q_t, k_t, v_t, attn_mask=None, is_causal=True, scale=scale
+    ).to(torch.bfloat16)
+    return ttnn.from_torch(
+        out_t,
+        device=query.device(),
+        layout=ttnn.TILE_LAYOUT,
+        dtype=ttnn.bfloat16,
+    )
 
 def _manual_sdpa(query, key, value, scale, seq_len):
     """Explicit attention via primitives: Q@K^T*scale + causal_mask + softmax + @V."""
@@ -1436,10 +1470,18 @@ class MultiHeadAttention:
         # SDPA (causal attention for prefill)
         if _BITNET_MANUAL_SDPA:
             attn_output = _manual_sdpa(query, key_expanded, value_expanded, self._sdpa_scale, seq_len)
+        elif _BITNET_SDPA_KERNEL_VARIANT == "pytorch_ref":
+            attn_output = _pytorch_ref_sdpa(
+                query, key_expanded, value_expanded, self._sdpa_scale, seq_len
+            )
         else:
             _sdpa_kwargs = {}
             if _sdpa_hifi4_cfg is not None:
                 _sdpa_kwargs["compute_kernel_config"] = _sdpa_hifi4_cfg
+            # K2-K4 aligned variants: once the tt-metal compute-kernel forks
+            # are upstreamed, _BITNET_SDPA_KERNEL_VARIANT in {"aligned_softmax",
+            # "aligned_qk","aligned_full"} will select them via a program-factory
+            # op_config parameter. For K1 we just pass through the stock kernel.
             attn_output = ttnn.transformer.scaled_dot_product_attention(
                 query,
                 key_expanded,
