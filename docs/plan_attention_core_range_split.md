@@ -15,7 +15,7 @@ cores (~64 us / layer) which we don't pay today. Net per-layer delta:
 `(31 + 64) - 26 = +69 us / layer * 30 layers = +2.0 ms / step`.
 
 `paged_fused_update_cache` has the same story: ~10 us saving vs 2x
-paged_update_cache, but K and V must go to disjoint cores — costing
+paged_update_cache, but K and V must go to disjoint cores -- costing
 one extra reshard (~32 us / layer) to accommodate. Net negative.
 
 The "~0.7 ms combined win" estimate in the original plan (below) was a
@@ -27,7 +27,7 @@ whatever launch-fusion savings exist.
 **Do not revisit unless the fused ops themselves change on tt-metal or
 we find a way to get Q and K onto disjoint cores for free (e.g.
 `nlp_create_qkv_heads_decode` with `overlap_qk_coregrid=False`, but
-that also requires sharded input — another reshard).**
+that also requires sharded input -- another reshard).**
 
 ---
 
@@ -36,10 +36,10 @@ that also requires sharded input — another reshard).**
 Enable two tt-metal fused ops that are currently gated behind a sharding
 constraint:
 
-1. `ttnn.experimental.rotary_embedding_llama_fused_qk` — applies RoPE to Q
+1. `ttnn.experimental.rotary_embedding_llama_fused_qk` -- applies RoPE to Q
    and K in a **single kernel** instead of the two separate
    `rotary_embedding_llama` calls we do today.
-2. `ttnn.experimental.paged_fused_update_cache` — writes K and V slots to
+2. `ttnn.experimental.paged_fused_update_cache` -- writes K and V slots to
    their respective paged caches in a **single kernel** instead of two
    back-to-back `paged_update_cache` calls.
 
@@ -58,7 +58,7 @@ norm 17 %, other 43 %) and the non-trace profile at the end of
 | `paged_update_cache`  × 2 | ~0.6 ms / step          | 1 call | ~0.3 ms |
 | **Combined**             |                         |        | **~0.7 ms** |
 
-On the current p50 of 17.5 ms, that is ~4 % — closer to 60 t/s p50.
+On the current p50 of 17.5 ms, that is ~4 % -- closer to 60 t/s p50.
 
 ## What blocks it today
 
@@ -74,13 +74,13 @@ q_heads_1bkd, k_heads_1bkd, v_heads_1bkd = ttnn.experimental.nlp_create_qkv_head
 ```
 
 `nlp_create_qkv_heads_decode` uses a **single** core range for all three
-outputs — the exact situation that blocks the fused RoPE + fused cache
+outputs -- the exact situation that blocks the fused RoPE + fused cache
 update ops (explicit comment at `attention.py:1039` and
 `attention.py:1082-1085`).
 
 ## Design options
 
-### Option A — post-split re-shard (lowest risk)
+### Option A -- post-split re-shard (lowest risk)
 
 Keep `nlp_create_qkv_heads_decode` as-is, then **re-shard Q, K, V onto
 disjoint core ranges** immediately after. This is a dispatch-only
@@ -105,13 +105,13 @@ V: (0,5)-(7,5)      8 cores
 the 0.7 ms we are trying to save. Measure first with a microbench
 before wiring into the decode path.
 
-### Option B — extend `nlp_create_qkv_heads_decode` to accept split grids
+### Option B -- extend `nlp_create_qkv_heads_decode` to accept split grids
 
-Larger change — either a new op or a new arg. Cleaner long-term but
+Larger change -- either a new op or a new arg. Cleaner long-term but
 touches tt-metal. Keep as a follow-up if Option A lands a measurable
 win and we want to shave the re-shard cost.
 
-### Option C — compose from lower-level heads ops
+### Option C -- compose from lower-level heads ops
 
 There are separate `nlp_create_q_heads` / `nlp_create_kv_heads` paths in
 tt-metal. Using those would give per-tensor core ranges directly but
@@ -124,7 +124,7 @@ layer without any tt-metal work.
 
 1. **Microbench the re-shard cost.** Standalone test: create a fake
    1BKD Q tensor, `to_memory_config` it to a smaller sharded spec,
-   measure μs. If it is already > ~300 μs, Option A may not pay off —
+   measure μs. If it is already > ~300 μs, Option A may not pay off --
    escalate to Option C before spending more time.
 2. **Microbench fused RoPE and fused cache update in isolation.** Build
    disjoint-sharded Q/K and K/V, call the fused ops, verify PCC vs. the
@@ -144,7 +144,7 @@ layer without any tt-metal work.
 ## Files to touch
 
 - `src/bitnet_tt/layers/attention.py`
-  - `_forward_decode_1bkd` — add re-shard + fused ops
+  - `_forward_decode_1bkd` -- add re-shard + fused ops
   - Potentially pre-compute the Q/K/V shard specs in `__init__` so they
     are not rebuilt per decode step
 - `src/bitnet_tt/inference/generator_batch32.py`
@@ -154,20 +154,20 @@ layer without any tt-metal work.
 ## Pass / fail criteria
 
 - **PCC** (fused vs. non-fused) ≥ 0.999 on the o_proj matmul output
-  (downstream of both fused ops — exercises the full chain).
+  (downstream of both fused ops -- exercises the full chain).
 - **p50 decode latency** on the full benchmark drops by ≥ 0.3 ms
   (enough to justify the added code path).
 - **No new L1 overflow** in the trace-mode program. Check with
   `TT_METAL_ENABLE_L1_DATA_CACHE_RISCVS=BR,NC,TR,ER` stays valid.
 
-If either of the latency or PCC criterion fails, revert the wiring —
+If either of the latency or PCC criterion fails, revert the wiring --
 keep the standalone sharding helpers in case a future attention
 refactor wants them.
 
 ## Non-goals for this plan
 
-- Further fused-norm extensions (o_proj / gate_up / down_proj) — already
+- Further fused-norm extensions (o_proj / gate_up / down_proj) -- already
   tested and regressed at trace level, see
   `project_fused_norm_result.md`.
-- Any SDPA-internal optimization — treat SDPA as a black box.
+- Any SDPA-internal optimization -- treat SDPA as a black box.
 - Multi-device sharding (all-gather variants). Irrelevant for p150a.

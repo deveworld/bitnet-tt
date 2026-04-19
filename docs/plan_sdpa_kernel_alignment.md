@@ -45,10 +45,10 @@ Primary suspects inside these:
 
 ## Phase structure
 
-Runs over 4–6 Ralph sessions. Each session is gated on (a) speed floor
+Runs over 4-6 Ralph sessions. Each session is gated on (a) speed floor
 not regressed and (b) PCC delta directionally correct or neutral.
 
-### Phase K1 — Baseline + harness on kernel sweeps (1 session)
+### Phase K1 -- Baseline + harness on kernel sweeps (1 session)
 
 - Wire `BITNET_SDPA_KERNEL_VARIANT=<tag>` env through
   `_forward_prefill_with_preallocated_cache` to select between the
@@ -62,7 +62,7 @@ not regressed and (b) PCC delta directionally correct or neutral.
   stock kernel; env knob selects a stock-equivalent variant without
   measurable delta.
 
-### Phase K2 — Softmax max-reduce alignment (1 session)
+### Phase K2 -- Softmax max-reduce alignment (1 session)
 
 - Fork `sdpa.cpp` compute kernel to a `sdpa_aligned_softmax.cpp`.
 - Change the max-reduce so each tile's row-max is fully reduced
@@ -75,26 +75,26 @@ not regressed and (b) PCC delta directionally correct or neutral.
   reduce regresses speed below 70, revert and attempt Phase K3
   before dropping further.
 
-### Phase K3 — Q · Kᵀ matmul reduction alignment (1 session)
+### Phase K3 -- Q · Kᵀ matmul reduction alignment (1 session)
 
 - Fork the K-loop in `sdpa.cpp` to walk K in contiguous chunks of
   `head_dim` matching PyTorch's reduction dimension, with fp32
   accumulation across tiles (`pack_tile_block` held in fp32 dest
   until the final pack).
-- This is invasive; expect +0.5–1.0 ms / step on prefill and a
+- This is invasive; expect +0.5-1.0 ms / step on prefill and a
   proportional decode-time hit because the same factory is hit on
   every layer.
 - **Acceptance**: unit harness RFE drops below 0.05. End-to-end
   bench_accuracy PCC delta ≥ +0.010. decode_tps ≥ 70 t/s.
 
-### Phase K4 — attn · V matmul reduction alignment (1 session)
+### Phase K4 -- attn · V matmul reduction alignment (1 session)
 
 - Same treatment to the attn·V matmul in the second half of the
   SDPA kernel.
 - **Acceptance**: unit harness RFE drops below 0.02. End-to-end
   bench_accuracy PCC ≥ 0.99. decode_tps ≥ 70 t/s.
 
-### Phase K5 — Joint validation + 64-prompt robustness (1 session)
+### Phase K5 -- Joint validation + 64-prompt robustness (1 session)
 
 - Run the new kernel combined on bench_vs_bitnetcpp.py and
   bench_vs_hf_noquant.py for 64 prompts.
@@ -102,7 +102,7 @@ not regressed and (b) PCC delta directionally correct or neutral.
 - **Acceptance**: median PCC ≥ 0.99 across 64 prompts; min PCC ≥ 0.97;
   decode_tps ≥ 70 on 128-tok bench.
 
-### Phase K6 — Upstream + cleanup (optional, 1 session)
+### Phase K6 -- Upstream + cleanup (optional, 1 session)
 
 - Prepare a tt-metal PR with the three compute kernel variants gated
   behind a per-op config flag (keeps stock kernel for non-BitNet
@@ -113,7 +113,7 @@ not regressed and (b) PCC delta directionally correct or neutral.
 
 ## Speed budget tracking
 
-Current HEAD (a0b4d01):
+Current HEAD (1345ab8):
 
 - decode_tps 74.28 t/s / p50 11.7 ms
 - Floor: 70 t/s → p50 ≤ 14.29 ms → **2.6 ms of headroom** across the
@@ -121,11 +121,11 @@ Current HEAD (a0b4d01):
 
 Rough per-change cost estimate:
 
-- K2 softmax max-reduce alignment: +0.3–0.6 ms (30 layers × ~20 μs)
-- K3 Q·Kᵀ reduction alignment: +0.8–1.5 ms (dominant matmul)
-- K4 attn·V reduction alignment: +0.5–1.0 ms
+- K2 softmax max-reduce alignment: +0.3-0.6 ms (30 layers × ~20 μs)
+- K3 Q·Kᵀ reduction alignment: +0.8-1.5 ms (dominant matmul)
+- K4 attn·V reduction alignment: +0.5-1.0 ms
 
-Total estimated cost ceiling: 2.5–3 ms — **right at the floor**. If
+Total estimated cost ceiling: 2.5-3 ms -- **right at the floor**. If
 K3 alone blows past 1.5 ms, the remaining K4 budget is negative and
 the plan must either:
 
@@ -141,7 +141,7 @@ the plan must either:
 | Kernel rewrite introduces numerical bug | High | Unit harness is the regression gate; no edits ship without it green |
 | Speed regresses past 70 floor | Medium | Per-phase rollback criteria; Phase K6 holds stock kernel as fallback |
 | Compilation + tt-metal build-environment issues | Medium | Check tt-metal build toolchain works before K2 kernel edit |
-| Out-of-scope ops still contribute drift (RMSNorm, RoPE) | High | Even if SDPA alignment drops sub-op RFE to 0.02, full-stack PCC may only reach 0.99-floor if RMSNorm/RoPE drift stays — prepare fallback Phase K4.5 to repeat the same treatment on RMSNorm kernel |
+| Out-of-scope ops still contribute drift (RMSNorm, RoPE) | High | Even if SDPA alignment drops sub-op RFE to 0.02, full-stack PCC may only reach 0.99-floor if RMSNorm/RoPE drift stays -- prepare fallback Phase K4.5 to repeat the same treatment on RMSNorm kernel |
 
 ## Out of scope
 
@@ -161,15 +161,15 @@ the plan must either:
   is due to compounded drift from surrounding ops (layer norm input,
   RoPE output), not SDPA itself. Redirect the arc to those ops.
 - **After K2 softmax**: if delta_PCC ≥ +0.005 and speed is intact,
-  the softmax path is the dominant contributor — prioritize K3/K4.
-  If delta_PCC is near zero, softmax is not the issue — skip to K3.
+  the softmax path is the dominant contributor -- prioritize K3/K4.
+  If delta_PCC is near zero, softmax is not the issue -- skip to K3.
 - **After K3**: largest planned speed hit. If decode_tps drops below
   72, gate K4 behind an explicit user decision.
 
 ## Effort estimate
 
-- 4–6 Ralph sessions @ ~2–4 hours TT-side work each + review/commit.
-- Total ~10–20 hours of directed tt-metal kernel work.
+- 4-6 Ralph sessions @ ~2-4 hours TT-side work each + review/commit.
+- Total ~10-20 hours of directed tt-metal kernel work.
 - Does NOT include learning-curve time on the LLK / matmul_block API
   or debugging a broken kernel. First-time tt-metal compute kernel
   authors should budget 2× for Phase K2.
@@ -178,6 +178,6 @@ the plan must either:
 
 - Plan drafted. Phase K1 (harness + env-flag plumbing) is the first
   Ralph session to execute when the user greenlights the arc.
-- All foundations from sessions 7–13 (per-op RFE harness, env flags,
+- All foundations from sessions 7-13 (per-op RFE harness, env flags,
   speed baseline reconciled) are in place to support measurement at
   each phase boundary.

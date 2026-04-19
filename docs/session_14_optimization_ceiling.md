@@ -1,8 +1,8 @@
-# Session 14 — Optimization Ceiling Reference
+# Session 14 -- Optimization Ceiling Reference
 
 > Consolidates Phase K (SDPA kernel alignment harness + FP32_ACC default)
 > and Phase L (bfp8 KV + ttnn.split dead-ends) Ralph cycles into a single
-> reference. Updated 2026-04-19, HEAD `75a65b5`.
+> reference. Updated 2026-04-19, HEAD `1e41c63`.
 
 ## Headline result: TT is 5.9× faster than bitnet.cpp on the same box
 
@@ -18,7 +18,7 @@ prompt tokens. TT's TTFT is 216 ms (2.2× faster prefill). Accuracy-wise TT
 matches bitnet.cpp's logits at PCC 0.9699 (argmax top-1 match on the Paris
 probe, top-10 overlap 0.90).
 
-The original task framing — "comparably fast and accurate vs bitnet.cpp" — is
+The original task framing -- "comparably fast and accurate vs bitnet.cpp" -- is
 decisively satisfied. Any further optimization is a pure stretch goal, not a
 catch-up effort.
 
@@ -35,7 +35,7 @@ catch-up effort.
 | PCC vs bitnet.cpp | 0.9699 |
 | greedy argmax ("The capital of France is" → " Paris") | match |
 
-Variance across 5 back-to-back runs on HEAD `75a65b5`:
+Variance across 5 back-to-back runs on HEAD `1e41c63`:
 `73.82, 74.14, 74.30, 73.99, 73.97` t/s. Mean **74.04 t/s**, stddev
 **0.17**, min-max spread **0.48**. Any single-run speed delta
 < +0.5 t/s is noise, not signal. A stable +0.5 t/s requires
@@ -44,14 +44,14 @@ from ≥ 3 runs beats the old mean by > 0.5 t/s.
 
 ## What's been tried and rejected
 
-### SDPA kernel fork (Phase K plan K2-K4) — REDIRECTED
+### SDPA kernel fork (Phase K plan K2-K4) -- REDIRECTED
 K1 harness measured fused SDPA RFE vs torch.F.sdpa(fp32) = 0.0257. bf16
 torch rounding floor alone = 0.0025. Net TT-kernel SDPA drift = 0.023,
 well under the plan's 0.05 redirect gate. The SDPA compute kernel is
 already aligned with PyTorch semantics to within bf16 rounding; forking
 it for softmax/QK/attnV alignment would yield diminishing returns.
 
-### attn_sub_norm amplification hypothesis (Phase KR1/KR2) — FALSIFIED
+### attn_sub_norm amplification hypothesis (Phase KR1/KR2) -- FALSIFIED
 RMSNorm kernel alignment harness on layer-0 drifted post_self_attn:
   input drift RFE 0.235 → TT rms_norm output RFE 0.220 (amp 0.93x)
 The TT rms_norm kernel does NOT amplify input drift. Session 8's high
@@ -59,38 +59,38 @@ The TT rms_norm kernel does NOT amplify input drift. Session 8's high
 vs HF-output where each end-state reflects the whole cumulative chain),
 not kernel amplification.
 
-### BITNET_RMSNORM_FP32_ACC default flip — LANDED (marginal)
-Flipped to default=ON at commit 97cb9bc. Speed delta +0.35 t/s (within
+### BITNET_RMSNORM_FP32_ACC default flip -- LANDED (marginal)
+Flipped to default=ON at commit dd3c9d2. Speed delta +0.35 t/s (within
 noise). PCC delta +0.00005 vs HF, +0.002 vs bitnet.cpp. Local per-op
 RFE at post_input_norm: 0.0089 → 0.0028 (-68%). Small but real local
 win; end-to-end gain absorbed by downstream Q/K/V ternary matmul drift.
 
-### bfp8 KV cache (Phase L1) — DEAD END
+### bfp8 KV cache (Phase L1) -- DEAD END
 BITNET_KV_CACHE_DTYPE=bfp8 regresses decode_tps 74.35 → 24.57 (3×
 slower) with max token latency 1005 ms. The bfp8 dtype adds a
 quantize/dequantize step on every DRAM-L1 cache fetch in SDPA_decode
 and paged_update_cache, swamping the bandwidth saving.
 
-### ttnn.split replacing 2 ttnn.slice (Phase L2) — NEUTRAL
+### ttnn.split replacing 2 ttnn.slice (Phase L2) -- NEUTRAL
 Replacing the ffn.gate_up dual-slice with one ttnn.split call measured
 74.08 t/s (-0.27 vs 74.35 baseline, within noise). The 131 us/call figure
 in the non-trace profile was dispatch overhead absorbed by trace replay;
 no wall-clock win is available from this path.
 
-### LoFi on decode-path RoPE (Phase O) — PURE REGRESSION
+### LoFi on decode-path RoPE (Phase O) -- PURE REGRESSION
 `ttnn.experimental.rotary_embedding_llama` accepts a `compute_kernel_config`.
 Phase O tried passing a LoFi math_fidelity config, hypothesizing that RoPE's
 cos/sin multiplication has bounded inputs and wouldn't need HiFi2 precision.
 Result: decode_tps 72.93 t/s (-1.11 vs 74.04 mean, outside 0.5 noise band)
-and the greedy output string diverged from baseline — likely both slower AND
+and the greedy output string diverged from baseline -- likely both slower AND
 less accurate. Reverted fully (env flag + call-site) since LoFi neither
 picked faster code paths nor preserved PCC. The fused RoPE kernel is already
 at its tuned default. Third kernel-config lever to be falsified after N.
 
-### HiFi4 + fp32_dest_acc on ternary_matmul (Phase N) — PURE REGRESSION
+### HiFi4 + fp32_dest_acc on ternary_matmul (Phase N) -- PURE REGRESSION
 `ttnn.experimental.ternary_matmul` accepts a `compute_kernel_config` but
 bitlinear.py was never passing one. Phase N wired `BITNET_TERNARY_MATMUL_HIFI4=1`
-to pass HiFi4 + fp32_dest_acc_en — the same config the RMSNorm path uses.
+to pass HiFi4 + fp32_dest_acc_en -- the same config the RMSNorm path uses.
 Result: decode_tps 71.69 t/s (-2.35 vs 74.04 mean), PCC vs HF fp32 0.982045
 (IDENTICAL), PCC vs bitnet.cpp 0.969858 (IDENTICAL). The ternary {-1, 0, +1}
 accumulation already produces exact partial sums in bf16 (the 8-bit
@@ -114,8 +114,8 @@ the RoPE application, not in SDPA or RMSNorm. **Phase N falsified the
 hypothesis that ternary_matmul kernel precision is the lever**: passing
 HiFi4+fp32_dest_acc yielded identical PCC (0.982045 vs HF, 0.9699 vs
 bitnet.cpp) with -2.35 t/s cost. Ternary accumulation is already exact
-in bf16. The remaining drift is structural — per-layer ternary
-quantization noise compounding across 30 layers — not a kernel fix.
+in bf16. The remaining drift is structural -- per-layer ternary
+quantization noise compounding across 30 layers -- not a kernel fix.
 
 ## Decision tree for the next Ralph session
 
@@ -144,30 +144,30 @@ User re-greenlights kernel-fork cycle?
 
 ## Files from these cycles
 
-- `tests/test_sdpa_kernel_alignment.py` — K1 SDPA harness + env-flag test
-- `tests/test_rmsnorm_kernel_alignment.py` — KR2 RMSNorm harness
-- `src/bitnet_tt/layers/attention.py` — BITNET_SDPA_KERNEL_VARIANT plumbing
+- `tests/test_sdpa_kernel_alignment.py` -- K1 SDPA harness + env-flag test
+- `tests/test_rmsnorm_kernel_alignment.py` -- KR2 RMSNorm harness
+- `src/bitnet_tt/layers/attention.py` -- BITNET_SDPA_KERNEL_VARIANT plumbing
   ({stock, pytorch_ref}; aligned_* reserved for future kernel-fork cycle)
-- `src/bitnet_tt/layers/bitlinear.py` — BITNET_RMSNORM_FP32_ACC default ON
-- `.omc/prd.json` — K/L/M cycle story closure records
-- `MEMO.md` — baseline header refresh
+- `src/bitnet_tt/layers/bitlinear.py` -- BITNET_RMSNORM_FP32_ACC default ON
+- `.omc/prd.json` -- K/L/M cycle story closure records
+- `MEMO.md` -- baseline header refresh
 
 ## Commits (2026-04-19)
 
 ```
-949e2ff Phase K1: SDPA kernel-variant env + unit harness
-d920016 Phase K1 follow-up: RMSNorm kernel alignment harness
-97cb9bc Speed+accuracy: enable BITNET_RMSNORM_FP32_ACC by default
-fac7b94 MEMO: refresh baseline to 97cb9bc (74.18 t/s, PCC 0.9699 vs bitnet.cpp)
-2d67946 PRD: Phase K1 session closure — all 7 stories marked passes=true
-7b282d8 Deslop Phase K1 landing (post-architect)
-75a65b5 PRD: Phase L cycle — bfp8 KV and ttnn.split both falsified
-1323f6f Session 14: Phase K+L+M optimization-ceiling reference
-032f5f6 Phase N: ternary_matmul HiFi4 env flag + finding (false lever)
-43aefc4 Phase O: LoFi decode-path RoPE — pure regression
+93ce391 Phase K1: SDPA kernel-variant env + unit harness
+e9c6460 Phase K1 follow-up: RMSNorm kernel alignment harness
+dd3c9d2 Speed+accuracy: enable BITNET_RMSNORM_FP32_ACC by default
+334babc MEMO: refresh baseline to dd3c9d2 (74.18 t/s, PCC 0.9699 vs bitnet.cpp)
+51e3314 PRD: Phase K1 session closure -- all 7 stories marked passes=true
+35bd047 Deslop Phase K1 landing (post-architect)
+1e41c63 PRD: Phase L cycle -- bfp8 KV and ttnn.split both falsified
+4d074f6 Session 14: Phase K+L+M optimization-ceiling reference
+28cf8c9 Phase N: ternary_matmul HiFi4 env flag + finding (false lever)
+ac260d4 Phase O: LoFi decode-path RoPE -- pure regression
 ```
 
-## Session closure — K through O verdict table
+## Session closure -- K through O verdict table
 
 | Cycle | Lever | Verdict | Net effect on main |
 |:---|:---|:---|:---|

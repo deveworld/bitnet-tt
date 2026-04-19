@@ -4,13 +4,14 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 
 ## Key Features
 
-- **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **74.28 t/s Decode @ 128 tok** (p50 11.7 ms, min 10.7 ms → peak 93.5 t/s; batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode + **bfp8 lm_head** + **cos/sin device-side lookup** + **cpu().to_list() argmax readout**)
-- **+130% faster than bfp4** at half the storage
-- **PCC 0.982 vs HF fp32**, **0.981 vs HF bf16**, 0.968 vs bitnet.cpp — greedy match 6/16 on the "Paris" probe, argmax match True. Current HEAD is the practical PCC ceiling under the ≥ 70 t/s speed budget (see [`docs/STATUS.md`](docs/STATUS.md))
-- **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
-- **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
-- **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
+- **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack, giving a ~600 MB model (vs 1.2 GB bfp4, 4.8 GB bf16)
+- **74.04 t/s decode @ 128 tok** (5-run mean, p50 11.6 ms, min 10.7 ms, peak 93.5 t/s). Measured on HEAD `0513858` with batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode + bfp8 lm_head + cos/sin device-side lookup + cpu().to_list() argmax readout + fp32_dest_acc RMSNorm.
+- **+130% faster than bfp4** at half the storage.
+- **5.91x faster than bitnet.cpp** on the same p150a box. bitnet.cpp `llama-cli` CPU decodes at 12.53 t/s against our 74.04 t/s; prefill TTFT 216 ms vs bitnet.cpp's 475 ms (2.2x faster).
+- **PCC 0.982 vs HF fp32**, 0.981 vs HF bf16, 0.9699 vs bitnet.cpp. Greedy match 6/16 on the "Paris" probe, argmax match True. Sessions 7 through Q have explored every available lever at the ttnn API layer; 0.982 vs HF is the practical ceiling under the >=70 t/s speed budget without editing tt-metal C++ kernels. See [`docs/STATUS.md`](docs/STATUS.md) and [`docs/session_14_optimization_ceiling.md`](docs/session_14_optimization_ceiling.md).
+- **Fused RMSNorm + ternary matmul** for the QKV projection. RMSNorm runs inline inside the matmul kernel so there is no separate launch.
+- **HuggingFace compatible**: direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights.
+- **In-trace greedy argmax (multicore)**: argmax runs inside Metal Trace with `use_multicore=True`. Vocab-dim reduction is parallelised across 110 cores (1.76 ms to 0.08 ms per step).
 
 ## Quick Start
 
@@ -38,7 +39,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary** (2026-04-19 HEAD + cpu().to_list() argmax readout, 128 tok) | **11.7** | **85.5** | **10.7** | **93.5** | **74.28** | **~600 MB** |
+| **packed_ternary** (2026-04-19 HEAD `0513858`, fp32_dest_acc RMSNorm, 128 tok, 5-run mean) | **11.6** | **86.2** | **10.7** | **93.5** | **74.04** | **~600 MB** |
+| packed_ternary (2026-04-19 +cpu().to_list() argmax readout, 128 tok) | 11.7 | 85.5 | 10.7 | 93.5 | 74.28 | ~600 MB |
 | packed_ternary (2026-04-18 +cos/sin LUT, 128 tok) | 11.7 | 85.5 | 10.7 | 93.5 | 73.90 | ~600 MB |
 | packed_ternary (2026-04-18 +bfp8 lm_head, 128 tok) | 12.2 | 82.0 | 10.9 | 91.7 | 71.89 | ~600 MB |
 | packed_ternary (2026-04-17 +concat_heads_decode, 64 tok) | 11.3 | 88.5 | 10.7 | 93.5 | 70.98 | ~600 MB |
@@ -48,14 +50,14 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | packed_ternary (2026-04-17 +sharded rms_norm, 64 tok)     | 13.5 | 74.1 | 12.8 | 78.1 | 62.66 | ~600 MB |
 | packed_ternary (2026-04-17 +multicore argmax, 64 tok)     | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
 | packed_ternary (2026-04-17 fused QKV-norm, 64 tok)        | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
-| bfp4 (production baseline)                                | 31   | 32.3 | —    | —    | —    | ~1.2 GB |
-| bf16                                                      | ~62  | ~16  | —    | —    | —    | ~4.8 GB |
+| bfp4 (production baseline)                                | 31   | 32.3 | n/a   | n/a   | n/a   | ~1.2 GB |
+| bf16                                                      | ~62  | ~16  | n/a   | n/a   | n/a   | ~4.8 GB |
 
 ### Performance Evolution
 
 | Step | t/s | Key change |
 |---|---:|---|
-| 0. baseline (1-core scalar) | ~0.9 | — |
+| 0. baseline (1-core scalar) | ~0.9 |  |
 | 1-5. multi-core + BFP2_b HW unpack | ~21 | 108 Tensix cores |
 | 8. dual-NoC RISC split | ~30 | BRISC/NOC_0 + NCRISC/NOC_1 |
 | 10. activation multicast | 32.41 | rectangular mcast layout |
@@ -87,11 +89,11 @@ Prompt `"The capital of France is"` → argmax ` Paris` on all references.
 | Reference | Prefill PCC | Top-5 overlap | Top-10 overlap | Greedy 16-tok match |
 |:---|---:|:---:|:---:|:---:|
 | **HF fp32** (primary reference) | **0.982** | 60% | 90% | 6/16 |
-| HF bf16 (default — with ActQuant) | 0.981 | 60% | 80% | — |
-| HF bf16 (ActQuant disabled, `bench_vs_hf_noquant.py`) | 0.980 | — | — | — |
-| bitnet.cpp (INT8×INT2 CPU reference, `bench_vs_bitnetcpp.py`) | 0.968 | 60% | 90% | — |
+| HF bf16 (default, ActQuant enabled) | 0.981 | 60% | 80% | |
+| HF bf16 (ActQuant disabled, `bench_vs_hf_noquant.py`) | 0.9816 | | | |
+| bitnet.cpp (INT8×INT2 CPU reference, `bench_vs_bitnetcpp.py`) | **0.9699** | 80% | 90% | |
 
-Sessions 7–13 established that **PCC 0.982 vs HF fp32 is the practical ceiling** under a decode_tps ≥ 70 speed budget. Five cheap-lever interventions (fp32 RMSNorm acc, fp32 residual add, SDPA HiFi4, manual RoPE, manual primitive SDPA) all move PCC by ≤ 0.0018 — none crosses 0.005. Root cause: distributed op-level bf16-arithmetic drift between tt-metal and PyTorch/CUDA op libraries, not a single localisable op. See [`docs/session_10_phase2_closure.md`](docs/session_10_phase2_closure.md) and [`docs/plan_sdpa_kernel_alignment.md`](docs/plan_sdpa_kernel_alignment.md) for the tt-metal kernel alignment roadmap.
+Sessions 7 through Q established that 0.982 vs HF fp32 is the practical accuracy ceiling under a decode_tps >=70 budget. Every cheap lever measured at the ttnn API layer (fp32 RMSNorm accumulator, fp32 residual add, SDPA HiFi4, manual RoPE, manual primitive SDPA, ternary_matmul HiFi4+fp32_acc, LoFi RoPE) moves PCC by at most 0.002 and most of them are within noise or regress. The residual drift is a distributed op-level bf16 divergence between tt-metal and PyTorch/CUDA, not a single localisable op. See [`docs/session_14_optimization_ceiling.md`](docs/session_14_optimization_ceiling.md) for the full K through Q verdict table and the tt-metal C++ kernel alignment options that remain.
 
 ## Architecture
 
@@ -101,7 +103,7 @@ Sessions 7–13 established that **PCC 0.982 vs HF fp32 is the practical ceiling
 BitNetModel (2.4B params, ~600 MB packed_ternary)
 ├── Embedding (128256 vocab, 2560 dim)
 ├── TransformerBlock × 30
-│   ├── RMSNorm (input) — FUSED into QKV matmul kernel (decode only)
+│   ├── RMSNorm (input, FUSED into QKV matmul kernel for decode)
 │   ├── MultiHeadAttention
 │   │   ├── Fused QKV Projection (ternary_matmul + inline RMSNorm, 2-bit)
 │   │   │   ├── QKV scales folded: q*k → SDPA, v → attn_sub_norm

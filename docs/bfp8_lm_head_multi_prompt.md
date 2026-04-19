@@ -3,9 +3,9 @@
 ## Context
 
 `bench_accuracy_multi.py --dtype packed_ternary --decode-steps 16` run
-against the ae1387e (`lm_head` bfp8 default) build on Tenstorrent
+against the 7f8f131 (`lm_head` bfp8 default) build on Tenstorrent
 Blackhole p150a, 2026-04-18. This is the broader-prompt validation
-that the architect/critic review after commit c93bc20 required before
+that the architect/critic review after commit cb0d9f5 required before
 the bfp8 change could be treated as prod-safe.
 
 ## Result
@@ -23,7 +23,7 @@ max 0.9983.
 
 ## Interpretation
 
-Every prompt preserves the HF argmax — bfp8 is safe for greedy decode
+Every prompt preserves the HF argmax -- bfp8 is safe for greedy decode
 across a diverse prompt mix. The PCC spread is almost entirely driven
 by the Tolkien opener (`"In a hole in the ground there lived"`), which
 is a highly distinctive context whose HF reference concentrates logit

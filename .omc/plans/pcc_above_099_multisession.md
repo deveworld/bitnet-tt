@@ -1,38 +1,38 @@
-# Plan: BitNet-TT Prefill PCC > 0.99 vs HF bf16 — Multi-Session Kernel Work (v4)
+# Plan: BitNet-TT Prefill PCC > 0.99 vs HF bf16 (Multi-Session Kernel Work, v4)
 
-> ## Execution status — 2026-04-19 (HEAD 503c164)
+> ## Execution status, 2026-04-19 (HEAD 67831c9)
 >
 > | Phase | Scope | Status |
 > |:---|:---|:---|
-> | **Phase 0** | dlpack env restore + baseline reconciliation | ✅ **DONE** (session 7) — torch.uintN shim + ttnn.to_torch wrapper; reconciled baseline 71.05 t/s / PCC 0.982. `docs/session_7_baseline_reconciled.md`. |
-> | **Phase 0.5** | fp32 RMSNorm acc + fp32 residual ablations | ✅ **DONE** (session 7) — both |delta_PCC| < 0.002 → **PROCEED**. `docs/session_7_phase_0p5_gate_decision.md`. |
-> | **Phase 1** | Per-op RFE localization harness | ✅ **DONE** (session 8) — `scripts/pcc_localize.py` + `BITNET_LOCALIZE` env. L0.post_input_norm RFE 0.009, L0.post_self_attn 0.240, L0.post_attn_sub_norm 0.420. Dominant drift chain = SDPA path. |
-> | **Phase 2** | Top-1 op kernel alignment (cheap levers) | ⚠️ **CLOSED NEGATIVE** (sessions 9–10) — 5 cheap levers tested (fp32 RMSNorm acc, fp32 residual, SDPA HiFi4, manual RoPE, manual primitive SDPA), all ≤ |0.002| PCC delta. `docs/session_10_phase2_closure.md`. |
-> | **Phase 3–4** | Multi-op alignment / speed recovery | ↻ **REPLACED by Phase K arc** — see `docs/plan_sdpa_kernel_alignment.md`. Cheap-lever exhaustion forced the pivot into direct tt-metal C++ kernel edits. |
-> | **Phase 5** | 64-prompt joint validation | ⏳ **Deferred** — runs after Phase K3 at earliest. |
-> | **Phase 6** | Upstream PR | ⏳ **Optional** — gated on Phase K landing a material win. |
+> | **Phase 0** | dlpack env restore + baseline reconciliation | ✅ **DONE** (session 7), torch.uintN shim + ttnn.to_torch wrapper; reconciled baseline 71.05 t/s / PCC 0.982. `docs/session_7_baseline_reconciled.md`. |
+> | **Phase 0.5** | fp32 RMSNorm acc + fp32 residual ablations | ✅ **DONE** (session 7), both |delta_PCC| < 0.002 → **PROCEED**. `docs/session_7_phase_0p5_gate_decision.md`. |
+> | **Phase 1** | Per-op RFE localization harness | ✅ **DONE** (session 8), `scripts/pcc_localize.py` + `BITNET_LOCALIZE` env. L0.post_input_norm RFE 0.009, L0.post_self_attn 0.240, L0.post_attn_sub_norm 0.420. Dominant drift chain = SDPA path. |
+> | **Phase 2** | Top-1 op kernel alignment (cheap levers) | ⚠️ **CLOSED NEGATIVE** (sessions 9-10), 5 cheap levers tested (fp32 RMSNorm acc, fp32 residual, SDPA HiFi4, manual RoPE, manual primitive SDPA), all ≤ |0.002| PCC delta. `docs/session_10_phase2_closure.md`. |
+> | **Phase 3-4** | Multi-op alignment / speed recovery | ↻ **REPLACED by Phase K arc**, see `docs/plan_sdpa_kernel_alignment.md`. Cheap-lever exhaustion forced the pivot into direct tt-metal C++ kernel edits. |
+> | **Phase 5** | 64-prompt joint validation | ⏳ **Deferred**, runs after Phase K3 at earliest. |
+> | **Phase 6** | Upstream PR | ⏳ **Optional**, gated on Phase K landing a material win. |
 >
-> **Speed-side bonus (out-of-plan):** sessions 11–12 recovered +3.23 decode_tps via the `cpu().to_list()` argmax readout fix. Current HEAD 74.28 t/s / PCC 0.982, exceeding pre-dlpack-regression baseline.
+> **Speed-side bonus (out-of-plan):** sessions 11-12 recovered +3.23 decode_tps via the `cpu().to_list()` argmax readout fix. Current HEAD 74.28 t/s / PCC 0.982, exceeding pre-dlpack-regression baseline.
 >
 > **Next step:** user greenlight → Phase K1 (unit harness + env-flag plumbing, no kernel edits yet). See `docs/plan_sdpa_kernel_alignment.md` §"Phase K1" and `docs/STATUS.md` §9 for the concrete Ralph-session sketch.
 >
 > ---
 
-**Mode:** DELIBERATE consensus (RALPLAN-DR) — high-risk, multi-week, multi-session kernel rewrite
-**Base commit:** d37798d (plan-of-record) — speed baseline to be RECONCILED in Phase 0 against MEMO.md-reported state (p50 17.5 ms / ~57 t/s / decode_tps ~50.4).
+**Mode:** DELIBERATE consensus (RALPLAN-DR), high-risk, multi-week, multi-session kernel rewrite
+**Base commit:** 7749efa (plan-of-record), speed baseline to be RECONCILED in Phase 0 against MEMO.md-reported state (p50 17.5 ms / ~57 t/s / decode_tps ~50.4).
 **Estimated scope:** 5-7 weeks across ~7 Ralph sessions (added Phase 0.5)
 **Partial-progress is an acceptable outcome.** Reaching PCC 0.990 after 3 kernel rewrites is a legitimate stopping point even if the full 0.019 gap does not close.
 
-**v4 revision summary (vs v3) — Critic ITERATE verdict, 4 MAJOR fixes:**
-- **FIX 1 (paired bootstrap):** Phase 0.5 bootstrap now explicitly paired across conditions — 25 (run, prompt, seed) tuples evaluated under both ablation and HEAD with identical seed/prompt; resample per-tuple deltas, not marginals. Tightens CI by √2 and makes the 0.002/0.005 gate bands decision-relevant.
+**v4 revision summary (vs v3). Critic ITERATE verdict, 4 MAJOR fixes:**
+- **FIX 1 (paired bootstrap):** Phase 0.5 bootstrap now explicitly paired across conditions, 25 (run, prompt, seed) tuples evaluated under both ablation and HEAD with identical seed/prompt; resample per-tuple deltas, not marginals. Tightens CI by √2 and makes the 0.002/0.005 gate bands decision-relevant.
 - **FIX 2 (multiple-comparisons correction):** Phase 1's 3σ bar replaced with **3.32σ (Bonferroni at FWER=0.05 across 55 cells)**. Benjamini-Hochberg at FDR=0.10 considered and rejected (binary per-op Phase-2 commitment makes Bonferroni's stricter FWER target more appropriate). Measurement-plan threshold updated to match.
 - **FIX 3 (wall-clock abort):** Phase 0.5 ablation (b) gains a 5×-normal-prefill wall-clock trigger that drops samples to 3×3=9 and widens CI to 80%, with hard abort if 9-sample run exceeds 1 day.
 - **FIX 4 (REDIRECT feasibility catalog):** Before committing Phases 1-4 to REDIRECT scope, a ~1-day tt-metal-feasibility catalog enumerates fp32_dest_acc_en coverage across every seam; <80% coverage triggers a hybrid Python-carry + targeted-rewrite fallback (partial reversion toward Option A).
 - **Polish:** 0.002 / 0.01 thresholds explicitly labeled (within-class ranking noise floor vs cross-class actionable signal); combined (a)+(b) inherits (b)'s speed-budget exemption; task-flow gate text references CI bounds rather than point estimates.
 
 **v3 revision summary (vs v2):**
-- **REQUIRED FIX 1 — Phase 0.5 gate is now CI-aware.** Ablation measurements use 5 runs × 5 prompts = 25 samples with 90% percentile-bootstrap CIs. REDIRECT gate is `lower CI bound on delta >= 0.005`; PROCEED gate is `upper CI bound on delta < 0.002`; between-state runs the combined (a)+(b) ablation and re-gates on combined CI. Removes the 3-run-median noise-flip failure mode identified by Architect.
-- **REQUIRED FIX 2 — Ablation (b) redesigned.** v2 ablation (b) cast residual to fp32 only at each residual-add and downcast immediately; this is numerically equivalent to the bf16 add (deferred rounding by one op) and did NOT test session 5's diffuse-across-layers fp32 accumulation hypothesis. v3 keeps residual in fp32 ACROSS all 30 layers and only downcasts at the final pre-lm_head boundary. Falsification section and gate cross-references updated.
+- **REQUIRED FIX 1: Phase 0.5 gate is now CI-aware.** Ablation measurements use 5 runs × 5 prompts = 25 samples with 90% percentile-bootstrap CIs. REDIRECT gate is `lower CI bound on delta >= 0.005`; PROCEED gate is `upper CI bound on delta < 0.002`; between-state runs the combined (a)+(b) ablation and re-gates on combined CI. Removes the 3-run-median noise-flip failure mode identified by Architect.
+- **REQUIRED FIX 2: Ablation (b) redesigned.** v2 ablation (b) cast residual to fp32 only at each residual-add and downcast immediately; this is numerically equivalent to the bf16 add (deferred rounding by one op) and did NOT test session 5's diffuse-across-layers fp32 accumulation hypothesis. v3 keeps residual in fp32 ACROSS all 30 layers and only downcasts at the final pre-lm_head boundary. Falsification section and gate cross-references updated.
 - **Polish:** Phase 1 variance N=5→N=10 with a 3σ separability bar (tightened from 2σ) to survive multiple-comparisons across 55 (layer, capture-point) cells. RFE triangle-inequality caveat added: cross-class ranking (linear vs norm vs softmax/attention) requires Jacobian-aware reweighting before kernel commitment. Phase 0.5 speed budget made prescriptive (0.5 ms/step is the budget, not an example), with ablation (b) exempt because cross-layer fp32 carry is a measurement-only path.
 - **v2 revision summary (for historical context):** baseline reconciliation gate added to Phase 0; new Phase 0.5 runs the deferred session-5 residual/accumulator ablations BEFORE committing to the multi-week harness; Phase 1 measurement replaced with relative Frobenius error (RFE) normalized by tensor RMS plus variance estimation and multi-layer capture from day one; Principles 2 and 4 rewritten for internal consistency; explicit falsification section added for session-5 hypothesis; Scenario 1 upgraded MEDIUM -> HIGH with Phase 0.5 as primary mitigation; explicit tradeoff-resolution statement added (speed-preserving numerical improvement wins over bit-identity when they conflict).
 
@@ -45,7 +45,7 @@
 1. **Measurement before mutation.** Any kernel change must be preceded by an intermediate-tensor numerical localization (RFE/RMS, see Phase 1) that quantifies that op's contribution. No speculative rewrites.
 2. **Speed floor: >= 70 t/s OR explicit documented regression with rollback criterion.** If reconciled HEAD is already below 70 t/s (see Phase 0), the floor becomes "no further regression vs reconciled-HEAD baseline" and any phase that drops below that reverts immediately unless an explicit speed/accuracy tradeoff is documented AND user-approved.
 3. **One kernel per session.** A Ralph session rewrites exactly one op, lands measurement, and stops. Multi-op diffs can't be bisected when PCC moves.
-4. **Speed-preserving numerical improvement over bit-identity.** The goal is reducing bf16 rounding error in a speed-compatible way (fp32 accumulators, better reduction order, pre-scaling) — NOT matching PyTorch/CUDA bf16 byte-for-byte. tt-metal's 32x32 tile-reduction topology cannot be bit-identical to CUDA's warp-shuffle tree with fp32 accum; we accept that. When bit-identity conflicts with Principle 2, **speed-preserving improvement wins.**
+4. **Speed-preserving numerical improvement over bit-identity.** The goal is reducing bf16 rounding error in a speed-compatible way (fp32 accumulators, better reduction order, pre-scaling), NOT matching PyTorch/CUDA bf16 byte-for-byte. tt-metal's 32x32 tile-reduction topology cannot be bit-identical to CUDA's warp-shuffle tree with fp32 accum; we accept that. When bit-identity conflicts with Principle 2, **speed-preserving improvement wins.**
 5. **Partial progress is victory.** PCC 0.985 -> 0.990 after two kernels is worth shipping and documenting. The "chase to 0.99" can stop mid-plan without regret.
 
 ### Decision Drivers (top 3)
@@ -82,7 +82,7 @@ Phase 0 -> Phase 0.5 -> Phase 1 -> rewrite the single op with largest RFE contri
 - If Phase 1 shows SDPA is top contributor, Phase 2 becomes a 3-4 week kernel rewrite with no intermediate checkpoints
 - Rollback kills the whole arc if SDPA rewrite fails numerically
 
-#### Option C: Bypass the problem — emulator-as-reference
+#### Option C: Bypass the problem, emulator-as-reference
 
 **INVALIDATED.** User rejected in session 6. Included per RALPLAN-DR for completeness. Invalidation rationale: does not address real numerical drift; future BitNet users hit the same ceiling.
 
@@ -120,7 +120,7 @@ Phase 0 -> Phase 0.5 -> Phase 1 -> rewrite the single op with largest RFE contri
 
 ## Context
 
-**Reported HEAD (d37798d) state — to be RECONCILED in Phase 0:**
+**Reported HEAD (7749efa) state, to be RECONCILED in Phase 0:**
 
 Two internally inconsistent speed figures exist in the repo. Phase 0 must resolve which is current:
 
@@ -128,11 +128,11 @@ Two internally inconsistent speed figures exist in the repo. Phase 0 must resolv
 |---|---|---|---|
 | v1 plan baseline (stale?) | 74.21 | 11.7 ms | bench_batch32 (historic) |
 | MEMO.md:8 (fused-RMSNorm work) | 57.1 (p50) / 50.4 (decode avg) | 17.5 ms | 64-tok bench |
-| MEMO.md:586 | 57 t/s p50 / 50.4 t/s decode avg | — | — |
+| MEMO.md:586 | 57 t/s p50 / 50.4 t/s decode avg |, |, |
 
 **Working assumption until Phase 0 resolves it:** HEAD is ~57 t/s p50 / 50.4 decode_tps, p50 17.5 ms. That puts HEAD *already below* the 70 t/s Principle-2 floor by about -3.2 ms. Downstream phases must therefore be **speed-neutral or speed-positive**, not "spend tps budget."
 
-**Accuracy baseline (d37798d, unchanged):**
+**Accuracy baseline (7749efa, unchanged):**
 - PCC vs HF fp32: 0.980679
 - PCC vs HF bf16 (ActQuant on): 0.981319
 - PCC vs HF bf16 (ActQuant off): 0.980143
@@ -141,11 +141,11 @@ Two internally inconsistent speed figures exist in the repo. Phase 0 must resolv
 
 **What has been ruled out (sessions 3-6):** weight format, LM head bfp8 vs bf16, HiFi2/HiFi4, multi-layer bf16 swaps, ActQuant, attention core-range split, fused-norm extensions. See v1 for details.
 
-**Root cause (diagnosed session 6):** op-level numerical drift between tt-metal bf16 and PyTorch/CUDA bf16. Hardware CAN produce bit-close bf16; this is a software kernel choice. **But note:** session 5 has a competing prior — the drift is *diffuse cumulative* across 30 layers, not localized to a few ops. Phase 0.5 is designed to arbitrate between these priors.
+**Root cause (diagnosed session 6):** op-level numerical drift between tt-metal bf16 and PyTorch/CUDA bf16. Hardware CAN produce bit-close bf16; this is a software kernel choice. **But note:** session 5 has a competing prior, the drift is *diffuse cumulative* across 30 layers, not localized to a few ops. Phase 0.5 is designed to arbitrate between these priors.
 
 **Unranked candidate contributors:** SDPA, RMSNorm, RoPE fused, residual-add ordering, ternary_matmul internal reduction, residual-stream accumulator precision.
 
-## Falsification Section — Which Phase 1 Outcome Validates Session 5 vs Falsifies It
+## Falsification Section: Which Phase 1 Outcome Validates Session 5 vs Falsifies It
 
 **Session 5 hypothesis:** diffuse cumulative bf16 drift across 30 layers; no small set of ops dominates.
 
@@ -194,7 +194,7 @@ Two internally inconsistent speed figures exist in the repo. Phase 0 must resolv
 Phase 0: Environment restore + SPEED BASELINE RECONCILIATION (1 session, ~1 day)
      |
      v
-Phase 0.5 (NEW): Session-5 deferred ablations — fp32 accum & fp32 residual (1 session, ~1-2 days)
+Phase 0.5 (NEW): Session-5 deferred ablations, fp32 accum & fp32 residual (1 session, ~1-2 days)
      |
      | GATE (CI-aware): if lower 90% CI bound on delta >= 0.005, REDIRECT; if upper 90% CI bound on delta < 0.002, PROCEED to Phase 1; else AMBIGUOUS (run combined ablation)
      v
@@ -219,16 +219,16 @@ Phase 6 (optional): Upstream to tt-metal (open-ended)
 
 ---
 
-## Phase 0 — Restore Measurement Harness AND Reconcile Speed Baseline
+## Phase 0: Restore Measurement Harness AND Reconcile Speed Baseline
 
-**Goal:** `bench_batch32.py`, `bench_accuracy.py`, `bench_vs_hf_noquant.py`, `bench_vs_bitnetcpp.py` all run to completion on current HEAD. **Additionally:** reconcile the two reported-speed figures (74.21 t/s vs 57 t/s p50) and lock a single authoritative HEAD speed baseline before any other phase runs.
+**Goal:** `bench_batch32.py`, `bench_accuracy.py`, `bench_vs_hf_noquant.py`, `bench_vs_bitnetcpp.py` all run to completion on current HEAD. Also reconcile the two reported-speed figures (74.21 t/s vs 57 t/s p50) and lock a single authoritative HEAD speed baseline before any other phase runs.
 
 **Task breakdown:**
 
 1. **Diagnose dlpack kUInt32 failure.** (unchanged from v1)
 2. **Pick lowest-risk fix** between torch upgrade vs cast workaround vs separate bitnet.cpp venv. (unchanged from v1)
 3. **Pin and gate.** (unchanged from v1)
-4. **NEW — Speed baseline reconciliation.** On reconciled HEAD run the same bench used to produce each historical figure:
+4. **NEW, Speed baseline reconciliation.** On reconciled HEAD run the same bench used to produce each historical figure:
    - (a) bench_batch32 with 64-tok warmup + 256-tok measure (MEMO.md:8 protocol) -> expect ~p50 17.5 ms
    - (b) bench_batch32 with the v1-plan protocol (whichever produced 11.7 ms / 74.21 t/s) -> determine whether this is reproducible or orphaned
    - If (a) and (b) give different numbers, document which bench is authoritative for this plan. Default to (a) if (b) cannot be reproduced.
@@ -246,7 +246,7 @@ Phase 6 (optional): Upstream to tt-metal (open-ended)
 
 ---
 
-## Phase 0.5 — Session-5 Deferred Ablations (NEW)
+## Phase 0.5: Session-5 Deferred Ablations (NEW)
 
 **Goal:** Before committing to a multi-week per-op harness, cheaply test the two session-5-deferred hypotheses. Redirect the plan if either closes a material chunk of the 0.019 gap.
 
@@ -262,7 +262,7 @@ Phase 6 (optional): Upstream to tt-metal (open-ended)
    - Record `(delta_PCC_mean, delta_PCC_90CI_lower, delta_PCC_90CI_upper, delta_tps)` in `docs/session_N_ablation_a_rmsnorm_fp32acc.md`
 
 2. **Ablation (b): fp32-residual-stream-across-layers (REDESIGNED in v3)**
-   - **Keep residual-stream tensor in fp32 ACROSS LAYERS** — no intra-layer downcast. Accumulate residual in fp32 from the embedding output through all 30 transformer blocks; downcast to bf16 ONLY at the final pre-lm_head projection boundary.
+   - **Keep residual-stream tensor in fp32 ACROSS LAYERS**, no intra-layer downcast. Accumulate residual in fp32 from the embedding output through all 30 transformer blocks; downcast to bf16 ONLY at the final pre-lm_head projection boundary.
    - Op inputs are still bf16 (we cast bf16 op-output back up to fp32 before the residual add); op internal compute is unchanged. This isolates the "diffuse fp32 residual accumulator across layers" hypothesis from session 5, not just per-op rounding.
    - Every other op unchanged (still bf16 compute).
    - Measure same three metrics as (a) with the same 5×5 discipline.
@@ -276,21 +276,21 @@ Phase 6 (optional): Upstream to tt-metal (open-ended)
 
 **Variance protocol (v3):** ablation PCC uses 5 runs × 5 prompts = 25 samples; report mean, 90% CI (percentile bootstrap, 1000 resamples), and the per-prompt std. Gate decisions use the 90% CI bounds on `delta_PCC` (ablation minus reconciled HEAD), not a single point estimate.
 
-**Paired-bootstrap protocol (v4):** Samples are PAIRED across conditions — each of the 25 (run, prompt, seed) tuples is evaluated under both (ablation) and (HEAD) with identical seed and identical prompt. Bootstrap resamples the 25 per-tuple delta_i = PCC(ablation)_i − PCC(HEAD)_i values, NOT the two marginal distributions independently. Paired bootstrap tightens the CI by √2 and is required for the 0.002/0.005 gate bands to be decision-relevant.
+**Paired-bootstrap protocol (v4):** Samples are PAIRED across conditions, each of the 25 (run, prompt, seed) tuples is evaluated under both (ablation) and (HEAD) with identical seed and identical prompt. Bootstrap resamples the 25 per-tuple delta_i = PCC(ablation)_i − PCC(HEAD)_i values, NOT the two marginal distributions independently. Paired bootstrap tightens the CI by √2 and is required for the 0.002/0.005 gate bands to be decision-relevant.
 
-**Gate criteria (primary plan decision point) — CI-AWARE (v3):**
+**Gate criteria (primary plan decision point), CI-AWARE (v3):**
 
 Given σ ≈ 0.002 noise on PCC measurements, a 3-run median can easily flip REDIRECT ↔ PROCEED around a true delta of 0.004. Gate on CI bounds, not point estimates.
 
 Let `delta = PCC(ablation) - PCC(reconciled HEAD)` for ablation (a) or (b). Compute a 90% CI from 25 samples via percentile bootstrap.
 
-- **REDIRECT:** if (a) lower 90% CI bound `>= 0.005` OR (b) lower 90% CI bound `>= 0.005`. Rewrite Phases 1-4 as a single "promote precision at seams across all ops" arc. Phase 1 becomes "map every accumulator/residual-stream seam in the forward pass"; Phases 2-4 become "promote (a) all accumulators, (b) all residual adds, (c) any remaining seam identified in Phase 1 map." **Feasibility catalog (v4):** Before committing Phases 1-4 to REDIRECT scope, insert a ~1 day tt-metal-feasibility catalog step: enumerate fp32_dest_acc_en / fp32-accumulator support coverage across every residual, norm, and matmul seam in the forward pass. If kernel coverage < 80% of seams: REDIRECT fallback becomes a hybrid — Python-side fp32 carry for measurement-only seams + targeted kernel rewrites for uncovered seams (partial reversion toward Option A scoping).
+- **REDIRECT:** if (a) lower 90% CI bound `>= 0.005` OR (b) lower 90% CI bound `>= 0.005`. Rewrite Phases 1-4 as a single "promote precision at seams across all ops" arc. Phase 1 becomes "map every accumulator/residual-stream seam in the forward pass"; Phases 2-4 become "promote (a) all accumulators, (b) all residual adds, (c) any remaining seam identified in Phase 1 map." **Feasibility catalog (v4):** Before committing Phases 1-4 to REDIRECT scope, insert a ~1 day tt-metal-feasibility catalog step: enumerate fp32_dest_acc_en / fp32-accumulator support coverage across every residual, norm, and matmul seam in the forward pass. If kernel coverage < 80% of seams: REDIRECT fallback becomes a hybrid, Python-side fp32 carry for measurement-only seams + targeted kernel rewrites for uncovered seams (partial reversion toward Option A scoping).
 - **PROCEED:** if (a) upper 90% CI bound `< 0.002` AND (b) upper 90% CI bound `< 0.002`. Session 5's diffuse-drift-at-seams hypothesis is materially weakened at the 90% confidence level. Per-op hypothesis earns the multi-week harness cost. Proceed to Phase 1 as specified.
 - **AMBIGUOUS:** any configuration between the above (e.g. CI straddles the 0.002-0.005 band, or one ablation REDIRECTs and the other PROCEEDs). Run combined (a)+(b) ablation with the same 5×5 discipline and re-gate on the combined CI using the same REDIRECT/PROCEED rules above. If combined is still AMBIGUOUS, treat as REDIRECT (conservative: session 5's prior is stronger than a non-separable null).
 
-**Speed check (Principle 2) — PRESCRIPTIVE (v3):**
+**Speed check (Principle 2), PRESCRIPTIVE (v3):**
 - **0.5 ms/step is the budget, not an example.** Ablation (a) must stay within +0.5 ms/step of reconciled-HEAD p50; ablation (b) is exempt from the budget because the cross-layer fp32 carry is a measurement-only path whose speed is not the thing being tested. Record both numbers either way.
-- If (a) exceeds the budget, note it and still use the PCC delta to decide the gate — but flag in the decision doc that the REDIRECTed plan will need kernel-level fp32 accumulator support, not just a Python toggle.
+- If (a) exceeds the budget, note it and still use the PCC delta to decide the gate, but flag in the decision doc that the REDIRECTed plan will need kernel-level fp32 accumulator support, not just a Python toggle.
 
 **Risk + mitigation:**
 - *Risk:* tt-metal's fp32_dest_acc_en flag has incomplete op coverage and (a) fails to compile. *Mitigation:* fall back to a Python-side fp32 cast around rmsnorm input/output for the measurement only.
@@ -305,9 +305,9 @@ Let `delta = PCC(ablation) - PCC(reconciled HEAD)` for ablation (a) or (b). Comp
 
 ---
 
-## Phase 1 — Per-Op Numerical Localization Harness (REWRITTEN)
+## Phase 1: Per-Op Numerical Localization Harness (REWRITTEN)
 
-**Goal:** Produce a table ranking each op's contribution to the 0.019 PCC gap using a metric that composes correctly through residual streams, with variance estimation sufficient to distinguish ops that differ by <= 0.002 (**within-class ranking noise floor**; the **cross-class actionable signal threshold** is 0.01 — see Phase 1 measurement plan).
+**Goal:** Produce a table ranking each op's contribution to the 0.019 PCC gap using a metric that composes correctly through residual streams, with variance estimation sufficient to distinguish ops that differ by <= 0.002 (**within-class ranking noise floor**; the **cross-class actionable signal threshold** is 0.01, see Phase 1 measurement plan).
 
 **Metric change (vs v1):**
 
@@ -321,7 +321,7 @@ RFE(tt_T, hf_T) = ||tt_T - hf_T||_F / (||hf_T||_F + eps)   # relative Frobenius
 
 RFE composes through residual streams via the triangle inequality: if op A adds error e_A and op B adds error e_B, the post-B error is bounded by e_A + e_B + O(e_A * e_B). This makes per-op contribution **meaningfully rankable** by RFE-delta between adjacent capture points.
 
-**Caveat (v3):** the triangle inequality is *loose across nonlinear ops* (RMSNorm, softmax). Two ops with equal RFE-delta can have very different downstream amplification factors because their local Jacobians differ. Ranking is therefore only directly comparable between ops with **similar local Jacobian scales** — e.g. two linear matmuls, or two residual-adds. A big RFE on RMSNorm is not directly comparable to a big RFE on a residual-add without Jacobian-aware reweighting. Phase 1 flags this in the output table by grouping ops into {linear-ish, norm, softmax/attention} classes; cross-class ranking is annotated "requires Jacobian correction before kernel commitment."
+**Caveat (v3):** the triangle inequality is *loose across nonlinear ops* (RMSNorm, softmax). Two ops with equal RFE-delta can have very different downstream amplification factors because their local Jacobians differ. Ranking is therefore only directly comparable between ops with **similar local Jacobian scales**, e.g. two linear matmuls, or two residual-adds. A big RFE on RMSNorm is not directly comparable to a big RFE on a residual-add without Jacobian-aware reweighting. Phase 1 flags this in the output table by grouping ops into {linear-ish, norm, softmax/attention} classes; cross-class ranking is annotated "requires Jacobian correction before kernel commitment."
 
 **Task breakdown:**
 
@@ -330,14 +330,14 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 3. **Multi-layer capture from day one (CHANGED).** v1 proposed single-layer bootstrap. v2 requires layers {0, 5, 15, 25, 29} from the first capture run because session 4 showed layer-0 contribution is ~5x layer-29; a single-layer bootstrap misranks ops.
 4. **HF-boundary alignment for fused QKV + RMSNorm (NEW).** Fused-kernel drift is non-decomposable because the fused output has no reference layout to compare against. Provide ONE of:
    - (a) an un-fused TT shadow path: a debug-only code path that runs unfused QKV and unfused post-RMSNorm, purely for boundary capture. Used ONLY in Phase 1, not in production decode.
-   - (b) explicit documentation in `docs/pcc_alignment.md` that fused-kernel capture points are "combined RFE only — non-decomposable into per-sub-op contribution." Fused-kernel rewrites in Phase 2+ are scoped by combined RFE, not sub-op breakdown.
+   - (b) explicit documentation in `docs/pcc_alignment.md` that fused-kernel capture points are "combined RFE only, non-decomposable into per-sub-op contribution." Fused-kernel rewrites in Phase 2+ are scoped by combined RFE, not sub-op breakdown.
    - Phase 1 picks (a) if the shadow path is < 2 days of work; else (b).
-5. **Variance estimation (UPDATED v3).** For each (layer, capture_point) pair, run the capture **N=10** times across the same prompt and across K=5 different prompts (was N=5 — underpowered at a 2σ bar). Compute:
+5. **Variance estimation (UPDATED v3).** For each (layer, capture_point) pair, run the capture **N=10** times across the same prompt and across K=5 different prompts (was N=5, underpowered at a 2σ bar). Compute:
    - within-prompt std of RFE
    - across-prompt std of RFE
    - report `RFE_delta +/- max(within_std, across_std)` per op
-   - An op is "statistically separable" only if `RFE_delta > 3.32 * sigma` (v4: Bonferroni correction at FWER=0.05 across 55 comparison cells — 11 capture points × 5 layers. Per-cell two-sided z-threshold = Φ⁻¹(1 − 0.025/55) ≈ 3.32σ. **Target: FWER=0.05 (family-wise error rate).** Alternative Benjamini-Hochberg at FDR=0.10 was considered but Bonferroni chosen because the Phase-2 target commitment is binary per-op and false-positives cost a full kernel-rewrite session.). Ops that do not clear this bar are grouped into a "noise floor" bucket and not ranked individually.
-   - If 50 samples × 11 capture points × 5 layers proves too expensive in wall-clock, fall back to N=5 with the same 3.32σ Bonferroni bar documented as the weaker power — but keep the 3.32σ threshold regardless of N.
+   - An op is "statistically separable" only if `RFE_delta > 3.32 * sigma` (v4: Bonferroni correction at FWER=0.05 across 55 comparison cells, 11 capture points × 5 layers. Per-cell two-sided z-threshold = Φ⁻¹(1 − 0.025/55) ≈ 3.32σ. **Target: FWER=0.05 (family-wise error rate).** Alternative Benjamini-Hochberg at FDR=0.10 was considered but Bonferroni chosen because the Phase-2 target commitment is binary per-op and false-positives cost a full kernel-rewrite session.). Ops that do not clear this bar are grouped into a "noise floor" bucket and not ranked individually.
+   - If 50 samples × 11 capture points × 5 layers proves too expensive in wall-clock, fall back to N=5 with the same 3.32σ Bonferroni bar documented as the weaker power, but keep the 3.32σ threshold regardless of N.
 6. **Ranking harness** `scripts/pcc_localize.py` outputs CSV and markdown table sorted by RFE-delta with variance bars.
 7. **Produce final ranked table** + decision doc `docs/session_N_pcc_localization.md` recommending Phase 2 target.
 
@@ -346,7 +346,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 - Multi-layer, multi-prompt RFE table with variance bars is produced
 - "Statistically separable" top-K ops identified (K may be 0, 1, 2, or more)
 - Fused-kernel alignment resolution (shadow path or documented non-decomposability) is committed
-- Decision doc names Phase 2 target OR states "no statistically separable op dominates — session 5 confirmed; plan may stop."
+- Decision doc names Phase 2 target OR states "no statistically separable op dominates, session 5 confirmed; plan may stop."
 
 **Measurement plan (v3):**
 - 5 prompts × 5 layers × 11 capture points × N=10 runs for variance (fallback N=5 if wall-clock forbids)
@@ -373,7 +373,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 ---
 
-## Phase 2 — Rewrite Op #1 (Top Contribution / Cost Ratio)
+## Phase 2: Rewrite Op #1 (Top Contribution / Cost Ratio)
 
 **Goal:** Rewrite the op ranked #1 by Phase 1 to reduce RFE in a **speed-preserving** way (Principle 4) while holding decode speed at or above reconciled-HEAD baseline (Principle 2).
 
@@ -383,7 +383,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 - Step 1 uses RFE (not PCC) for op characterization
 - Step 5 "Decide" becomes:
-  - **PASS:** decode speed at or above reconciled-HEAD baseline (no regression), AND end-to-end PCC improved by at least 30% of Phase 1's predicted RFE gain for this op (was 50% in v1 — relaxed because fused-kernel alignment may give us only combined-RFE targets)
+  - **PASS:** decode speed at or above reconciled-HEAD baseline (no regression), AND end-to-end PCC improved by at least 30% of Phase 1's predicted RFE gain for this op (was 50% in v1, relaxed because fused-kernel alignment may give us only combined-RFE targets)
   - **FAIL:** revert, document
 
 **Acceptance criteria (REWRITTEN for internal consistency):**
@@ -398,11 +398,11 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 ---
 
-## Phase 3 — Rewrite Op #2
+## Phase 3: Rewrite Op #2
 
 (Unchanged from v1 structure; baselines now chain against reconciled HEAD.)
 
-## Phase 4 — Rewrite Op #3
+## Phase 4: Rewrite Op #3
 
 (Unchanged from v1 structure.)
 
@@ -410,7 +410,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 ---
 
-## Phase 5 — Joint Validation + Multi-Prompt Robustness
+## Phase 5: Joint Validation + Multi-Prompt Robustness
 
 (Structure unchanged from v1; acceptance thresholds for speed now reference reconciled HEAD rather than 70.0 t/s absolute.)
 
@@ -422,7 +422,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 ---
 
-## Phase 6 — Upstream to tt-metal (OPTIONAL)
+## Phase 6: Upstream to tt-metal (OPTIONAL)
 
 (Unchanged from v1.)
 
@@ -439,14 +439,14 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 
 ---
 
-## ADR — PCC > 0.99 Multi-Session Kernel Plan (v4)
+## ADR: PCC > 0.99 Multi-Session Kernel Plan (v4)
 
 **Decision:** Adopt Option A (measurement-first, cheap-kernels-first, one-kernel-per-session) with a **new Phase 0.5 gate** that tests session-5's deferred fp32-accumulator and fp32-residual hypotheses before committing to per-op harness work. Speed baseline is reconciled in Phase 0 before any numerical target is defined.
 
 **Drivers:**
 1. Session 5 already posited diffuse cumulative drift; Phase 0.5 arbitrates this prior cheaply (~1-2 days) and can redirect the plan before multi-week commitment.
 2. RFE is the mathematically correct composable metric; PCC-delta summation (v1) was unsound.
-3. Speed baseline must be reconciled because v1's 74.21 t/s figure conflicts with MEMO.md's 57 t/s — every downstream speed gate depends on knowing which is current.
+3. Speed baseline must be reconciled because v1's 74.21 t/s figure conflicts with MEMO.md's 57 t/s, every downstream speed gate depends on knowing which is current.
 4. Ralph session cadence favors atomic, revertible per-op commits over multi-week monoliths.
 5. **(v3) The Phase 0.5 gate is the most consequential decision in the whole plan** (REDIRECT or PROCEED), so it must be gated by confidence bounds, not point estimates; and ablation (b) must actually test the hypothesis it claims to test (diffuse fp32 accumulation across layers), not a numerically-equivalent weaker form.
 
@@ -455,7 +455,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 - **Option B (biggest-contributor-first):** Conditional fallback if Phase 1 shows a single op contributes > 0.015.
 - **Option C (emulator-as-reference):** Rejected; invalidation rationale per RALPLAN-DR.
 - **Do-nothing:** Legitimate fallback after Phase 0.5 if ablations close the gap cheaply, or after Phase 1 if drift is too diffuse.
-- **(v3) Architect-suggested simplification — run only ablation (a) in Phase 0.5, defer (b) to Phase 1 RFE ranking:** Considered and rejected. Session 5's hypothesis is specifically about cross-layer residual-stream accumulation, which Phase 1's per-op RFE harness does NOT naturally surface (residual-add RFE can look small per-op while accumulation dominates end-to-end). Keeping the cross-layer fp32 residual carry as an explicit Phase 0.5 ablation (b) preserves a cheap falsification path for the session-5 prior; dropping it would force us to either run a multi-week harness to discover the same thing or leave the prior un-falsified. Ablation (a) alone does not substitute.
+- **(v3) Architect-suggested simplification, run only ablation (a) in Phase 0.5, defer (b) to Phase 1 RFE ranking:** Considered and rejected. Session 5's hypothesis is specifically about cross-layer residual-stream accumulation, which Phase 1's per-op RFE harness does NOT naturally surface (residual-add RFE can look small per-op while accumulation dominates end-to-end). Keeping the cross-layer fp32 residual carry as an explicit Phase 0.5 ablation (b) preserves a cheap falsification path for the session-5 prior; dropping it would force us to either run a multi-week harness to discover the same thing or leave the prior un-falsified. Ablation (a) alone does not substitute.
 - **(v3) Retaining v2's per-op-downcast ablation (b):** Rejected. Casting to fp32 at the add and immediately back to bf16 is mathematically equivalent to a bf16 add (rounding is merely deferred one op); it does not test the cross-layer hypothesis and would produce a near-zero delta_PCC that would spuriously trigger PROCEED.
 
 **Why chosen:**
@@ -472,7 +472,7 @@ RFE composes through residual streams via the triangle inequality: if op A adds 
 - **(v3)** Phase 0.5 wall-clock grows from ~1-2 days to ~2-3 days because CI-aware gating requires 25 samples per ablation (vs 3-run median); the combined ablation is no longer conditional-on-delta but conditional-on-CI-straddling-bands. Net schedule impact: +~1 day at most.
 - **(v3)** Ablation (b) requires a cross-layer fp32-residual Python path (env-var gated in `src/bitnet_tt/model/transformer.py`) that is slower than production; this is accepted as measurement-only and exempt from the 0.5 ms/step budget.
 - **(v3)** Phase 1 variance grows from N=5 to N=10 (fallback N=5 with the same 3σ bar). Wall-clock of the localization harness approximately doubles; accepted because the bar's statistical meaning is primary.
-- **(v4)** Phase 0.5 bootstrap is paired across conditions (tightens CI by √2) — prerequisite for the 0.002/0.005 gate bands to be decision-relevant.
+- **(v4)** Phase 0.5 bootstrap is paired across conditions (tightens CI by √2), prerequisite for the 0.002/0.005 gate bands to be decision-relevant.
 - **(v4)** Phase 1 separability threshold is 3.32σ (Bonferroni FWER=0.05 across 55 cells) rather than raw 3σ; a small number of borderline ops that would have cleared 3σ will now be binned into the noise floor. Accepted because false positives cost a full kernel-rewrite session.
 - **(v4)** Phase 0.5 ablation (b) has a wall-clock safety valve: 5× normal prefill triggers a fallback to 3×3=9 samples with 80% CI, and a hard 1-day abort. Worst-case Phase 0.5 wall-clock is bounded.
 - **(v4)** REDIRECT path adds a ~1-day tt-metal-feasibility catalog before Phase 1-4 rescope. If fp32-accumulator coverage <80% of seams, REDIRECT becomes a hybrid Python-carry + targeted-rewrite plan rather than pure seam promotion. Total schedule impact under REDIRECT: +~1 day.

@@ -1,16 +1,16 @@
 # TODO
 
-## 현재 상태 (2026-04-19, HEAD 503c164)
+## 현재 상태 (2026-04-19, HEAD 67831c9)
 
-### 달성 — p50 11.7 ms / 74.28 decode_tps (128 tok), bfp4 대비 +130%, PCC 0.982 vs HF fp32
+### 달성 -- p50 11.7 ms / 74.28 decode_tps (128 tok), bfp4 대비 +130%, PCC 0.982 vs HF fp32
 
-- **Session 7–13 speed 회복**: dlpack uint32 regression 발생 후 `cpu().to_list()` readout 패턴으로 4개 사이트 최적화 → 71.05 → 74.28 t/s (+3.23, pre-regression baseline 초과)
+- **Session 7-13 speed 회복**: dlpack uint32 regression 발생 후 `cpu().to_list()` readout 패턴으로 4개 사이트 최적화 → 71.05 → 74.28 t/s (+3.23, pre-regression baseline 초과)
 - **Session 8 per-op RFE localization**: `scripts/pcc_localize.py` + `BITNET_LOCALIZE` env flag → L0 block_input RFE 0.000 / post_input_norm 0.009 (bit-identical) / post_self_attn 0.240 / post_attn_sub_norm 0.420. 드리프트 진입 지점 = SDPA chain.
-- **Session 9–10 cheap-lever 탐색 전면 반증**: fp32 RMSNorm acc (+0.0005), fp32 residual add (-0.0014), SDPA HiFi4 (-0.0005), manual RoPE (-0.0007), manual primitive SDPA (-0.0018). 전부 환경 flag / ttnn-primitive level에서 결정되는 개입은 불가능.
-- **Phase K plan (tt-metal 커널 수정) 문서화**: `docs/plan_sdpa_kernel_alignment.md` + `docs/STATUS.md` — 4~6 세션 / 10~20시간 커널 작업. 현재 사용자 승인 대기.
+- **Session 9-10 cheap-lever 탐색 전면 반증**: fp32 RMSNorm acc (+0.0005), fp32 residual add (-0.0014), SDPA HiFi4 (-0.0005), manual RoPE (-0.0007), manual primitive SDPA (-0.0018). 전부 환경 flag / ttnn-primitive level에서 결정되는 개입은 불가능.
+- **Phase K plan (tt-metal 커널 수정) 문서화**: `docs/plan_sdpa_kernel_alignment.md` + `docs/STATUS.md` -- 4~6 세션 / 10~20시간 커널 작업. 현재 사용자 승인 대기.
 
-### 달성 — p50 11.3 ms / 71.0 t/s (min 10.7 ms, 64 tok, 이전 baseline)
-- **p50 11.3 ms, min 10.7 ms, decode_tps ≈ 70.98 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode, 64-tok) — Blackhole p150a
+### 달성 -- p50 11.3 ms / 71.0 t/s (min 10.7 ms, 64 tok, 이전 baseline)
+- **p50 11.3 ms, min 10.7 ms, decode_tps ≈ 70.98 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode, 64-tok) -- Blackhole p150a
 - **nlp_concat_heads_decode**: SDPA 이후 `ttnn.reshape` 대신 전용 kernel 사용. GQA SDPA는 sharded 출력 불가로 reshard 필요하지만, 전체 pass가 reshape 38→concat 29 μs (-9 μs/layer).
 - **LM head chunks L1**: split lm_head의 4 chunk 출력을 L1에 유지 → concat/to_layout/argmax 체인 DRAM 라운드트립 제거. -40 μs/step.
 - **Split lm_head matmul (4-way)**: 단일 matmul이 vocab=128256 전체에 맞춰 per_core config를 잡아 ~2.2 ms/step 소요되던 것을 4개 chunk로 쪼개 각각 tight per-core config 적용. 측정: 2197 → 722 μs (-67%). trace kernel 11.9 → 10.4 ms.
@@ -30,17 +30,17 @@
 - **K-block pipelining**: in0_block_w = Kt/2, cb0/cb1 double-buffer
 - **True 2-bit DRAM** storage (BFP2_b + L1 exp 합성)
 - **Activation multicast** 경로 동작 (sender/receiver on BRISC/NOC_0). fused-norm mcast 변형 `reader_ternary_norm_sender.cpp` / `_receiver.cpp` 도 작동.
-- **정확도:** PCC 0.975 vs HF, fused vs 비-fused 경로 PCC > 0.9997 (max_diff 4–6 at std≈26)
+- **정확도:** PCC 0.975 vs HF, fused vs 비-fused 경로 PCC > 0.9997 (max_diff 4-6 at std≈26)
 - **Dual RoPE:** fused / manual, `--no-fused-rope` 옵션
 
 ### 성능 진화 요약
 | 단계 | t/s | 주요 변화 |
 |---|---:|---|
-| 0. baseline (1 core scalar) | ~0.9 | — |
-| 1. 2D core grid (108) | ~7 | — |
+| 0. baseline (1 core scalar) | ~0.9 | -- |
+| 1. 2D core grid (108) | ~7 | -- |
 | 2-5. LUT+Bfp2_b+matmul_block | ~21 | HW unpack |
 | 7. true 2-bit DRAM | ~21 | 256B/tile + L1 exp |
-| 8. dual-NoC split | ~30 | — |
+| 8. dual-NoC split | ~30 | -- |
 | 9. cb1 exp probe 버그 fix + nt_per_core≥2 | 31.4 | NaN 버그 해결 |
 | 10. activation multicast + RISC swap | 32.41 | sender on BRISC/NOC_0 |
 | 11. fused QKV + attn projections → packed_ternary | 33.61 | 전체 attention 경로 2-bit |
@@ -67,7 +67,7 @@
 
 ---
 
-## Track A: Packed Ternary Matmul — ✅ DONE
+## Track A: Packed Ternary Matmul -- ✅ DONE
 
 ### 완료
 - [x] 2-bit pack/unpack roundtrip 검증
@@ -81,7 +81,7 @@
 - [x] `SetCommonRuntimeArgs` for shared DRAM addresses
 - [x] FFN 통합: gate_up, down_proj, o_proj 모두 `ttnn.experimental.ternary_matmul` 사용
 - [x] Attention 통합: q/k/v/o_proj + fused QKV 모두 packed_ternary
-- [x] **K-block pipelining** (`in0_block_w = Kt/2`) — cb0/cb1 자동 double-buffer
+- [x] **K-block pipelining** (`in0_block_w = Kt/2`) -- cb0/cb1 자동 double-buffer
 - [x] bench_batch32 end-to-end 검증
 
 ### 설계 메모
@@ -89,7 +89,7 @@
   (production `reader_bmm_tile_layout_in0_sender_padding` 패턴).
   NCRISC에서 시작하는 multicast는 Blackhole에서 dispatcher CQ를 손상시킴.
 - **Writer (weight reads + cb1 exp init + output writes)** → NCRISC / NOC_1
-- **cb1 exp init**: 매 launch마다 재초기화 (L1 probe cache 불가 — Blackhole
+- **cb1 exp init**: 매 launch마다 재초기화 (L1 probe cache 불가 -- Blackhole
   un-inited L1이 0x7F 패턴과 충돌 가능)
 - **mcast 활성 조건**: rectangular layout의 core count ≥ L-shape core count
   AND ≥ 2. gate_up은 108 L-shape 유지, down_proj/o_proj는 40-core 5×8 rect.
@@ -100,19 +100,19 @@
 
 ---
 
-## Track B: Zero-Tile / Sparsity Skip — ✗ 불가 (실측 검증 완료)
+## Track B: Zero-Tile / Sparsity Skip -- ✗ 불가 (실측 검증 완료)
 
 ### 조사한 각도
 1. **All-zero 32×32 tiles**: 전 projection 0%. 값 분포가 1/3:1/3:1/3 균일이라
    1024개 값이 모두 0일 확률이 (1/3)^1024 ≈ 0.
 2. **All-zero BFP2 groups (16v)**: gate/up/down/o_proj에서 4.7%, q/k/v에서
    0~3%. Tensix `matmul_block`이 tile 단위라 group skip 불가능.
-3. **Dead 32-row/col slabs**: 전부 0/…. 개별 dead rows/cols는 있지만 32
+3. **Dead 32-row/col slabs**: 전부 0/.... 개별 dead rows/cols는 있지만 32
    경계에 정렬되지 않음.
 4. **FFN 구조적 sparsity (lossless 조건)**:
    `(gate_row_dead ∧ up_row_dead) ∨ down_col_dead`인 intermediate 채널.
    - 30 layers 평균: 334 channels (4.8%)
-   - **Layer 1: 3016 channels (43.5%)** — 놀라운 값, 학습 중 early layer가
+   - **Layer 1: 3016 channels (43.5%)** -- 놀라운 값, 학습 중 early layer가
      intermediate의 절반을 사용하지 않도록 압축됨
    - Layer 2/3도 27%/15%
    - 전 레이어 공통 dead 인덱스: 0 → per-layer 독립 pruning 필요
@@ -132,15 +132,15 @@
 bound도 아니라서 Nt 축소가 wall-clock에 전환되지 않음.
 
 **분석 스크립트** (재현용, 미커밋 local):
-- `analyze_sparsity.py` — tile/group/row/col-level zero 통계
-- `analyze_dead_indices.py` — per-layer lossless dead index count + 32 정렬
+- `analyze_sparsity.py` -- tile/group/row/col-level zero 통계
+- `analyze_dead_indices.py` -- per-layer lossless dead index count + 32 정렬
 
 **재검토 조건:** decode가 BW-bound가 되는 shape(더 큰 batch, 더 긴 context)이
 나 hardware(더 낮은 DRAM bandwidth)로 전환될 경우 재고 가치 있음.
 
 ---
 
-## Track C: multi_core_reuse_optimized 포팅 — ⚠️ Reduced priority
+## Track C: multi_core_reuse_optimized 포팅 -- ⚠️ Reduced priority
 **목표:** Activation + weight 둘 다 multicast + 2D core grid reuse 패턴으로
 매트멀 팩토리 재작성. DRAM 대역폭을 `Kt × Nt` → `Kt + Nt` 수준으로 축소.
 
@@ -162,11 +162,11 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 - p150a harvesting (2 Tensix reserved) 하에서 row/column mcast 사각형 유효성
 - Weight mcast sender도 BRISC에 배치 필요 (NCRISC mcast CQ 손상)
 - 현재 팩토리의 core heuristic (`nt_per_core ∈ [2, 8]`)과 재구성된 core
-  grid의 호환성 — 특히 non-divisor shapes 처리
+  grid의 호환성 -- 특히 non-divisor shapes 처리
 
 ---
 
-## Track D: Fused RMSNorm + ternary_matmul — ✅ DONE (QKV only)
+## Track D: Fused RMSNorm + ternary_matmul -- ✅ DONE (QKV only)
 
 ### 완료 (2026-04-17)
 - [x] Fused compute kernel `fused_norm_ternary_mm_compute.cpp`
@@ -195,7 +195,7 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 
 ---
 
-## Track E: Attention core-range 분할 — 🚧 계획 단계
+## Track E: Attention core-range 분할 -- 🚧 계획 단계
 
 ### 목표
 두 개의 tt-metal fused op가 K/V (또는 Q/K)가 겹치지 않는 코어 범위에 있길
@@ -212,7 +212,7 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 ### 권장 접근
 **Option A (post-split re-shard)**: `nlp_create_qkv_heads_decode` 이후
 `to_memory_config`로 Q, K, V를 disjoint shard spec에 재배치. Python-only
-변경 — tt-metal 수정 없음.
+변경 -- tt-metal 수정 없음.
 
 전체 설계 및 성공 기준: `docs/plan_attention_core_range_split.md`.
 
@@ -246,12 +246,12 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 | packed_ternary (2026-04-17 +sharded rms_norm, 64 tok) | 13.5 | 74.1 | 12.8 | 78.1 | 62.66 | ~600 MB |
 | packed_ternary (2026-04-17 +multicore argmax, 64 tok) | 15.5 | 64.5 | 15.0 | 66.7 | 55.83 | ~600 MB |
 | packed_ternary (2026-04-17 fused QKV-norm, 64 tok) | 17.5 | 57.1 | 16.9 | 59.2 | 50.4 | ~600 MB |
-| packed_ternary (2026-04-16, 128 tok)             | 17.8    | 56.2    | —       | —       | — | ~600 MB |
-| packed_ternary (pre-L1)                          | 19.3    | 51.8    | —       | —       | ~600 MB |
-| packed_ternary (pre-session)                     | 25      | 40      | —       | —       | ~600 MB |
-| packed_ternary (Track A final)                   | 26      | 38.5    | —       | —       | ~600 MB |
-| bfp4 production                                  | 31      | 32.3    | —       | —       | ~1.2 GB |
-| bf16                                             | ~62     | ~16     | —       | —       | ~4.8 GB |
+| packed_ternary (2026-04-16, 128 tok)             | 17.8    | 56.2    | --       | --       | -- | ~600 MB |
+| packed_ternary (pre-L1)                          | 19.3    | 51.8    | --       | --       | ~600 MB |
+| packed_ternary (pre-session)                     | 25      | 40      | --       | --       | ~600 MB |
+| packed_ternary (Track A final)                   | 26      | 38.5    | --       | --       | ~600 MB |
+| bfp4 production                                  | 31      | 32.3    | --       | --       | ~1.2 GB |
+| bf16                                             | ~62     | ~16     | --       | --       | ~4.8 GB |
 
 측정 조건: batch32 + trace + fused RoPE.
 
@@ -267,16 +267,16 @@ mcast heuristic 실험에서 gate_up 72 rect → 50.77 t/s vs 108 L-shape 51.12 
 
 이 분해는 추정치. 실측은 category-sorted 비-trace profile (`profile_decode.py`)에서
 rope/create_qkv_heads/slice_gate_up이 각각 top 3 (~180μs in non-trace).
-trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 — 단일 병목 없음.
+trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 -- 단일 병목 없음.
 
 ### L1 메모리 최적화 실험 결과 (2026-04-16)
 | 변경 | 결과 | 효과 |
 |---|---:|---|
-| **norm→matmul 중간값 L1** | **51.12** | **+6.1%** — 120 norm 출력이 L1에서 matmul 입력으로 직접 전달 |
-| **+ SDPA 출력 L1** | **51.58** | **+7.1%** — SDPA→reshape→sub_norm 체인이 L1에서 동작 |
-| ttnn.add(residual) L1 | 47.58 | **-1.2%** — DRAM+L1 혼합 입력으로 역효과 |
-| final_norm L1 | 47.41 | **-1.6%** — slice(L1)→matmul(lm_head) 경로 역효과 |
-| gate_up mcast heuristic (72 cores) | 50.77 | **-0.7%** — L1 norm이 이미 activation 증폭 해결 |
+| **norm→matmul 중간값 L1** | **51.12** | **+6.1%** -- 120 norm 출력이 L1에서 matmul 입력으로 직접 전달 |
+| **+ SDPA 출력 L1** | **51.58** | **+7.1%** -- SDPA→reshape→sub_norm 체인이 L1에서 동작 |
+| ttnn.add(residual) L1 | 47.58 | **-1.2%** -- DRAM+L1 혼합 입력으로 역효과 |
+| final_norm L1 | 47.41 | **-1.6%** -- slice(L1)→matmul(lm_head) 경로 역효과 |
+| gate_up mcast heuristic (72 cores) | 50.77 | **-0.7%** -- L1 norm이 이미 activation 증폭 해결 |
 | lm_head matmul 출력 L1 | FAIL | trace 중 L1 할당 초과 (8.2MB TILE output) |
 
 ### 미래 커널 레벨 최적화 (C++ 필요)
@@ -288,7 +288,7 @@ trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 — 단
 | Split lm_head | - | ✅ 1.5 ms 회수 (4-way + L1 chunks). |
 | Sharded rms_norm (width multicore) | - | ✅ 2.6 ms 회수 (91 norms × 25 μs 절감, tune grid 추가 0.3 ms). |
 | nlp_concat_heads_decode (SDPA out) | - | ✅ 0.27 ms 회수 (reshape 대체). |
-| Track C weight column sharing | +1~2 t/s (재평가) | 재평가 — L1 norm이 activation 증폭을 이미 해결. |
+| Track C weight column sharing | +1~2 t/s (재평가) | 재평가 -- L1 norm이 activation 증폭을 이미 해결. |
 
 ---
 
@@ -308,7 +308,7 @@ trace-mode에서는 모든 카테고리가 ~86μs 수준으로 평평함 — 단
    두는 이유.
 2. **cb1 exp init probe 사용 금지**. Un-inited L1이 우연히 0x7F 패턴과 같을 수
    있어 false-positive skip → 다른 슬롯이 garbage → NaN.
-3. **`worker_core_from_logical_core`는 2 corner로 사용 가능** — p150a의
+3. **`worker_core_from_logical_core`는 2 corner로 사용 가능** -- p150a의
    harvesting (x=8,9 reserved)은 multicast 레벨에서 올바르게 처리됩니다.
 
 ### 실행

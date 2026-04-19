@@ -1,6 +1,6 @@
-# BitNet-TT — Current Status & Roadmap
+# BitNet-TT -- Current Status & Roadmap
 
-> Consolidates sessions 3–13 findings + the Phase K (tt-metal kernel
+> Consolidates sessions 3-13 findings + the Phase K (tt-metal kernel
 > alignment) roadmap into a single reference. Updated 2026-04-19.
 
 ---
@@ -9,7 +9,7 @@
 
 | Property | Value |
 |:---|:---|
-| Commit | `82d551a` |
+| Commit | `ec9cefc` |
 | Device | Tenstorrent Blackhole p150a (`ssh TT` → `e09cs04`) |
 | Bench | `python3 bench_batch32.py --dtype packed_ternary --max-new 128` |
 | decode_tps | **74.28 t/s** |
@@ -60,11 +60,11 @@ swap moves the needle.
 
 The 0.019 gap is **not** caused by:
 
-- Weight storage format (packed_ternary vs bfp4/bfp8/bf16) — session 5 (±0.001)
-- LM head precision (bfp8 vs bf16) — session 5 (+0.000017)
-- INT8 activation quantization (HF AutoBitLinear ActQuant toggle) —
+- Weight storage format (packed_ternary vs bfp4/bfp8/bf16) -- session 5 (±0.001)
+- LM head precision (bfp8 vs bf16) -- session 5 (+0.000017)
+- INT8 activation quantization (HF AutoBitLinear ActQuant toggle) --
   session 6 (+0.0012 noise)
-- Math fidelity on matmul kernels (HiFi2 vs HiFi4) — session 4/9 (noise)
+- Math fidelity on matmul kernels (HiFi2 vs HiFi4) -- session 4/9 (noise)
 
 The root cause, confirmed by session 8 per-op RFE localization, is
 **distributed op-level numerical drift between tt-metal bf16 and
@@ -112,14 +112,14 @@ HF bf16 no ActQuant (0.9801)          TT packed_ternary (bf16 runtime)
   (0.9801), ruling out ActQuant as the gap driver.
 - TT is **closer to HF than to bitnet.cpp**. bitnet.cpp's INT8×INT2
   pipeline is farther from both than they are from each other.
-- No single reference is "the ground truth" — all four disagree with
-  each other at the 0.01–0.03 level.
+- No single reference is "the ground truth" -- all four disagree with
+  each other at the 0.01-0.03 level.
 
 ---
 
 ## 4. File inventory
 
-### New tools added sessions 7–13
+### New tools added sessions 7-13
 
 | File | Purpose |
 |:---|:---|
@@ -188,27 +188,27 @@ widths > 8. Loaded from `bitnet_tt/__init__.py:_install_ttnn_to_torch_uint_wrapp
 
 Known gaps:
 
-- `post_attn_residual` TT-only (no HF hook — residual-add output is
+- `post_attn_residual` TT-only (no HF hook -- residual-add output is
   not a module output in HF)
 - Some fused-op boundaries are non-decomposable; RFE at the fused
   output is an aggregate, not a per-op signal
 
 ---
 
-## 6. Phase K — the tt-metal kernel alignment arc
+## 6. Phase K -- the tt-metal kernel alignment arc
 
 Full plan: `docs/plan_sdpa_kernel_alignment.md`.
 
 | Phase | Scope | Expected Δ PCC | Expected Δ speed |
 |:---|:---|---:|---:|
-| **K1** | Unit harness + env flag plumbing (no kernel edit) | — | 0 |
+| **K1** | Unit harness + env flag plumbing (no kernel edit) | -- | 0 |
 | **K2** | Softmax max-reduce alignment (single global max) | +0.005 | −0.3~0.6 ms |
 | **K3** | Q·Kᵀ matmul reduction alignment (fp32 accum, contig K) | +0.010 | −0.8~1.5 ms |
 | **K4** | attn·V matmul reduction alignment | ≥ +0.005 | −0.5~1.0 ms |
-| **K5** | 64-prompt joint validation | median ≥ 0.99 | — |
-| **K6** | tt-metal upstream PR (optional) | — | — |
+| **K5** | 64-prompt joint validation | median ≥ 0.99 | -- |
+| **K6** | tt-metal upstream PR (optional) | -- | -- |
 
-**Speed budget**: 2.6 ms headroom vs K2+K3+K4 ceiling 2.5–3 ms. Tight.
+**Speed budget**: 2.6 ms headroom vs K2+K3+K4 ceiling 2.5-3 ms. Tight.
 K3 alone > 1.5 ms forces K4 to be reconsidered.
 
 **Files in scope**:
@@ -220,8 +220,8 @@ K3 alone > 1.5 ms forces K4 to be reconsidered.
 **Decision gates**:
 
 - After K1 harness: if stock-vs-PyTorch sub-op RFE ≤ 0.05, SDPA is not
-  the dominant contributor — redirect to RMSNorm / RoPE alignment.
-- After K2 softmax: if Δ PCC ≈ 0, softmax is not the issue — skip to K3.
+  the dominant contributor -- redirect to RMSNorm / RoPE alignment.
+- After K2 softmax: if Δ PCC ≈ 0, softmax is not the issue -- skip to K3.
 - After K3: if decode_tps drops below 72, gate K4 behind explicit
   user re-approval.
 
@@ -231,12 +231,12 @@ K3 alone > 1.5 ms forces K4 to be reconsidered.
 
 | Question | Evidence |
 |:---|:---|
-| "Is INT8 activation quantisation the cause?" | `docs/session_6_int8_act.md` — toggle Δ +0.0012 |
-| "Does bf16 storage matter?" | `docs/session_5_correct_attribution.md` — Δ +0.00026 |
-| "Does lm_head precision matter?" | `docs/session_5_correct_attribution.md` — Δ +0.000017 |
-| "Are layer 0 and layer 29 asymmetric?" | `docs/session_4_pcc_ceiling.md` — 5.4× asymmetry |
-| "Which op dominates drift?" | `docs/session_8_rfe_ranking.md` — `post_attn_sub_norm` L0 RFE 0.420 |
-| "Does tt-metal SDPA match its ttnn-primitive decomposition?" | `session 10 commit 61a3644` — fused is *better* than primitives |
+| "Is INT8 activation quantisation the cause?" | `docs/session_6_int8_act.md` -- toggle Δ +0.0012 |
+| "Does bf16 storage matter?" | `docs/session_5_correct_attribution.md` -- Δ +0.00026 |
+| "Does lm_head precision matter?" | `docs/session_5_correct_attribution.md` -- Δ +0.000017 |
+| "Are layer 0 and layer 29 asymmetric?" | `docs/session_4_pcc_ceiling.md` -- 5.4× asymmetry |
+| "Which op dominates drift?" | `docs/session_8_rfe_ranking.md` -- `post_attn_sub_norm` L0 RFE 0.420 |
+| "Does tt-metal SDPA match its ttnn-primitive decomposition?" | `session 10 commit 48b4052` -- fused is *better* than primitives |
 | "How much speed headroom is there?" | Current 74.28 t/s, floor 70 → 2.6 ms |
 
 ---
@@ -248,7 +248,7 @@ Goal: maintain or raise PCC at decode_tps ≥ 70 t/s
 │
 ├─ User greenlights Phase K arc?
 │   ├─ YES → start Phase K1 (unit harness + env-flag plumbing)
-│   │         — no kernel edits yet; establishes go/no-go signal
+│   │         -- no kernel edits yet; establishes go/no-go signal
 │   │
 │   └─ NO  → session is closed; no further cheap levers known
 │
@@ -283,7 +283,7 @@ and attn·V in isolation.
      only sub-RFEs.
 3. Land the env flag `BITNET_SDPA_KERNEL_VARIANT=<tag>` plumbing
    through `_forward_prefill_with_preallocated_cache` in
-   `src/bitnet_tt/layers/attention.py`. No kernel variants yet —
+   `src/bitnet_tt/layers/attention.py`. No kernel variants yet --
    the switch just passes through to the stock kernel.
 4. Commit + push. Close session. Hand off to K2 with an honest
    assessment of whether the stock kernel reproduces the 0.240 signal

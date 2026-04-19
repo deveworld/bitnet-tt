@@ -1,16 +1,16 @@
-# Session 7 — Phase 0.5 gate decision: PROCEED to Phase 1
+# Session 7 -- Phase 0.5 gate decision: PROCEED to Phase 1
 
 Plan v4 Phase 0.5 gate evaluation. Tests session 5's unaddressed
 "diffuse bf16 drift" hypothesis before committing to multi-week Phase
 1-4 kernel arc.
 
-## Measurements (HEAD d37798d + dlpack fix + BITNET_*_FP32 flags)
+## Measurements (HEAD 7749efa + dlpack fix + BITNET_*_FP32 flags)
 
 Single prompt 'The capital of France is', 128-tok bench.
 
 | config                     | PCC vs HF fp32 | Δ PCC vs baseline | decode_tps | Δ tps |
 |----------------------------|---------------:|------------------:|-----------:|------:|
-| Baseline (both flags OFF)  |       0.982032 |               —   |      71.05 |    —  |
+| Baseline (both flags OFF)  |       0.982032 |               --   |      71.05 |    --  |
 | BITNET_RMSNORM_FP32_ACC=1  |    ~0.982540 * |          +0.0005  |      71.83 | +0.78 |
 | BITNET_FP32_RESIDUAL=1     |       0.980593 |          -0.0014  |      71.94 | +0.89 |
 
@@ -25,14 +25,14 @@ Single prompt 'The capital of France is', 128-tok bench.
 Measured |delta_PCC| for both ablations is far under the 0.002 PROCEED
 threshold on a 3-sample scan. Full 25-sample paired bootstrap CI was
 deferred because the point estimates are already an order of magnitude
-below the decision thresholds — a paired bootstrap can only narrow
+below the decision thresholds -- a paired bootstrap can only narrow
 the CI, not shift the point estimate by +0.005.
 
 ## Decision: PROCEED to Phase 1
 
 Neither narrow seam-level precision upgrade (fp32 RMSNorm accumulator,
 fp32 per-add) moves PCC by an actionable margin. Session 5's "diffuse
-drift across 30 layers" hypothesis is weakly confirmed — no single
+drift across 30 layers" hypothesis is weakly confirmed -- no single
 seam dominates at the fp32-promotion granularity. Phase 1 per-op RFE
 localization is the next lever.
 
@@ -54,9 +54,9 @@ localization is the next lever.
 
 ## Flags kept for Phase 1 instrumentation
 
-- `BITNET_RMSNORM_FP32_ACC=1` — per-rmsnorm compute_kernel_config with
+- `BITNET_RMSNORM_FP32_ACC=1` -- per-rmsnorm compute_kernel_config with
   HiFi4 + fp32_dest_acc_en.
-- `BITNET_FP32_RESIDUAL=1` — per-block residual add cast to fp32 then
+- `BITNET_FP32_RESIDUAL=1` -- per-block residual add cast to fp32 then
   downcast to bf16.
 
 Both default OFF; useful as ablation knobs in the per-op RFE harness.

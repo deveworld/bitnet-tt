@@ -1,4 +1,4 @@
-# Session 8 — Per-op RFE localization design
+# Session 8 -- Per-op RFE localization design
 
 Plan v4 Phase 1. Output: ranked table of which tt-metal op contributes
 most to the 0.019 PCC gap vs HF bf16.
@@ -8,7 +8,7 @@ most to the 0.019 PCC gap vs HF bf16.
 To keep the harness tractable and avoid fused-op alignment pitfalls, we
 capture at module-output boundaries only. Internal boundaries (post-QKV
 projection, post-SDPA internal) are skipped because TT fuses QKV+RMSNorm
-and uses a different SDPA tiling than PyTorch — tensor-shape alignment
+and uses a different SDPA tiling than PyTorch -- tensor-shape alignment
 there requires the un-fused TT shadow path which is deferred.
 
 For each captured layer:
@@ -40,7 +40,7 @@ late coverage catches layer-position asymmetry (session 4: layer 0 is
   kernel lands in capture point #3 (post_attn_add) as a combined
   signal with SDPA/o_proj. Non-decomposable by design.
 - **SDPA**: paged flash-attention on TT vs PyTorch scaled_dot_product
-  on HF. Same fate — contributes to post_attn_add aggregate.
+  on HF. Same fate -- contributes to post_attn_add aggregate.
 - **Fused gate/up/down (SwiGLU)**: HF has separate gate_proj / up_proj
   / down_proj; TT fuses gate/up. We capture only post_post_attn_norm
   (pre-fused) and block_output (post-down-proj). Internal SwiGLU
@@ -51,7 +51,7 @@ late coverage catches layer-position asymmetry (session 4: layer 0 is
 - **Prompts (K=5)**: "The capital of France is", "Once upon a time",
   "The answer to life is", "def fib(n):", "In 2024, we"
 - **Runs per prompt (N=10)**: same prompt, 10 independent forward
-  passes (no dropout — deterministic — runs are for bootstrap variance
+  passes (no dropout -- deterministic -- runs are for bootstrap variance
   estimation, not actual variation; repeated to confirm zero-variance).
   If runs are literally identical, we drop to N=1 and rely on K=5
   prompt variation for the variance estimate.

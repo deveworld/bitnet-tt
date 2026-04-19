@@ -1,4 +1,4 @@
-# Session 6 — INT8 activation quant hypothesis falsified
+# Session 6 -- INT8 activation quant hypothesis falsified
 
 After session 5 corrected the PCC attribution to "cumulative bf16 drift",
 session 6 tested whether **implementing the BitNet per-token INT8 absmax
@@ -9,10 +9,10 @@ gap toward bitnet.cpp (and by extension HF bf16 with its native
 ## Hypothesis
 
 bitnet.cpp and HF `AutoBitLinear` both apply per-token INT8 absmax
-activation quantisation at every BitLinear forward. TT does not — it
+activation quantisation at every BitLinear forward. TT does not -- it
 passes bf16 activations straight through to the ternary matmul. If the
 PCC gap were driven by this missing step, implementing it in the TT
-kernel should raise PCC vs those references significantly.
+kernel should raise PCC vs those references by a clear margin.
 
 ## Measurement
 
@@ -32,7 +32,7 @@ same quant step on TT would close the gap.
 | ON  (default) | 0.981319       |
 | **OFF**       | **0.980143**   |
 
-Delta = **+0.0012** — noise-level.
+Delta = **+0.0012** -- noise-level.
 
 Earlier session 6 measurements:
 
@@ -73,7 +73,7 @@ Implementing per-token INT8 activation quantisation inside
 multi-week tt-metal kernel effort (new reader variant, new compute
 kernel with fp32 accumulator + scale rescale, new program factory,
 numerical validation harness). The best-case PCC improvement is the
-measured +0.001 — nowhere near the +0.019 needed to cross 0.99.
+measured +0.001 -- nowhere near the +0.019 needed to cross 0.99.
 
 **Decision: do not build the kernel.** US-602 and US-603 are closed
 as obsolete by US-601 evidence.
@@ -84,7 +84,7 @@ Not in scope for an inference-optimisation session, but documented for
 the record:
 
 - **Port the RMSNorm / SDPA / RoPE ops to bit-identical PyTorch
-  equivalents** — requires rewriting multiple tt-metal kernels to
+  equivalents** -- requires rewriting multiple tt-metal kernels to
   match specific bf16 reduction orders. Likely sacrifices the current
   speed baseline.
 - **Run the reference in tt-metal bf16 on CPU first** (i.e. use a TT
@@ -102,7 +102,7 @@ started failing with `RuntimeError: Unsupported kUInt bits 32` inside
 benches in this session were captured *before* that regression so the
 US-601 measurements are unaffected. Current HEAD was measured working
 at 74.21 t/s immediately before the regression. Cause is a pip
-side-effect on torch / dlpack interop — orthogonal to the session 6
+side-effect on torch / dlpack interop -- orthogonal to the session 6
 hypothesis. Restoring the environment (or upgrading torch to a version
 whose dlpack supports kUInt bits 32) is a follow-up for any session
 that needs bench_batch32 + accuracy on the same checkout.

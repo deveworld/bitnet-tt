@@ -1,4 +1,4 @@
-# Session 7 — Phase 0 baseline reconciliation + dlpack env fix
+# Session 7 -- Phase 0 baseline reconciliation + dlpack env fix
 
 Plan v4 Phase 0 deliverable.
 
@@ -13,16 +13,16 @@ Root cause: torch 2.2.2 rejects DLPack capsules whose dtype is
 `ttnn.to_torch` on that tensor routes through dlpack and dies.
 
 Fix (`src/bitnet_tt/_ttnn_config.py` + `src/bitnet_tt/__init__.py`):
-1. `_install_torch_uint_compat_shim` — adds `torch.uint{16,32,64}` as
+1. `_install_torch_uint_compat_shim` -- adds `torch.uint{16,32,64}` as
    aliases of `torch.int{16,32,64}` so any attribute-based dispatch in
    ttnn succeeds.
-2. `_install_ttnn_to_torch_uint_wrapper` — intercepts `ttnn.to_torch`
+2. `_install_ttnn_to_torch_uint_wrapper` -- intercepts `ttnn.to_torch`
    and routes `uint32`-dtyped tensors through `ttnn.typecast(..., int32)`
    before the torch conversion. Falls back cleanly if typecast is not
    applicable.
 3. Single call-site fix in `_sample_token` (`inference/generator_batch32.py:1362`):
    for the trace-embedded argmax tensor (shape `[1]`, ROW_MAJOR), the
-   typecast path additionally requires a TILE-layout pad first, so the
+   typecast path also requires a TILE-layout pad first, so the
    readout uses
    `ttnn.to_torch(ttnn.typecast(ttnn.to_layout(t, TILE_LAYOUT), int32))`.
 
@@ -50,7 +50,7 @@ For Phase 0.5 onward:
 
 | key                 | value         |
 |--------------------:|:--------------|
-| commit              | d37798d (+ dlpack fix)           |
+| commit              | 7749efa (+ dlpack fix)           |
 | bench               | `bench_batch32.py --dtype packed_ternary --max-new 128` |
 | decode_tps          | 71.05 t/s     |
 | overall_tps         | 69.00 t/s     |

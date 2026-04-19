@@ -4,22 +4,22 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Current perf (2026-04-19 HEAD 97cb9bc, batch32 + trace + fused RoPE +
+- Current perf (2026-04-19 HEAD dd3c9d2, batch32 + trace + fused RoPE +
   packed_ternary + cpu().to_list() argmax readout + **fp32_dest_acc RMSNorm default**):
   **p50 11.6 ms / decode_tps 74.18 t/s (128-tok bench)**, PCC 0.982045 vs HF fp32,
   **PCC 0.9699 vs bitnet.cpp** (+0.002 over 0.9679 pre-FP32_ACC baseline).
-  Phase K1 measured SDPA fused-kernel RFE 0.0257 vs torch fp32 — within
+  Phase K1 measured SDPA fused-kernel RFE 0.0257 vs torch fp32 -- within
   bf16 floor; SDPA kernel is aligned, not the drift source.
   Previous MEMO figure (74.28 t/s, pre-FP32_ACC default flip):
   Session 11+12 regained +3.23 t/s on top of the post-dlpack-fix baseline
   (71.05 t/s) by switching the four uint32 argmax readout sites from
   to_layout+typecast+to_torch (0.282 ms/call) to cpu().to_list()
   (0.047 ms/call). Now exceeds pre-dlpack-regression baseline of 74.21.
-  Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale — predates
+  Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale -- predates
   the split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-
   lookup / fused-QKV-norm stack.
 - Historical Alpha baseline (`cd995ba` + HiFi2 kernel ≈ 8.5 t/s) kept
-  in tables below for context only — current stable path is the
+  in tables below for context only -- current stable path is the
   packed_ternary + fused-QKV-norm pipeline documented in README / TODO.
 - Focus now: attention data-path core-range split
   (`docs/plan_attention_core_range_split.md`) and anything else not
@@ -386,7 +386,7 @@ ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
 ### 12.1 Current Analysis
 
 > Historical snapshot from the early development phase. All four items
-> below have been addressed — the Trace-mode packed_ternary pipeline
+> below have been addressed -- the Trace-mode packed_ternary pipeline
 > runs at p50 17.5 ms / ~57 t/s. Kept here to show the original
 > problem statement; for current optimization targets see Track D / E
 > in `TODO.md`.
@@ -535,7 +535,7 @@ def update_decode_simple(self, key_states, value_states, current_pos, num_kv_gro
 - `num_heads=20` (BitNet) is incompatible with 32-core grid requirement
 - Options: (A) Pad to 32 heads (1.6x compute overhead), (B) Custom shard geometry
 
-### 12.5 Expected Performance (Updated — historic plan, all shipped)
+### 12.5 Expected Performance (Updated -- historic plan, all shipped)
 
 > All phases below are done. The actual final number (p50 17.5 ms ≈
 > 57 t/s, decode_tps ~50) is well past the original Phase 3 target.
@@ -547,7 +547,7 @@ def update_decode_simple(self, key_states, value_states, current_pos, num_kv_gro
 | Phase 1b | In-place + Trace | 17-25 t/s | ✅ done |
 | Phase 2 | + Ternary Matmul | 25-35 t/s | ✅ done |
 | Phase 3 | + Custom QKV | 30-45 t/s | ✅ done |
-| Extras (2026-04-17) | + L1 norm/SDPA + fused-QKV-norm | — | ✅ **57 t/s p50** |
+| Extras (2026-04-17) | + L1 norm/SDPA + fused-QKV-norm | -- | ✅ **57 t/s p50** |
 
 ### 12.6 Risks and Alternatives
 
@@ -597,7 +597,7 @@ def update_decode_simple(self, key_states, value_states, current_pos, num_kv_gro
 **BitNet-TT Current (2026-04-17)**: **57 t/s p50 / 50.4 t/s decode avg**
 (packed_ternary, batch32, Metal Trace). The original 33.1 t/s Llama target
 has been exceeded by 72 % on a 2.4B model with 2-bit weights. No further
-"fill the gap to 33 t/s" optimization needed — remaining work is
+"fill the gap to 33 t/s" optimization needed -- remaining work is
 incremental (attention core-range split, ~0.7 ms → ~60 t/s).
 
 ### 13.2 Key Optimization Techniques Summary
