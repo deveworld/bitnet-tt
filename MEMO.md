@@ -4,13 +4,13 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Current perf (2026-04-18 HEAD e5e1cd4, batch32 + trace + fused RoPE +
-  packed_ternary + cpu().to_list() argmax readout):
-  **p50 11.6 ms / decode_tps 73.39 t/s (128-tok bench)**, PCC ~0.981.
-  Session 11 regained +2.34 t/s on top of the post-dlpack-fix baseline
-  (71.05 t/s) by switching the uint32 argmax readout from
+- Current perf (2026-04-19 HEAD c30731b, batch32 + trace + fused RoPE +
+  packed_ternary + cpu().to_list() argmax readout everywhere):
+  **p50 11.7 ms / decode_tps 74.28 t/s (128-tok bench)**, PCC ~0.980.
+  Session 11+12 regained +3.23 t/s on top of the post-dlpack-fix baseline
+  (71.05 t/s) by switching the four uint32 argmax readout sites from
   to_layout+typecast+to_torch (0.282 ms/call) to cpu().to_list()
-  (0.047 ms/call).
+  (0.047 ms/call). Now exceeds pre-dlpack-regression baseline of 74.21.
   Previous MEMO figure (p50 17.5 ms / 57.1 t/s) was stale — predates
   the split-lm-head / sharded-rmsnorm / multicore-argmax / cos-sin-
   lookup / fused-QKV-norm stack.
