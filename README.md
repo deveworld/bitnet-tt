@@ -5,9 +5,9 @@ A native TT-NN implementation for running Microsoft's **BitNet b1.58 2B-4T** mod
 ## Key Features
 
 - **True 2-bit Weights**: Custom `ternary_matmul` op with BFP2_b HW unpack — **~600 MB** model size (vs 1.2 GB bfp4, 4.8 GB bf16)
-- **85.5 t/s Decode @ 128 tok** (p50, batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode + **bfp8 lm_head** + **cos/sin device-side lookup**; peak 93.5 t/s at min latency)
-- **+165% faster than bfp4** at half the storage
-- **PCC 0.981 vs HF CPU** (prefill, +0.005 over bfp4 lm_head), greedy match 3× the baseline — bfp8 lm_head dominates both bfp4 (higher accuracy) and bf16 (same accuracy, faster)
+- **74.28 t/s Decode @ 128 tok** (p50 11.7 ms, min 10.7 ms → peak 93.5 t/s; batch32 + Metal Trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode + **bfp8 lm_head** + **cos/sin device-side lookup** + **cpu().to_list() argmax readout**)
+- **+130% faster than bfp4** at half the storage
+- **PCC 0.982 vs HF fp32**, **0.981 vs HF bf16**, 0.968 vs bitnet.cpp — greedy match 6/16 on the "Paris" probe, argmax match True. Current HEAD is the practical PCC ceiling under the ≥ 70 t/s speed budget (see [`docs/STATUS.md`](docs/STATUS.md))
 - **Fused RMSNorm + ternary matmul** for QKV projection — RMSNorm runs inline inside the matmul kernel
 - **HuggingFace Compatible**: Direct loading of `microsoft/bitnet-b1.58-2B-4T-bf16` weights
 - **In-trace Greedy Argmax (multicore)**: Argmax runs inside Metal Trace with `use_multicore=True` — vocab-dim reduction parallelised across 110 cores (1.76 → 0.08 ms/step)
@@ -38,7 +38,8 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 
 | dtype | p50 ms | p50 t/s | min ms | min t/s | decode_tps | model size |
 |---|---:|---:|---:|---:|---:|---:|
-| **packed_ternary** (2026-04-18 +cos/sin LUT, 128 tok) | **11.7** | **85.5** | **10.7** | **93.5** | **73.90** | **~600 MB** |
+| **packed_ternary** (2026-04-19 HEAD + cpu().to_list() argmax readout, 128 tok) | **11.7** | **85.5** | **10.7** | **93.5** | **74.28** | **~600 MB** |
+| packed_ternary (2026-04-18 +cos/sin LUT, 128 tok) | 11.7 | 85.5 | 10.7 | 93.5 | 73.90 | ~600 MB |
 | packed_ternary (2026-04-18 +bfp8 lm_head, 128 tok) | 12.2 | 82.0 | 10.9 | 91.7 | 71.89 | ~600 MB |
 | packed_ternary (2026-04-17 +concat_heads_decode, 64 tok) | 11.3 | 88.5 | 10.7 | 93.5 | 70.98 | ~600 MB |
 | packed_ternary (2026-04-17 +L1 chunks, 64 tok)            | 11.6 | 86.2 | 10.9 | 91.7 | 70.51 | ~600 MB |
@@ -77,19 +78,20 @@ Measured on Tenstorrent Blackhole p150a (110 Tensix, harvesting mask 0x2080).
 | 28. **nlp_concat_heads_decode after SDPA** | **88.5 p50 / 70.98 decode_tps** | Replaces ttnn.reshape for SDPA output. SDPA GQA can't emit sharded output so we reshard first; the concat_heads kernel still nets -9 us/layer vs reshape (-0.27 ms/step). |
 | 29. **lm_head bfp4 → bfp8** | **82.0 p50 / 71.89 decode_tps** | Joint speed+accuracy tuning: lm_head dtype sweep (bfp4/bfp8/bf16) showed bfp8 dominates bf16 across all accuracy metrics while staying close to bfp4 speed. Prefill PCC 0.975 → 0.981 (+0.005), greedy match on 32 steps ≈3x baseline for only -1 t/s. bf16 is strictly dominated by bfp8 (same PCC, lower match count, slower). `BITNET_LM_HEAD_DTYPE={bf16,bfp8,bfp4}` env var supports future re-sweeps. |
 | 30. **cos/sin device-side lookup** | **85.5 p50 / 73.90 decode_tps** | Two of the four per-step H2D copies (cos, sin) replaced with an in-trace `ttnn.embedding(pos_tensor, cos_matrix)` / `...(pos_tensor, sin_matrix)` lookup against the pre-uploaded `cos_matrix` / `sin_matrix` already used by the non-trace path. Microbench matches the reference cos/sin at PCC=1.0 / max\|Δ\|=0; end-to-end 32-step accuracy is bit-identical to the H2D baseline. +2.01 decode_tps, p50 -0.5 ms. `BITNET_DECODE_COS_SIN_LOOKUP=0` reverts to the old H2D path. |
+| 31. **cpu().to_list() argmax readout** | **85.5 p50 / 74.28 decode_tps** | Four per-step uint32 argmax readout sites (in `_sample_token` and `_on_device_argmax_single`) were going through `to_layout(TILE) + typecast(int32) + to_torch` (0.282 ms/call) because torch 2.2.2 dlpack rejects kUInt bit widths > 8. Replaced with `ttnn.Tensor.cpu().to_list()` (0.047 ms/call, 5.5× cheaper). Session 11+12 combined gain: +3.23 decode_tps on top of the post-dlpack baseline (71.05 → 74.28). Now exceeds the pre-dlpack-regression baseline. |
 
-### Accuracy (vs HuggingFace CPU reference)
+### Accuracy (current HEAD, multiple references)
 
-| Metric | packed_ternary (bfp8 lm_head, current) | packed_ternary (bfp4 lm_head, old) | bfp4 weights |
-|---|---|---|---|
-| Prefill PCC | **0.981** | 0.975 | 0.993 |
-| Top-1 match | True | True | True |
-| Top-5 overlap | 60% | 80% | 90% |
-| Top-10 overlap | **90%** | 70% | — |
-| Greedy match (32 steps) | **6/32** | ~2/32 | 9/32 |
-| Greedy divergence | step 1 | step 1 | step 3 |
+Prompt `"The capital of France is"` → argmax ` Paris` on all references.
 
-Note: PCC 0.975 → 0.981 with bfp8 lm_head is real accuracy gain on top of the 2-bit weight quantization floor. The top-5 shuffle vs top-10 improvement is a set-overlap artifact: with bfp8 the top candidates are closer together, so rank boundaries (top 5 vs top 10) shift while the overall quality (PCC and greedy match) improves.
+| Reference | Prefill PCC | Top-5 overlap | Top-10 overlap | Greedy 16-tok match |
+|:---|---:|:---:|:---:|:---:|
+| **HF fp32** (primary reference) | **0.982** | 60% | 90% | 6/16 |
+| HF bf16 (default — with ActQuant) | 0.981 | 60% | 80% | — |
+| HF bf16 (ActQuant disabled, `bench_vs_hf_noquant.py`) | 0.980 | — | — | — |
+| bitnet.cpp (INT8×INT2 CPU reference, `bench_vs_bitnetcpp.py`) | 0.968 | 60% | 90% | — |
+
+Sessions 7–13 established that **PCC 0.982 vs HF fp32 is the practical ceiling** under a decode_tps ≥ 70 speed budget. Five cheap-lever interventions (fp32 RMSNorm acc, fp32 residual add, SDPA HiFi4, manual RoPE, manual primitive SDPA) all move PCC by ≤ 0.0018 — none crosses 0.005. Root cause: distributed op-level bf16-arithmetic drift between tt-metal and PyTorch/CUDA op libraries, not a single localisable op. See [`docs/session_10_phase2_closure.md`](docs/session_10_phase2_closure.md) and [`docs/plan_sdpa_kernel_alignment.md`](docs/plan_sdpa_kernel_alignment.md) for the tt-metal kernel alignment roadmap.
 
 ## Architecture
 

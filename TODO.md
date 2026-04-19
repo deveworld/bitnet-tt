@@ -1,8 +1,15 @@
 # TODO
 
-## 현재 상태 (2026-04-17)
+## 현재 상태 (2026-04-19, HEAD 503c164)
 
-### 달성 — p50 11.3 ms / 71.0 t/s (min 10.7 ms, 64 tok), bfp4 대비 +135%
+### 달성 — p50 11.7 ms / 74.28 decode_tps (128 tok), bfp4 대비 +130%, PCC 0.982 vs HF fp32
+
+- **Session 7–13 speed 회복**: dlpack uint32 regression 발생 후 `cpu().to_list()` readout 패턴으로 4개 사이트 최적화 → 71.05 → 74.28 t/s (+3.23, pre-regression baseline 초과)
+- **Session 8 per-op RFE localization**: `scripts/pcc_localize.py` + `BITNET_LOCALIZE` env flag → L0 block_input RFE 0.000 / post_input_norm 0.009 (bit-identical) / post_self_attn 0.240 / post_attn_sub_norm 0.420. 드리프트 진입 지점 = SDPA chain.
+- **Session 9–10 cheap-lever 탐색 전면 반증**: fp32 RMSNorm acc (+0.0005), fp32 residual add (-0.0014), SDPA HiFi4 (-0.0005), manual RoPE (-0.0007), manual primitive SDPA (-0.0018). 전부 환경 flag / ttnn-primitive level에서 결정되는 개입은 불가능.
+- **Phase K plan (tt-metal 커널 수정) 문서화**: `docs/plan_sdpa_kernel_alignment.md` + `docs/STATUS.md` — 4~6 세션 / 10~20시간 커널 작업. 현재 사용자 승인 대기.
+
+### 달성 — p50 11.3 ms / 71.0 t/s (min 10.7 ms, 64 tok, 이전 baseline)
 - **p50 11.3 ms, min 10.7 ms, decode_tps ≈ 70.98 t/s** (batch32 + trace + fused RoPE + multicore argmax + tuned sharded rms_norm + split lm_head with L1 chunks + nlp_concat_heads_decode, 64-tok) — Blackhole p150a
 - **nlp_concat_heads_decode**: SDPA 이후 `ttnn.reshape` 대신 전용 kernel 사용. GQA SDPA는 sharded 출력 불가로 reshard 필요하지만, 전체 pass가 reshape 38→concat 29 μs (-9 μs/layer).
 - **LM head chunks L1**: split lm_head의 4 chunk 출력을 L1에 유지 → concat/to_layout/argmax 체인 DRAM 라운드트립 제거. -40 μs/step.
@@ -54,6 +61,9 @@
 | 26. **Split lm_head (4-way)** | **68.57 (p50 11.7ms)** | vocab matmul 4 chunk으로 쪼개 per-core config 최적화. 2197→722 μs (-67%), trace kernel -1.5 ms. |
 | 27. **LM head chunks L1** | **70.51 (p50 11.6ms)** | split lm_head chunk 출력을 L1 유지. -40 μs/step. |
 | 28. **nlp_concat_heads_decode** | **70.98 (p50 11.3ms)** | SDPA 뒤 `ttnn.reshape`를 전용 kernel로 대체. reshard 포함해도 38→29 μs/layer (-0.27 ms/step). |
+| 29. **lm_head bfp4 → bfp8** | **71.89 (p50 12.2ms)** | Joint speed+accuracy tuning. PCC 0.975 → 0.981 (+0.005), greedy match ~3×, speed -1 t/s. |
+| 30. **cos/sin device-side lookup** | **73.90 (p50 11.7ms)** | Per-step H2D copy 2개 제거 (cos/sin), in-trace `ttnn.embedding(pos, cos_matrix)` 사용. PCC=1.0 vs reference, +2.01 t/s. |
+| 31. **dlpack kUInt fix + cpu().to_list() argmax readout** | **74.28 (p50 11.7ms)** | torch 2.2.2 dlpack이 kUInt32 거부 → 4개 uint32 argmax readout 사이트를 `ttnn.Tensor.cpu().to_list()`로 전환 (5.5× 저렴). Sessions 11+12 combined: 71.05 → 74.28 (+3.23). pre-dlpack baseline 74.21 초과. |
 
 ---
 

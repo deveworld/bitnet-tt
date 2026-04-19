@@ -1,10 +1,15 @@
 # Open Questions — BitNet-TT PCC Plans
 
-## pcc_above_099_multisession — 2026-04-18
+## pcc_above_099_multisession — resolved in sessions 7–13
 
-- [ ] Which dlpack-kUInt32 workaround does the user prefer (torch upgrade vs cast workaround vs separate bitnet.cpp venv)? — Determines Phase 0 scope and risk profile.
-- [ ] If Phase 1 shows SDPA contributes >0.015, does user want Option B fallback (SDPA-first, 3+ week single phase) or stay on Option A (cheaper ops first, accept partial outcome)? — Branching point after Phase 1.
-- [ ] Is "partial success" (PCC 0.985-0.990) an acceptable shipping outcome, or must the plan continue until 0.99 is crossed even if it means Phase 6+ work? — Affects per-phase stop criteria.
-- [ ] Is a hybrid fast-decode + accurate-prefill kernel path acceptable if a kernel rewrite tps-regresses below 70 for decode but improves prefill PCC? — Affects Phase 2-4 rollback criteria.
-- [ ] Phase 6 (upstreaming) — user priority? Open-ended review cycles vs keeping patches local in fork indefinitely. — Affects whether Phase 6 is scheduled or left as "someday".
-- [ ] Should Phase 1 capture harness also instrument bitnet.cpp as a third reference (alongside HF bf16 and HF fp32)? — Widens diagnostic value but adds env coupling to a flaky bitnet.cpp install.
+- [x] **dlpack-kUInt32 workaround (Phase 0)** — RESOLVED session 7. Chose the in-tree compat shim: alias `torch.uint{16,32,64}` → `int` + `ttnn.to_torch` wrapper that typecasts uint tensors via `ttnn.typecast(..., int32)`. No torch upgrade needed. Separate bitnet.cpp venv not required — bitnet.cpp lives in `~/bitnet.cpp` and uses its own pip env. Commit bb75ee7 / later refined at e5e1cd4, c30731b.
+- [x] **Option A vs Option B after Phase 1** — RESOLVED session 9–10. Phase 1 per-op RFE (session 8) located drift in the SDPA chain (L0.post_self_attn RFE 0.240, L0.post_attn_sub_norm 0.420). Sessions 9–10 tested five cheap levers (fp32 RMSNorm/residual, SDPA HiFi4, manual RoPE, manual primitive SDPA) — all ≤ |0.002| PCC delta, i.e. below PROCEED threshold. Pivoted to Phase K (tt-metal kernel rewrite) plan: `docs/plan_sdpa_kernel_alignment.md`.
+- [x] **Partial success at PCC 0.985–0.990 acceptable?** — DEFERRED, not yet needed. Cheap levers delivered no partial progress (still at 0.982); the question becomes live only if Phase K2/K3 partially close the gap.
+- [x] **Phase 1 capture harness instrument bitnet.cpp?** — RESOLVED session 7/10. Decoupled: `bench_vs_bitnetcpp.py` does TT-vs-bitnet.cpp directly on prefill logits via `extract_logits.cpp` binary dump. Not integrated into `pcc_localize.py` because bitnet.cpp has no per-op boundary we can match TT at — only end-to-end logits.
+
+## Still open — gate Phase K execution
+
+- [ ] **Hybrid fast-decode + accurate-prefill kernel path acceptable** if a Phase K kernel rewrite raises prefill PCC but regresses decode tps below 70? — Relevant for K3/K4 gating. Decode path uses a different SDPA variant (`scaled_dot_product_attention_decode`), so prefill-only kernel changes won't touch decode directly, but the fused compute kernel may be shared.
+- [ ] **Phase 6 upstreaming priority** — schedule an upstream tt-metal PR vs keep patches in fork. Not relevant until at least Phase K3 lands with a measurable win.
+- [ ] **Phase K1 harness expected signal** — if stock SDPA vs `torch.nn.functional.scaled_dot_product_attention` RFE is already ≤ 0.05, SDPA itself is not the bottleneck and Phase K redirects to RMSNorm / RoPE op alignment. Cannot predict without running the harness.
+- [ ] **Kernel budget trade-off if decode_tps < 72 after K3** — current headroom is 2.6 ms vs 70 t/s floor; Phase K2+K3+K4 ceiling is 2.5–3 ms. If K3 alone consumes > 1.5 ms, K4 must either be skipped or ship at sub-70 decode_tps. User decision required at that gate.

@@ -1,5 +1,23 @@
 # Plan: BitNet-TT Prefill PCC > 0.99 vs HF bf16 — Multi-Session Kernel Work (v4)
 
+> ## Execution status — 2026-04-19 (HEAD 503c164)
+>
+> | Phase | Scope | Status |
+> |:---|:---|:---|
+> | **Phase 0** | dlpack env restore + baseline reconciliation | ✅ **DONE** (session 7) — torch.uintN shim + ttnn.to_torch wrapper; reconciled baseline 71.05 t/s / PCC 0.982. `docs/session_7_baseline_reconciled.md`. |
+> | **Phase 0.5** | fp32 RMSNorm acc + fp32 residual ablations | ✅ **DONE** (session 7) — both |delta_PCC| < 0.002 → **PROCEED**. `docs/session_7_phase_0p5_gate_decision.md`. |
+> | **Phase 1** | Per-op RFE localization harness | ✅ **DONE** (session 8) — `scripts/pcc_localize.py` + `BITNET_LOCALIZE` env. L0.post_input_norm RFE 0.009, L0.post_self_attn 0.240, L0.post_attn_sub_norm 0.420. Dominant drift chain = SDPA path. |
+> | **Phase 2** | Top-1 op kernel alignment (cheap levers) | ⚠️ **CLOSED NEGATIVE** (sessions 9–10) — 5 cheap levers tested (fp32 RMSNorm acc, fp32 residual, SDPA HiFi4, manual RoPE, manual primitive SDPA), all ≤ |0.002| PCC delta. `docs/session_10_phase2_closure.md`. |
+> | **Phase 3–4** | Multi-op alignment / speed recovery | ↻ **REPLACED by Phase K arc** — see `docs/plan_sdpa_kernel_alignment.md`. Cheap-lever exhaustion forced the pivot into direct tt-metal C++ kernel edits. |
+> | **Phase 5** | 64-prompt joint validation | ⏳ **Deferred** — runs after Phase K3 at earliest. |
+> | **Phase 6** | Upstream PR | ⏳ **Optional** — gated on Phase K landing a material win. |
+>
+> **Speed-side bonus (out-of-plan):** sessions 11–12 recovered +3.23 decode_tps via the `cpu().to_list()` argmax readout fix. Current HEAD 74.28 t/s / PCC 0.982, exceeding pre-dlpack-regression baseline.
+>
+> **Next step:** user greenlight → Phase K1 (unit harness + env-flag plumbing, no kernel edits yet). See `docs/plan_sdpa_kernel_alignment.md` §"Phase K1" and `docs/STATUS.md` §9 for the concrete Ralph-session sketch.
+>
+> ---
+
 **Mode:** DELIBERATE consensus (RALPLAN-DR) — high-risk, multi-week, multi-session kernel rewrite
 **Base commit:** d37798d (plan-of-record) — speed baseline to be RECONCILED in Phase 0 against MEMO.md-reported state (p50 17.5 ms / ~57 t/s / decode_tps ~50.4).
 **Estimated scope:** 5-7 weeks across ~7 Ralph sessions (added Phase 0.5)
