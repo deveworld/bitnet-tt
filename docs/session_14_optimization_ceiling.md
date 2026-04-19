@@ -1,0 +1,123 @@
+# Session 14 — Optimization Ceiling Reference
+
+> Consolidates Phase K (SDPA kernel alignment harness + FP32_ACC default)
+> and Phase L (bfp8 KV + ttnn.split dead-ends) Ralph cycles into a single
+> reference. Updated 2026-04-19, HEAD `75a65b5`.
+
+## Calibrated baseline (bench_batch32 --dtype packed_ternary --max-new 128)
+
+| Metric | Value |
+|:---|---:|
+| decode_tps | ~74.1 t/s |
+| p50 | 11.6 ms |
+| min | 10.7 ms |
+| p90 | 12.4 ms |
+| PCC vs HF fp32 | 0.982045 |
+| PCC vs HF bf16 | 0.9813 |
+| PCC vs bitnet.cpp | 0.9699 |
+| greedy argmax ("The capital of France is" → " Paris") | match |
+
+Variance across 5 back-to-back runs on HEAD `75a65b5`:
+`73.82, 74.14, 74.30, 73.99, 73.97` t/s. Mean **74.04 t/s**, stddev
+**0.17**, min-max spread **0.48**. Any single-run speed delta
+< +0.5 t/s is noise, not signal. A stable +0.5 t/s requires
+≥ 3 stddev = +0.51, so report kernel wins only when a new mean
+from ≥ 3 runs beats the old mean by > 0.5 t/s.
+
+## What's been tried and rejected
+
+### SDPA kernel fork (Phase K plan K2-K4) — REDIRECTED
+K1 harness measured fused SDPA RFE vs torch.F.sdpa(fp32) = 0.0257. bf16
+torch rounding floor alone = 0.0025. Net TT-kernel SDPA drift = 0.023,
+well under the plan's 0.05 redirect gate. The SDPA compute kernel is
+already aligned with PyTorch semantics to within bf16 rounding; forking
+it for softmax/QK/attnV alignment would yield diminishing returns.
+
+### attn_sub_norm amplification hypothesis (Phase KR1/KR2) — FALSIFIED
+RMSNorm kernel alignment harness on layer-0 drifted post_self_attn:
+  input drift RFE 0.235 → TT rms_norm output RFE 0.220 (amp 0.93x)
+The TT rms_norm kernel does NOT amplify input drift. Session 8's high
+0.420 at `post_attn_sub_norm` is a comparison-order artifact (TT-output
+vs HF-output where each end-state reflects the whole cumulative chain),
+not kernel amplification.
+
+### BITNET_RMSNORM_FP32_ACC default flip — LANDED (marginal)
+Flipped to default=ON at commit 97cb9bc. Speed delta +0.35 t/s (within
+noise). PCC delta +0.00005 vs HF, +0.002 vs bitnet.cpp. Local per-op
+RFE at post_input_norm: 0.0089 → 0.0028 (-68%). Small but real local
+win; end-to-end gain absorbed by downstream Q/K/V ternary matmul drift.
+
+### bfp8 KV cache (Phase L1) — DEAD END
+BITNET_KV_CACHE_DTYPE=bfp8 regresses decode_tps 74.35 → 24.57 (3×
+slower) with max token latency 1005 ms. The bfp8 dtype adds a
+quantize/dequantize step on every DRAM-L1 cache fetch in SDPA_decode
+and paged_update_cache, swamping the bandwidth saving.
+
+### ttnn.split replacing 2 ttnn.slice (Phase L2) — NEUTRAL
+Replacing the ffn.gate_up dual-slice with one ttnn.split call measured
+74.08 t/s (-0.27 vs 74.35 baseline, within noise). The 131 us/call figure
+in the non-trace profile was dispatch overhead absorbed by trace replay;
+no wall-clock win is available from this path.
+
+## Real drift engine
+
+K1 + KR1/KR2 localized the 0.019 PCC gap vs HF bf16 to the Q/K/V
+`ttnn.experimental.ternary_matmul` chain feeding SDPA. Sub-evidence:
+
+- L0 post_input_norm RFE = 0.009 (clean, RMSNorm is near-bit-identical).
+- L0 post_self_attn RFE = 0.235 (compounded drift from
+  q_proj + k_proj + v_proj + RoPE + fused SDPA).
+- Stock SDPA adds only 0.023 to whatever input drift it receives.
+- Stock attn_sub_norm preserves or slightly reduces its input drift.
+
+So the drift enters in the three ternary matmul projections and
+the RoPE application, not in SDPA or RMSNorm. This is **kernel-level
+work on `ternary_matmul_*.cpp` in tt-metal** — not reachable from the
+Python layer.
+
+## Decision tree for the next Ralph session
+
+```
+User re-greenlights kernel-fork cycle?
+│
+├─ YES, targeting accuracy → edit ternary_matmul compute kernel
+│   (e.g., add fp32_dest_acc option to matmul_block calls in
+│    ~/tt-metal/ttnn/cpp/ttnn/operations/experimental/ternary_matmul/
+│    device/kernels/ternary_mm_compute.cpp). Requires tt-metal rebuild
+│    (~30 min). Gate on unit harness (tests/test_sdpa_kernel_alignment.py
+│    pattern, adapted to ternary_matmul) showing sub-op RFE drop before
+│    committing.
+│
+├─ YES, targeting speed → trace-level profiling first
+│   (tt-metal tracy profiler or device-side perf counter dump) to find
+│   the actual trace-mode hot op. Non-trace category profiling has
+│   been exhausted; all non-trace top ops are already optimized or
+│   dispatch-overhead-bound.
+│
+└─ NO → session closed; the 74 t/s / PCC 0.982 / PCC 0.9699 vs bitnet.cpp
+         ceiling is the current practical limit for the packed_ternary
+         + fused-QKV-norm + trace + multicore-argmax + sharded-rmsnorm
+         stack without kernel forks.
+```
+
+## Files from these cycles
+
+- `tests/test_sdpa_kernel_alignment.py` — K1 SDPA harness + env-flag test
+- `tests/test_rmsnorm_kernel_alignment.py` — KR2 RMSNorm harness
+- `src/bitnet_tt/layers/attention.py` — BITNET_SDPA_KERNEL_VARIANT plumbing
+  ({stock, pytorch_ref}; aligned_* reserved for future kernel-fork cycle)
+- `src/bitnet_tt/layers/bitlinear.py` — BITNET_RMSNORM_FP32_ACC default ON
+- `.omc/prd.json` — K/L/M cycle story closure records
+- `MEMO.md` — baseline header refresh
+
+## Commits (2026-04-19)
+
+```
+949e2ff Phase K1: SDPA kernel-variant env + unit harness
+d920016 Phase K1 follow-up: RMSNorm kernel alignment harness
+97cb9bc Speed+accuracy: enable BITNET_RMSNORM_FP32_ACC by default
+fac7b94 MEMO: refresh baseline to 97cb9bc (74.18 t/s, PCC 0.9699 vs bitnet.cpp)
+2d67946 PRD: Phase K1 session closure — all 7 stories marked passes=true
+7b282d8 Deslop Phase K1 landing (post-architect)
+75a65b5 PRD: Phase L cycle — bfp8 KV and ttnn.split both falsified
+```

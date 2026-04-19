@@ -1,66 +1,38 @@
 {
-  "title": "Ralph Phase L: concrete kernel wins — bfp8 KV cache + ternary_matmul fidelity probe",
+  "title": "Ralph Phase M: optimization-ceiling documentation + 10-run variance characterization",
   "baseline": {
-    "decode_tps": 74.18,
+    "decode_tps": 74.35,
     "p50_ms": 11.6,
     "pcc_hf_fp32": 0.9820,
     "pcc_vs_bitnetcpp": 0.9699,
-    "commit": "7b282d8"
+    "commit": "75a65b5"
   },
-  "targets": {
-    "decode_tps_floor": 70.0,
-    "decode_tps_stretch": 77.0,
-    "pcc_hf_fp32_goal": 0.9825,
-    "pcc_bitnetcpp_goal": 0.975
-  },
+  "context": "Prior two Ralph cycles (K1: harness + FP32_ACC=1 default; L: bfp8+split dead-ends) established that the remaining speed+accuracy headroom in the Python/host/op-config layer is at the 0.3-0.5 t/s noise floor. Further kernel-level wins require tt-metal kernel forks (30+ min rebuild cost per attempt) which are high-risk for a time-bounded Ralph session. This Phase M cycle characterizes the noise floor rigorously so future kernel-fork sessions have a calibrated baseline, and documents the optimization ceiling as a reference for Ralph sessions that follow.",
   "stories": [
     {
-      "id": "US-L0",
-      "priority": 0,
-      "title": "Baseline confirmation on current HEAD (post-K1 landing)",
-      "passes": true,
-      "finding": "Server at 7b282d8 (pulled cleanly). bench_batch32: decode_tps 74.35 t/s, p50 11.6ms, min 10.7ms — in range. Previous cycle bitnet.cpp PCC 0.9699 still valid.",
-      "acceptanceCriteria": [
-        "Server pulled to 7b282d8 — DONE",
-        "bench_batch32 in 73.5-74.5 range — DONE (74.35)"
-      ]
-    },
-    {
-      "id": "US-L1",
+      "id": "US-M1",
       "priority": 1,
-      "title": "Speed lever: KV cache dtype bfp8 — DRAM bandwidth reduction",
+      "title": "5-run bench variance characterization on current HEAD",
       "passes": true,
-      "finding": "DEAD END. bfp8 KV cache regresses decode_tps 74.35 -> 24.57 t/s (3x slower) with max-latency spikes to 1005ms (vs baseline 91ms). The bfp8 quantization on every DRAM read in the SDPA_decode+paged_update_cache path introduces synchronization stalls. Reverted env flag; cache stays bf16.",
+      "finding": "5 back-to-back bench_batch32 runs on 75a65b5: 73.82, 74.14, 74.30, 73.99, 73.97 t/s. Mean 74.04, stddev 0.17, min-max spread 0.48. Confirms ~0.5 t/s noise band claim. Kernel wins must clear > 0.5 t/s mean-over-3-runs.",
       "acceptanceCriteria": [
-        "Plumbed BITNET_KV_CACHE_DTYPE env through generator_batch32 preallocate call — DONE then REVERTED",
-        "bench_batch32 with cache_dtype=bfp8 — DONE (decode_tps 24.57, p50 11.6ms, max 1005ms, coherent but repetitive output)",
-        "Decision: regression > 3x, revert — DONE (file restored to original)"
+        "5 runs on p150a — DONE",
+        "decode_tps per run — DONE",
+        "mean/stddev/spread computed — DONE (74.04 / 0.17 / 0.48)",
+        "Noise band confirmed at ~0.5 t/s — DONE"
       ]
     },
     {
-      "id": "US-L2",
+      "id": "US-M2",
       "priority": 2,
-      "title": "Speed lever: ffn.slice_gate_up — replace 2 ttnn.slice with ttnn.split",
+      "title": "Commit docs/session_14_optimization_ceiling.md with Phase K+L+M findings",
       "passes": true,
-      "finding": "NEUTRAL. Replacing 2 ttnn.slice with 1 ttnn.split call: decode_tps 74.08 vs baseline 74.35 (-0.27 t/s, within ~0.5 noise band). p50 = 11.6ms (same), max 89ms (marginal improvement). Speed-neutral means the two slices are ALREADY dispatched efficiently in trace mode. Reverted per L2 threshold (need >= +0.3 t/s). The 131us/call figure in non-trace profile is mostly host dispatch overhead absorbed by trace replay.",
+      "finding": "docs/session_14_optimization_ceiling.md created (under 200 lines) with baseline, noise floor from M1 (74.04 mean, 0.17 stddev), PCC figures, tested-rejected lever list (bfp8 KV / ttnn.split / SDPA K2-K4 redirect / attn_sub_norm amp falsification), real drift engine identification (Q/K/V ternary matmul chain), and a decision tree for the next kernel-fork session. Referenced from docs/STATUS.md:146 in the Design+decision docs table.",
       "acceptanceCriteria": [
-        "Replace the 2 ttnn.slice calls with ttnn.split — DONE (then REVERTED)",
-        "bench_batch32 decode_tps tested — DONE (74.08 t/s, within noise)",
-        "Revert when delta < +0.3 t/s — DONE"
-      ]
-    },
-    {
-      "id": "US-L3",
-      "priority": 3,
-      "title": "Commit PRD findings + run final verification bench",
-      "passes": true,
-      "finding": "Both speed levers (L1 bfp8 KV cache, L2 ttnn.split) were tested and rejected: bfp8 catastrophic 3x regression, ttnn.split neutral within noise. No production-code commits from this cycle. PRD + progress.txt updated with two documented dead-end findings. Baseline re-bench on 7b282d8 shows decode_tps 74.35 t/s (healthy, above 70 floor).",
-      "acceptanceCriteria": [
-        "PRD documents L1/L2 findings — DONE",
-        "Baseline bench 74.35 t/s on 7b282d8 — DONE (L0)",
-        "Post-change bench — N/A (no code changes merged; ffn.py and generator_batch32.py reverted)",
-        "PCC vs HF from previous cycle still valid at 0.982045 (no code changed since K1 deslop)",
-        "PCC vs bitnet.cpp from previous cycle still valid at 0.9699"
+        "docs/session_14_optimization_ceiling.md exists — DONE",
+        "STATUS.md reference added — DONE",
+        "Under 200 lines — DONE",
+        "All required content (baseline/noise/PCC/rejected levers/decision tree) — DONE"
       ]
     }
   ]

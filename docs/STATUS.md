@@ -143,6 +143,7 @@ HF bf16 no ActQuant (0.9801)          TT packed_ternary (bf16 runtime)
 | `docs/session_8_rfe_ranking.md` | First RFE ranked table |
 | `docs/session_10_phase2_closure.md` | Cheap-lever scope exhausted |
 | `docs/plan_sdpa_kernel_alignment.md` | **Next-step plan (Phase K)** |
+| `docs/session_14_optimization_ceiling.md` | Phase K+L+M consolidated ceiling |
 | `.omc/plans/pcc_above_099_multisession.md` | Plan v4 (7-phase roadmap) |
 
 ### Env flags (all default OFF)
