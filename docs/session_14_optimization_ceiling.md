@@ -59,6 +59,16 @@ Replacing the ffn.gate_up dual-slice with one ttnn.split call measured
 in the non-trace profile was dispatch overhead absorbed by trace replay;
 no wall-clock win is available from this path.
 
+### LoFi on decode-path RoPE (Phase O) — PURE REGRESSION
+`ttnn.experimental.rotary_embedding_llama` accepts a `compute_kernel_config`.
+Phase O tried passing a LoFi math_fidelity config, hypothesizing that RoPE's
+cos/sin multiplication has bounded inputs and wouldn't need HiFi2 precision.
+Result: decode_tps 72.93 t/s (-1.11 vs 74.04 mean, outside 0.5 noise band)
+and the greedy output string diverged from baseline — likely both slower AND
+less accurate. Reverted fully (env flag + call-site) since LoFi neither
+picked faster code paths nor preserved PCC. The fused RoPE kernel is already
+at its tuned default. Third kernel-config lever to be falsified after N.
+
 ### HiFi4 + fp32_dest_acc on ternary_matmul (Phase N) — PURE REGRESSION
 `ttnn.experimental.ternary_matmul` accepts a `compute_kernel_config` but
 bitlinear.py was never passing one. Phase N wired `BITNET_TERNARY_MATMUL_HIFI4=1`

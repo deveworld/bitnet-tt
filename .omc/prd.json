@@ -1,54 +1,36 @@
 {
-  "title": "Ralph Phase N: ternary_matmul compute_kernel_config — real kernel lever",
+  "title": "Ralph Phase O: RoPE compute_kernel_config (LoFi speed lever)",
   "baseline": {
     "decode_tps_mean": 74.04,
     "decode_tps_stddev": 0.17,
-    "p50_ms": 11.6,
     "pcc_hf_fp32": 0.9820,
     "pcc_vs_bitnetcpp": 0.9699,
-    "commit": "1323f6f"
+    "commit": "032f5f6"
   },
-  "targets": {
-    "decode_tps_floor": 70.0,
-    "pcc_hf_fp32_delta_goal": 0.003,
-    "pcc_bitnetcpp_delta_goal": 0.005
-  },
-  "insight": "ternary_matmul_nanobind.cpp accepts a compute_kernel_config parameter (defaults to None → init_device_compute_kernel_config). bitlinear.py's Linear class never passes this — so the Q/K/V ternary matmul chain (the documented drift engine from Phase K+L+M) has been running at default fidelity. Passing HiFi4+fp32_dest_acc_en should cost speed but improve PCC.",
+  "insight": "attn.rope is the 3rd hottest decode op (134us/call non-trace). ttnn.experimental.rotary_embedding_llama accepts an optional compute_kernel_config but attention.py never passes one. Default fidelity is HiFi2. RoPE is a trig multiply (cos/sin multiplies) — LoFi should suffice numerically because the input range is bounded. Test LoFi on RoPE to see if it saves cycles without PCC loss.",
   "stories": [
     {
-      "id": "US-N1",
+      "id": "US-O1",
       "priority": 1,
-      "title": "Wire BITNET_TERNARY_MATMUL_HIFI4 env through bitlinear.Linear.__call__",
+      "title": "Wire BITNET_ROPE_LOFI env + test LoFi on decode RoPE",
       "passes": true,
-      "finding": "Env flag wired in src/bitnet_tt/layers/bitlinear.py. Default OFF. _hifi4_fp32_kernel_config() helper refactored out of _rmsnorm_compute_kernel_config — shared between RMSNorm and ternary_matmul paths. compute_kernel_config is passed to ttnn.experimental.ternary_matmul when flag is set.",
+      "finding": "Wired BITNET_ROPE_LOFI env flag and passed ttnn.experimental.rotary_embedding_llama a LoFi math_fidelity compute_kernel_config. Tested on p150a: decode_tps 72.93 t/s (vs 74.04 mean baseline, -1.11 — outside 0.5 noise band). Greedy output changed from baseline pattern, strongly suggesting PCC degraded too (not measured in detail since speed alone rules out a win).",
       "acceptanceCriteria": [
-        "Env flag read at module import, default OFF — DONE",
-        "HiFi4+fp32_acc config passed to ternary_matmul when ON — DONE",
-        "Default path unchanged — DONE (verified by 74.35 t/s baseline bench pre-change matching post-change flag=OFF)"
+        "Env flag + plumbing added and tested — DONE then REVERTED",
+        "Speed measured with flag=1 — DONE (72.93 t/s)",
+        "Speed delta >= +0.5 requirement — NOT MET (-1.11 regression)",
+        "Revert (fully removed, not left as opt-in) — DONE. The experiment shows LoFi on this RoPE kernel either picks slower code paths or pulls extra data format conversions; fused RoPE already hits its own floor."
       ]
     },
     {
-      "id": "US-N2",
+      "id": "US-O2",
       "priority": 2,
-      "title": "Measure impact of HiFi4+fp32_acc ternary_matmul on PCC and tps",
+      "title": "Append Phase O finding to optimization-ceiling doc + commit",
       "passes": true,
-      "finding": "PURE REGRESSION. HiFi4+fp32_dest_acc on ternary_matmul: decode_tps 71.69 t/s (-2.35 vs 74.04 mean, well outside 0.5 noise band), PCC vs HF fp32 = 0.982045 (IDENTICAL to baseline), PCC vs bitnet.cpp = 0.969858 (IDENTICAL to baseline 0.9699). Zero PCC benefit. The ternary {-1, 0, +1} accumulation is already exact in bf16 because the partial sums never overflow the 8-bit mantissa; HiFi4 upgrade costs cycles but doesn't change the output. Keep env flag default OFF; do NOT make default.",
+      "finding": "Session 14 doc updated with Phase O falsification record. PRD closure committed.",
       "acceptanceCriteria": [
-        "bench_batch32 with flag=1 — DONE (71.69 t/s)",
-        "bench_accuracy with flag=1 — DONE (PCC 0.982045, argmax match)",
-        "bench_vs_bitnetcpp with flag=1 — DONE (PCC 0.969858)",
-        "Decision: PCC delta 0.000 < +0.003 threshold → keep as opt-in env flag (NOT default)"
-      ]
-    },
-    {
-      "id": "US-N3",
-      "priority": 3,
-      "title": "Commit env flag + update optimization-ceiling doc",
-      "passes": false,
-      "acceptanceCriteria": [
-        "bitlinear.py default OFF committed",
-        "Session 14 doc updated with N2 finding (ternary_matmul fidelity is a false lever)",
-        "Push to origin/main"
+        "Session 14 doc appended — DONE",
+        "PRD closure commit + push — DONE (see commit)"
       ]
     }
   ]
