@@ -84,7 +84,7 @@ def _on_device_argmax_single(logits: ttnn.Tensor) -> int:
     """Return the argmax token id while transferring only the final index."""
     try:
         token_indices = ttnn.argmax(logits, dim=-1)
-        token_id = int(ttnn.to_torch(token_indices).numpy().reshape(-1)[0])
+        token_id = int(_flatten_first(token_indices.cpu().to_list()))
         ttnn.deallocate(token_indices)
         return token_id
     except Exception:
@@ -93,7 +93,7 @@ def _on_device_argmax_single(logits: ttnn.Tensor) -> int:
         last_logits = logits_rm[:, -1:, :]
         last_logits_tile = ttnn.to_layout(last_logits, ttnn.TILE_LAYOUT)
         token_indices = ttnn.argmax(last_logits_tile, dim=-1)
-        token_id = int(ttnn.to_torch(token_indices).numpy().reshape(-1)[0])
+        token_id = int(_flatten_first(token_indices.cpu().to_list()))
         ttnn.deallocate(logits_rm)
         ttnn.deallocate(last_logits)
         ttnn.deallocate(last_logits_tile)
@@ -1381,7 +1381,7 @@ class Batch32Generator:
             try:
                 row_rm = ttnn.to_layout(last_row, ttnn.ROW_MAJOR_LAYOUT)
                 token_indices = ttnn.argmax(row_rm, dim=-1)
-                token_id = int(ttnn.to_torch(token_indices).reshape(-1)[0].item())
+                token_id = int(_flatten_first(token_indices.cpu().to_list()))
                 ttnn.deallocate(token_indices)
                 ttnn.deallocate(row_rm)
                 if not use_direct_logits:
