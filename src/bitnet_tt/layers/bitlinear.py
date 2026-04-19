@@ -13,7 +13,7 @@ from numpy.typing import NDArray
 
 from bitnet_tt.utils.quantization import weight_quant_ternary
 
-_BITNET_RMSNORM_FP32_ACC = os.environ.get("BITNET_RMSNORM_FP32_ACC", "").strip() in ("1", "true", "yes", "on")
+_BITNET_RMSNORM_FP32_ACC = os.environ.get("BITNET_RMSNORM_FP32_ACC", "1").strip() in ("1", "true", "yes", "on")
 
 def _rmsnorm_compute_kernel_config(device):
     if not _BITNET_RMSNORM_FP32_ACC:
