@@ -25,7 +25,6 @@ The test is skipped (not failed) if no capture and no device are available.
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 
 import numpy as np
@@ -248,10 +247,7 @@ def test_sdpa_fused_vs_pytorch_rfe(capsys):
 
 def test_env_variant_flag_plumbing():
     """BITNET_SDPA_KERNEL_VARIANT is read at module import and validated."""
-    import importlib
     import bitnet_tt.layers.attention as att_mod
 
     assert hasattr(att_mod, "_BITNET_SDPA_KERNEL_VARIANT")
-    assert att_mod._BITNET_SDPA_KERNEL_VARIANT in {
-        "stock", "pytorch_ref", "aligned_softmax", "aligned_qk", "aligned_full",
-    }
+    assert att_mod._BITNET_SDPA_KERNEL_VARIANT in att_mod._SDPA_KERNEL_VARIANTS_KNOWN

@@ -31,16 +31,11 @@ _sdpa_hifi4_cfg = get_compute_kernel_config("hifi4") if _BITNET_SDPA_HIFI4 else 
 _BITNET_MANUAL_SDPA = _os.environ.get("BITNET_MANUAL_SDPA", "").strip() in ("1", "true", "yes", "on")
 # Phase K1: kernel-variant selector for prefill SDPA. Default "stock" preserves
 # current behavior. "pytorch_ref" moves Q/K/V to CPU and runs torch.nn.functional
-# SDPA (debug/reference path). Future tags "aligned_softmax", "aligned_qk",
-# "aligned_full" map to tt-metal compute-kernel forks once K2-K4 land.
+# SDPA (debug/reference path). Additional tags (aligned_softmax, aligned_qk,
+# aligned_full) will be added here when the corresponding tt-metal compute-kernel
+# forks actually land, so setting an unimplemented tag fails loudly at import.
 _BITNET_SDPA_KERNEL_VARIANT = _os.environ.get("BITNET_SDPA_KERNEL_VARIANT", "stock").strip().lower()
-_SDPA_KERNEL_VARIANTS_KNOWN = {
-    "stock",
-    "pytorch_ref",
-    "aligned_softmax",
-    "aligned_qk",
-    "aligned_full",
-}
+_SDPA_KERNEL_VARIANTS_KNOWN = {"stock", "pytorch_ref"}
 if _BITNET_SDPA_KERNEL_VARIANT not in _SDPA_KERNEL_VARIANTS_KNOWN:
     raise ValueError(
         f"BITNET_SDPA_KERNEL_VARIANT={_BITNET_SDPA_KERNEL_VARIANT!r} not in "
@@ -1478,10 +1473,6 @@ class MultiHeadAttention:
             _sdpa_kwargs = {}
             if _sdpa_hifi4_cfg is not None:
                 _sdpa_kwargs["compute_kernel_config"] = _sdpa_hifi4_cfg
-            # K2-K4 aligned variants: once the tt-metal compute-kernel forks
-            # are upstreamed, _BITNET_SDPA_KERNEL_VARIANT in {"aligned_softmax",
-            # "aligned_qk","aligned_full"} will select them via a program-factory
-            # op_config parameter. For K1 we just pass through the stock kernel.
             attn_output = ttnn.transformer.scaled_dot_product_attention(
                 query,
                 key_expanded,

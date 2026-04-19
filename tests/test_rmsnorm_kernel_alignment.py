@@ -81,22 +81,21 @@ def _run_ttnn_rms_norm(x_np: np.ndarray, weight_np: np.ndarray,
 
     compute_kernel_config = None
     if fp32_acc:
+        # Mirror the config bitlinear.py:_rmsnorm_compute_kernel_config builds
+        # when BITNET_RMSNORM_FP32_ACC=1. Duplicated (not imported) so this
+        # harness runs independently of bitlinear's env-gated module state.
         try:
             from ttnn import BlackholeComputeKernelConfig, MathFidelity
-            compute_kernel_config = BlackholeComputeKernelConfig(
-                math_fidelity=MathFidelity.HiFi4,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                packer_l1_acc=False,
-            )
+            ckc_cls = BlackholeComputeKernelConfig
         except Exception:
             from ttnn import WormholeComputeKernelConfig, MathFidelity
-            compute_kernel_config = WormholeComputeKernelConfig(
-                math_fidelity=MathFidelity.HiFi4,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                packer_l1_acc=False,
-            )
+            ckc_cls = WormholeComputeKernelConfig
+        compute_kernel_config = ckc_cls(
+            math_fidelity=MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
 
     x_t = torch.from_numpy(x_np).to(torch.bfloat16)
     w_t = torch.from_numpy(weight_np.reshape(1, 1, 1, -1)).to(torch.bfloat16)
