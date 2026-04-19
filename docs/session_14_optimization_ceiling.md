@@ -4,6 +4,24 @@
 > and Phase L (bfp8 KV + ttnn.split dead-ends) Ralph cycles into a single
 > reference. Updated 2026-04-19, HEAD `75a65b5`.
 
+## Headline result: TT is 5.9× faster than bitnet.cpp on the same box
+
+Measured on p150a (Phase Q, 2026-04-19), `The capital of France is` prompt, 128 new tokens:
+
+| Implementation | Device | Decode t/s | ms/token | Speedup |
+|:---|:---|---:|---:|---:|
+| bitnet.cpp `llama-cli` (n_threads=2 default) | CPU | **12.53** | 79.82 | 1.00× |
+| bitnet-tt `bench_batch32.py --dtype packed_ternary` | TT Blackhole p150a | **74.04** | 13.51 | **5.91×** |
+
+bitnet.cpp's prompt eval is also slow: 12.62 t/s prefill → 475 ms to ingest 6
+prompt tokens. TT's TTFT is 216 ms (2.2× faster prefill). Accuracy-wise TT
+matches bitnet.cpp's logits at PCC 0.9699 (argmax top-1 match on the Paris
+probe, top-10 overlap 0.90).
+
+The original task framing — "comparably fast and accurate vs bitnet.cpp" — is
+decisively satisfied. Any further optimization is a pure stretch goal, not a
+catch-up effort.
+
 ## Calibrated baseline (bench_batch32 --dtype packed_ternary --max-new 128)
 
 | Metric | Value |
