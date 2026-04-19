@@ -1,36 +1,25 @@
 {
-  "title": "Ralph Phase O: RoPE compute_kernel_config (LoFi speed lever)",
+  "title": "Ralph Phase P: session closure — 5 cycles exhausted, document findings",
   "baseline": {
     "decode_tps_mean": 74.04,
     "decode_tps_stddev": 0.17,
     "pcc_hf_fp32": 0.9820,
     "pcc_vs_bitnetcpp": 0.9699,
-    "commit": "032f5f6"
+    "commit": "43aefc4"
   },
-  "insight": "attn.rope is the 3rd hottest decode op (134us/call non-trace). ttnn.experimental.rotary_embedding_llama accepts an optional compute_kernel_config but attention.py never passes one. Default fidelity is HiFi2. RoPE is a trig multiply (cos/sin multiplies) — LoFi should suffice numerically because the input range is bounded. Test LoFi on RoPE to see if it saves cycles without PCC loss.",
+  "context": "Five consecutive Ralph cycles (K→L→M→N→O, all architect-APPROVED) have tested every reachable kernel lever: SDPA compute_kernel_config, attn_sub_norm amplification hypothesis, BITNET_RMSNORM_FP32_ACC default flip (landed), bfp8 KV cache (3x regression), ttnn.split vs slice (neutral), ternary_matmul HiFi4 (false lever: identical PCC, -2.35 t/s), decode-path RoPE LoFi (false lever: -1.11 t/s, output divergence). Every tt-metal API-level kernel lever reachable from bitnet-tt Python has now been tried and either landed, redirected, or falsified. Further wins require editing tt-metal compute kernel C++ source (ternary_mm_compute.cpp algorithmic changes, sdpa.cpp softmax max-reduce variants) which triggers a 30+ min tt-metal rebuild per attempt — out of Ralph session scope.",
   "stories": [
     {
-      "id": "US-O1",
+      "id": "US-P1",
       "priority": 1,
-      "title": "Wire BITNET_ROPE_LOFI env + test LoFi on decode RoPE",
+      "title": "Append Phase O+P closure summary to session_14_optimization_ceiling.md",
       "passes": true,
-      "finding": "Wired BITNET_ROPE_LOFI env flag and passed ttnn.experimental.rotary_embedding_llama a LoFi math_fidelity compute_kernel_config. Tested on p150a: decode_tps 72.93 t/s (vs 74.04 mean baseline, -1.11 — outside 0.5 noise band). Greedy output changed from baseline pattern, strongly suggesting PCC degraded too (not measured in detail since speed alone rules out a win).",
+      "finding": "Doc appended with (1) full commit list through 43aefc4, (2) K–O verdict table, (3) explicit prerequisite for the next cycle (tt-metal C++ edit + rebuild). Commit + push on this iteration.",
       "acceptanceCriteria": [
-        "Env flag + plumbing added and tested — DONE then REVERTED",
-        "Speed measured with flag=1 — DONE (72.93 t/s)",
-        "Speed delta >= +0.5 requirement — NOT MET (-1.11 regression)",
-        "Revert (fully removed, not left as opt-in) — DONE. The experiment shows LoFi on this RoPE kernel either picks slower code paths or pulls extra data format conversions; fused RoPE already hits its own floor."
-      ]
-    },
-    {
-      "id": "US-O2",
-      "priority": 2,
-      "title": "Append Phase O finding to optimization-ceiling doc + commit",
-      "passes": true,
-      "finding": "Session 14 doc updated with Phase O falsification record. PRD closure committed.",
-      "acceptanceCriteria": [
-        "Session 14 doc appended — DONE",
-        "PRD closure commit + push — DONE (see commit)"
+        "Doc has a 'Session closure' section listing all 5 cycles with one-line verdict each",
+        "Doc states the explicit next-action prerequisite (tt-metal source edit + rebuild) for any further progress",
+        "Doc references the 10 commits in chronological order (949e2ff through 43aefc4)",
+        "Commit + push"
       ]
     }
   ]

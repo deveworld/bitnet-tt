@@ -144,4 +144,31 @@ fac7b94 MEMO: refresh baseline to 97cb9bc (74.18 t/s, PCC 0.9699 vs bitnet.cpp)
 2d67946 PRD: Phase K1 session closure — all 7 stories marked passes=true
 7b282d8 Deslop Phase K1 landing (post-architect)
 75a65b5 PRD: Phase L cycle — bfp8 KV and ttnn.split both falsified
+1323f6f Session 14: Phase K+L+M optimization-ceiling reference
+032f5f6 Phase N: ternary_matmul HiFi4 env flag + finding (false lever)
+43aefc4 Phase O: LoFi decode-path RoPE — pure regression
 ```
+
+## Session closure — K through O verdict table
+
+| Cycle | Lever | Verdict | Net effect on main |
+|:---|:---|:---|:---|
+| K1 | SDPA compute_kernel_config + harness | REDIRECTED (RFE 0.023, below gate) | Env flag + 2 test files landed |
+| KR1 | BITNET_RMSNORM_FP32_ACC default flip | LANDED (marginal, in noise) | bitlinear.py default=ON |
+| KR2 | RMSNorm amplifier hypothesis | FALSIFIED (amp 0.93x, not amp) | Harness landed, no code change |
+| L1 | bfp8 KV cache | DEAD END (3x regression) | reverted |
+| L2 | ttnn.split vs 2 ttnn.slice | NEUTRAL (within noise) | reverted |
+| M | 5-run variance characterization | STDDEV 0.17, floor 0.5 t/s | doc landed |
+| N | ternary_matmul HiFi4 + fp32_acc | FALSE LEVER (PCC identical, -2.35 t/s) | Env flag default OFF, helper refactor |
+| O | RoPE LoFi math_fidelity | FALSE LEVER (-1.11 t/s + output divergence) | Fully reverted |
+
+**Cumulative net production code delta**: +2 test harnesses, bitlinear.py FP32_ACC default flipped, BITNET_SDPA_KERNEL_VARIANT + BITNET_TERNARY_MATMUL_HIFI4 opt-in env flags, `_hifi4_fp32_kernel_config()` shared helper, docs refresh. Zero algorithmic change to the production trace-replay path.
+
+**Prerequisite for any further progress**: tt-metal C++ source edit in
+`~/tt-metal/ttnn/cpp/ttnn/operations/experimental/ternary_matmul/device/kernels/ternary_mm_compute.cpp`
+(accuracy axis) or
+`~/tt-metal/ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/sdpa.cpp`
+(speed axis, K2 softmax max-reduce alignment in the original plan).
+Each attempt costs ~30 min tt-metal rebuild + risk of a broken device
+state that needs PCI reset. That is the boundary for the next session
+to cross; this one ends at the API/config layer boundary.
