@@ -4,9 +4,13 @@ Summary of key patterns and currently working configurations. Removed unnecessar
 
 ## 0. Current Status & Goals
 
-- Current perf (2026-04-19 HEAD c30731b, batch32 + trace + fused RoPE +
-  packed_ternary + cpu().to_list() argmax readout everywhere):
-  **p50 11.7 ms / decode_tps 74.28 t/s (128-tok bench)**, PCC ~0.980.
+- Current perf (2026-04-19 HEAD 97cb9bc, batch32 + trace + fused RoPE +
+  packed_ternary + cpu().to_list() argmax readout + **fp32_dest_acc RMSNorm default**):
+  **p50 11.6 ms / decode_tps 74.18 t/s (128-tok bench)**, PCC 0.982045 vs HF fp32,
+  **PCC 0.9699 vs bitnet.cpp** (+0.002 over 0.9679 pre-FP32_ACC baseline).
+  Phase K1 measured SDPA fused-kernel RFE 0.0257 vs torch fp32 — within
+  bf16 floor; SDPA kernel is aligned, not the drift source.
+  Previous MEMO figure (74.28 t/s, pre-FP32_ACC default flip):
   Session 11+12 regained +3.23 t/s on top of the post-dlpack-fix baseline
   (71.05 t/s) by switching the four uint32 argmax readout sites from
   to_layout+typecast+to_torch (0.282 ms/call) to cpu().to_list()
