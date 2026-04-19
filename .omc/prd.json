@@ -1,38 +1,54 @@
 {
-  "title": "Ralph Phase M: optimization-ceiling documentation + 10-run variance characterization",
+  "title": "Ralph Phase N: ternary_matmul compute_kernel_config — real kernel lever",
   "baseline": {
-    "decode_tps": 74.35,
+    "decode_tps_mean": 74.04,
+    "decode_tps_stddev": 0.17,
     "p50_ms": 11.6,
     "pcc_hf_fp32": 0.9820,
     "pcc_vs_bitnetcpp": 0.9699,
-    "commit": "75a65b5"
+    "commit": "1323f6f"
   },
-  "context": "Prior two Ralph cycles (K1: harness + FP32_ACC=1 default; L: bfp8+split dead-ends) established that the remaining speed+accuracy headroom in the Python/host/op-config layer is at the 0.3-0.5 t/s noise floor. Further kernel-level wins require tt-metal kernel forks (30+ min rebuild cost per attempt) which are high-risk for a time-bounded Ralph session. This Phase M cycle characterizes the noise floor rigorously so future kernel-fork sessions have a calibrated baseline, and documents the optimization ceiling as a reference for Ralph sessions that follow.",
+  "targets": {
+    "decode_tps_floor": 70.0,
+    "pcc_hf_fp32_delta_goal": 0.003,
+    "pcc_bitnetcpp_delta_goal": 0.005
+  },
+  "insight": "ternary_matmul_nanobind.cpp accepts a compute_kernel_config parameter (defaults to None → init_device_compute_kernel_config). bitlinear.py's Linear class never passes this — so the Q/K/V ternary matmul chain (the documented drift engine from Phase K+L+M) has been running at default fidelity. Passing HiFi4+fp32_dest_acc_en should cost speed but improve PCC.",
   "stories": [
     {
-      "id": "US-M1",
+      "id": "US-N1",
       "priority": 1,
-      "title": "5-run bench variance characterization on current HEAD",
+      "title": "Wire BITNET_TERNARY_MATMUL_HIFI4 env through bitlinear.Linear.__call__",
       "passes": true,
-      "finding": "5 back-to-back bench_batch32 runs on 75a65b5: 73.82, 74.14, 74.30, 73.99, 73.97 t/s. Mean 74.04, stddev 0.17, min-max spread 0.48. Confirms ~0.5 t/s noise band claim. Kernel wins must clear > 0.5 t/s mean-over-3-runs.",
+      "finding": "Env flag wired in src/bitnet_tt/layers/bitlinear.py. Default OFF. _hifi4_fp32_kernel_config() helper refactored out of _rmsnorm_compute_kernel_config — shared between RMSNorm and ternary_matmul paths. compute_kernel_config is passed to ttnn.experimental.ternary_matmul when flag is set.",
       "acceptanceCriteria": [
-        "5 runs on p150a — DONE",
-        "decode_tps per run — DONE",
-        "mean/stddev/spread computed — DONE (74.04 / 0.17 / 0.48)",
-        "Noise band confirmed at ~0.5 t/s — DONE"
+        "Env flag read at module import, default OFF — DONE",
+        "HiFi4+fp32_acc config passed to ternary_matmul when ON — DONE",
+        "Default path unchanged — DONE (verified by 74.35 t/s baseline bench pre-change matching post-change flag=OFF)"
       ]
     },
     {
-      "id": "US-M2",
+      "id": "US-N2",
       "priority": 2,
-      "title": "Commit docs/session_14_optimization_ceiling.md with Phase K+L+M findings",
+      "title": "Measure impact of HiFi4+fp32_acc ternary_matmul on PCC and tps",
       "passes": true,
-      "finding": "docs/session_14_optimization_ceiling.md created (under 200 lines) with baseline, noise floor from M1 (74.04 mean, 0.17 stddev), PCC figures, tested-rejected lever list (bfp8 KV / ttnn.split / SDPA K2-K4 redirect / attn_sub_norm amp falsification), real drift engine identification (Q/K/V ternary matmul chain), and a decision tree for the next kernel-fork session. Referenced from docs/STATUS.md:146 in the Design+decision docs table.",
+      "finding": "PURE REGRESSION. HiFi4+fp32_dest_acc on ternary_matmul: decode_tps 71.69 t/s (-2.35 vs 74.04 mean, well outside 0.5 noise band), PCC vs HF fp32 = 0.982045 (IDENTICAL to baseline), PCC vs bitnet.cpp = 0.969858 (IDENTICAL to baseline 0.9699). Zero PCC benefit. The ternary {-1, 0, +1} accumulation is already exact in bf16 because the partial sums never overflow the 8-bit mantissa; HiFi4 upgrade costs cycles but doesn't change the output. Keep env flag default OFF; do NOT make default.",
       "acceptanceCriteria": [
-        "docs/session_14_optimization_ceiling.md exists — DONE",
-        "STATUS.md reference added — DONE",
-        "Under 200 lines — DONE",
-        "All required content (baseline/noise/PCC/rejected levers/decision tree) — DONE"
+        "bench_batch32 with flag=1 — DONE (71.69 t/s)",
+        "bench_accuracy with flag=1 — DONE (PCC 0.982045, argmax match)",
+        "bench_vs_bitnetcpp with flag=1 — DONE (PCC 0.969858)",
+        "Decision: PCC delta 0.000 < +0.003 threshold → keep as opt-in env flag (NOT default)"
+      ]
+    },
+    {
+      "id": "US-N3",
+      "priority": 3,
+      "title": "Commit env flag + update optimization-ceiling doc",
+      "passes": false,
+      "acceptanceCriteria": [
+        "bitlinear.py default OFF committed",
+        "Session 14 doc updated with N2 finding (ternary_matmul fidelity is a false lever)",
+        "Push to origin/main"
       ]
     }
   ]

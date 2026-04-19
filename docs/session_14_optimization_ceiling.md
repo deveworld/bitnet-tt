@@ -59,6 +59,17 @@ Replacing the ffn.gate_up dual-slice with one ttnn.split call measured
 in the non-trace profile was dispatch overhead absorbed by trace replay;
 no wall-clock win is available from this path.
 
+### HiFi4 + fp32_dest_acc on ternary_matmul (Phase N) — PURE REGRESSION
+`ttnn.experimental.ternary_matmul` accepts a `compute_kernel_config` but
+bitlinear.py was never passing one. Phase N wired `BITNET_TERNARY_MATMUL_HIFI4=1`
+to pass HiFi4 + fp32_dest_acc_en — the same config the RMSNorm path uses.
+Result: decode_tps 71.69 t/s (-2.35 vs 74.04 mean), PCC vs HF fp32 0.982045
+(IDENTICAL), PCC vs bitnet.cpp 0.969858 (IDENTICAL). The ternary {-1, 0, +1}
+accumulation already produces exact partial sums in bf16 (the 8-bit
+mantissa never truncates), so HiFi4 only adds cycles. Flag kept default OFF
+so future investigation can re-test without code changes, but this closes
+the "ternary_matmul kernel precision" door.
+
 ## Real drift engine
 
 K1 + KR1/KR2 localized the 0.019 PCC gap vs HF bf16 to the Q/K/V
@@ -71,9 +82,12 @@ K1 + KR1/KR2 localized the 0.019 PCC gap vs HF bf16 to the Q/K/V
 - Stock attn_sub_norm preserves or slightly reduces its input drift.
 
 So the drift enters in the three ternary matmul projections and
-the RoPE application, not in SDPA or RMSNorm. This is **kernel-level
-work on `ternary_matmul_*.cpp` in tt-metal** — not reachable from the
-Python layer.
+the RoPE application, not in SDPA or RMSNorm. **Phase N falsified the
+hypothesis that ternary_matmul kernel precision is the lever**: passing
+HiFi4+fp32_dest_acc yielded identical PCC (0.982045 vs HF, 0.9699 vs
+bitnet.cpp) with -2.35 t/s cost. Ternary accumulation is already exact
+in bf16. The remaining drift is structural — per-layer ternary
+quantization noise compounding across 30 layers — not a kernel fix.
 
 ## Decision tree for the next Ralph session
 

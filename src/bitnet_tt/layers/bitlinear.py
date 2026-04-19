@@ -14,19 +14,33 @@ from numpy.typing import NDArray
 from bitnet_tt.utils.quantization import weight_quant_ternary
 
 _BITNET_RMSNORM_FP32_ACC = os.environ.get("BITNET_RMSNORM_FP32_ACC", "1").strip() in ("1", "true", "yes", "on")
+# Phase N: pass a HiFi4 + fp32_dest_acc compute_kernel_config to
+# ttnn.experimental.ternary_matmul. The Q/K/V ternary matmul chain is the
+# documented drift engine (session_14_optimization_ceiling.md). Default OFF
+# until N2 measures the speed/accuracy trade-off on p150a.
+_BITNET_TERNARY_MATMUL_HIFI4 = os.environ.get("BITNET_TERNARY_MATMUL_HIFI4", "").strip() in ("1", "true", "yes", "on")
+
+
+def _hifi4_fp32_kernel_config():
+    """Build a HiFi4 + fp32_dest_acc compute_kernel_config, arch-neutral."""
+    try:
+        from ttnn import BlackholeComputeKernelConfig, MathFidelity
+        return BlackholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
+    except Exception:
+        try:
+            from ttnn import WormholeComputeKernelConfig, MathFidelity
+            return WormholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
+        except Exception:
+            return None
+
 
 def _rmsnorm_compute_kernel_config(device):
     if not _BITNET_RMSNORM_FP32_ACC:
         return None
-    try:
-        from ttnn import WormholeComputeKernelConfig, MathFidelity
-        return WormholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
-    except Exception:
-        try:
-            from ttnn import BlackholeComputeKernelConfig, MathFidelity
-            return BlackholeComputeKernelConfig(math_fidelity=MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
-        except Exception:
-            return None
+    return _hifi4_fp32_kernel_config()
+
+
+_TERNARY_MATMUL_KERNEL_CONFIG = _hifi4_fp32_kernel_config() if _BITNET_TERNARY_MATMUL_HIFI4 else None
 
 
 def numpy_to_ttnn(
@@ -316,10 +330,14 @@ class Linear:
             raise RuntimeError("Weights not loaded. Call load_weights() first.")
 
         if self._use_packed_ternary:
+            _tm_kwargs = {}
+            if _TERNARY_MATMUL_KERNEL_CONFIG is not None:
+                _tm_kwargs["compute_kernel_config"] = _TERNARY_MATMUL_KERNEL_CONFIG
             out = ttnn.experimental.ternary_matmul(
                 x, self.weight, use_packed_ternary=True,
                 norm_weight=norm_weight,
                 norm_epsilon=norm_epsilon,
+                **_tm_kwargs,
             )
         elif self._compute_kernel_config is not None:
             out = ttnn.matmul(
